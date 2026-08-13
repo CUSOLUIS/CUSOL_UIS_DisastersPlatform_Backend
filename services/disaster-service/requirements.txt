@@ -1,0 +1,7 @@
+asyncpg==0.31.0
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+python-multipart==0.0.20
+pillow==11.3.0
+pillow-heif==0.22.0
+cryptography==45.0.3

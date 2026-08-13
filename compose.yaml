@@ -1,0 +1,151 @@
+name: cusol-disasters
+
+services:
+  disasters-db:
+    build:
+      context: ./infra/postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-disasters}
+      POSTGRES_USER: ${POSTGRES_USER:-disasters}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-disasters-local-only}
+    volumes:
+      - disasters-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - backend
+
+  disaster-service:
+    build:
+      context: ./services/disaster-service
+      target: development
+    environment:
+      DATABASE_URL: >-
+        postgresql://${POSTGRES_USER:-disasters}:${POSTGRES_PASSWORD:-disasters-local-only}@disasters-db:5432/${POSTGRES_DB:-disasters}
+      DATABASE_POOL_MIN_SIZE: 1
+      DATABASE_POOL_MAX_SIZE: 5
+      WATCHFILES_FORCE_POLLING: "true"
+      UPLOAD_DIR: /data/uploads
+      REPORT_ENCRYPTION_KEY: ${REPORT_ENCRYPTION_KEY:-dev-local-only-report-key}
+    volumes:
+      - ./services/disaster-service/app:/app/app:ro
+      - report-uploads:/data/uploads
+    depends_on:
+      disasters-db:
+        condition: service_healthy
+    expose:
+      - "8001"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health/ready', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      target: development
+    environment:
+      DISASTER_SERVICE_URL: http://disaster-service:8001
+      UPSTREAM_TIMEOUT_SECONDS: 5
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      - ./services/api-gateway/app:/app/app:ro
+    depends_on:
+      disaster-service:
+        condition: service_healthy
+    ports:
+      - "${GATEWAY_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - edge
+      - backend
+
+  frontend:
+    build:
+      context: ../CUSOL_UIS_DisastersPlatform_Frontend
+      target: development
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+      # Metro acepta EXPO_API_PROXY_TARGET (VITE_ se conserva por compatibilidad).
+      EXPO_API_PROXY_TARGET: http://api-gateway:8000
+      VITE_API_PROXY_TARGET: http://api-gateway:8000
+      # CHG-006/T013: el mapa consume la API real; usar `demo` para volver al fixture.
+      EXPO_PUBLIC_OPERATIONAL_MAP_DATA_MODE: ${OPERATIONAL_MAP_DATA_MODE:-api}
+    volumes:
+      - ../CUSOL_UIS_DisastersPlatform_Frontend:/app
+      - frontend-node-modules:/app/node_modules
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-3100}:3100"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "-q",
+          "-O",
+          "-",
+          "http://127.0.0.1:3100/",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - edge
+
+networks:
+  edge:
+    name: cusol-disasters-edge
+  backend:
+    name: cusol-disasters-backend
+    internal: true
+
+volumes:
+  disasters-data:
+    name: cusol-disasters-data
+  report-uploads:
+    name: cusol-disasters-report-uploads
+  frontend-node-modules:
+    name: cusol-disasters-frontend-node-modules

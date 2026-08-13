@@ -1,0 +1,558 @@
+import json
+from datetime import UTC, datetime
+from io import BytesIO
+from uuid import UUID, uuid4
+
+import asyncpg
+import httpx
+import pytest
+from PIL import Image
+
+from app.main import build_fernet, create_app
+from app.config import Settings
+from app.models import (
+    MissingPersonPublicRecord,
+    MissingPersonReportReceipt,
+)
+from app.photos import (
+    SignatureMalwareScanner,
+    sniff_image_type,
+    strip_metadata,
+)
+from app.storage import StorageUnavailableError
+
+
+EICAR = (
+    b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-"
+    b"ANTIVIRUS-TEST-FILE!$H+H*"
+)
+
+PUBLIC_RECORD = MissingPersonPublicRecord(
+    id=UUID("55555555-5555-4555-8555-555555555501"),
+    public_case_code="MP-2026-DEMO01",
+    display_name="Camila Rueda (caso demo)",
+    aliases=["Cami"],
+    approximate_age=34,
+    last_seen_at=datetime(2026, 8, 10, 18, 30, tzinfo=UTC),
+    last_seen_area="Sector Café Madrid",
+    municipality="Bucaramanga",
+    department="Santander",
+    clothing_description="Chaqueta azul",
+    physical_description="Cabello castaño largo",
+    distinctive_marks=None,
+    public_photo_url=None,
+    map_point_id=None,
+    updated_at=datetime(2026, 8, 12, 10, 0, tzinfo=UTC),
+    data_classification="demonstrative",
+)
+
+RECEIPT = MissingPersonReportReceipt(
+    id=UUID("66666666-6666-4666-8666-666666666601"),
+    public_case_code="MP-2026-AAAA1111",
+    status="under_review",
+    received_at=datetime(2026, 8, 12, 16, 0, tzinfo=UTC),
+)
+
+
+class FakeMissingPersonRepository:
+    def __init__(self, duplicate: bool = False, fail: bool = False):
+        self.duplicate = duplicate
+        self.fail = fail
+        self.last_search = None
+        self.created_report = None
+        self.created_photos = None
+
+    async def ping(self) -> bool:
+        return True
+
+    async def search_missing_persons(self, query, limit):
+        self.last_search = {"query": query, "limit": limit}
+        return [PUBLIC_RECORD], 1
+
+    async def create_missing_person_report(self, report, photos):
+        if self.fail:
+            raise asyncpg.PostgresError("fallo simulado")
+        if self.duplicate:
+            return RECEIPT, False
+        self.created_report = report
+        self.created_photos = photos
+        return (
+            MissingPersonReportReceipt(
+                id=report.id,
+                public_case_code=report.public_case_code,
+                status="under_review",
+                received_at=datetime(2026, 8, 12, 16, 0, tzinfo=UTC),
+            ),
+            True,
+        )
+
+
+class FakeStorage:
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.objects: dict[str, bytes] = {}
+        self.deleted: list[str] = []
+
+    def save(self, key: str, data: bytes) -> None:
+        if self.fail:
+            raise StorageUnavailableError("sin espacio")
+        self.objects[key] = data
+
+    def delete(self, key: str) -> None:
+        self.deleted.append(key)
+        self.objects.pop(key, None)
+
+
+def make_jpeg(with_exif: bool = True, size=(48, 48)) -> bytes:
+    image = Image.new("RGB", size, "red")
+    output = BytesIO()
+    if with_exif:
+        exif = Image.Exif()
+        exif[271] = "DemoCam"  # Make
+        exif[272] = "DemoModel"  # Model
+        image.save(output, format="JPEG", exif=exif.tobytes())
+    else:
+        image.save(output, format="JPEG")
+    return output.getvalue()
+
+
+def make_png() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (32, 32), "blue").save(output, format="PNG")
+    return output.getvalue()
+
+
+def valid_payload(**overrides) -> dict:
+    payload = {
+        "firstNames": "Nombre",
+        "lastNames": "Demo",
+        "lastSeenDate": "2026-08-11",
+        "department": "Santander",
+        "municipality": "Bucaramanga",
+        "lastSeenArea": "Café Madrid",
+        "clothingDescription": "Chaqueta azul",
+        "circumstances": "Salió hacia el trabajo y no regresó.",
+        "reporterName": "Reportante Demo",
+        "reporterRelationship": "Hermana",
+        "reporterPhone": "+57 300 000 0000",
+        "documentNumber": "CC-1234567",
+        "medicalInformation": "Requiere medicación diaria",
+        "truthConfirmed": True,
+        "photoAuthorizationConfirmed": True,
+        "reviewAcknowledged": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+IDEMPOTENCY = {"Idempotency-Key": "clave-idempotente-0001"}
+
+
+async def request_app(app, method, path, **kwargs) -> httpx.Response:
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            return await client.request(method, path, **kwargs)
+
+
+def report_app(repository=None, storage=None, settings=None, scanner=None):
+    return create_app(
+        settings=settings,
+        repository=repository or FakeMissingPersonRepository(),
+        storage=storage if storage is not None else FakeStorage(),
+        scanner=scanner,
+    )
+
+
+def photos_form(count: int, photo: bytes | None = None):
+    content = photo if photo is not None else make_jpeg()
+    return [
+        ("photos", (f"foto-{index}.jpg", content, "image/jpeg"))
+        for index in range(count)
+    ]
+
+
+# --- Búsqueda pública ---
+
+
+@pytest.mark.anyio
+async def test_search_returns_only_public_projection():
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    response = await request_app(
+        app, "GET", "/internal/v1/missing-persons/search?q=Camila&limit=5"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert body["query"] == "Camila"
+    assert repository.last_search == {"query": "Camila", "limit": 5}
+    item = body["items"][0]
+    assert set(item.keys()) == {
+        "id", "publicCaseCode", "displayName", "aliases",
+        "approximateAge", "lastSeenAt", "lastSeenArea", "municipality",
+        "department", "clothingDescription", "physicalDescription",
+        "distinctiveMarks", "publicPhotoUrl", "mapPointId", "updatedAt",
+        "dataClassification",
+    }
+    forbidden = {
+        "documentNumber", "documentType", "medicalInformation",
+        "reporterName", "reporterPhone", "reporterEmail",
+    }
+    assert forbidden.isdisjoint(item.keys())
+
+
+@pytest.mark.anyio
+async def test_search_rejects_short_queries():
+    app = report_app()
+
+    too_short = await request_app(
+        app, "GET", "/internal/v1/missing-persons/search?q=a"
+    )
+    blank = await request_app(
+        app, "GET", "/internal/v1/missing-persons/search?q=%20a"
+    )
+
+    assert too_short.status_code == 422
+    assert blank.status_code == 422
+
+
+# --- Recepción de reportes ---
+
+
+@pytest.mark.anyio
+async def test_report_with_one_photo_creates_under_review_receipt():
+    repository = FakeMissingPersonRepository()
+    storage = FakeStorage()
+    app = report_app(repository=repository, storage=storage)
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(valid_payload())},
+        files=photos_form(1),
+        headers=IDEMPOTENCY,
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "under_review"
+    assert body["publicCaseCode"].startswith("MP-")
+    assert set(body.keys()) == {
+        "id", "publicCaseCode", "status", "receivedAt"
+    }
+
+    # Almacenamiento opaco: original + derivado, sin nombre del cliente.
+    assert len(storage.objects) == 2
+    assert all("foto-0" not in key for key in storage.objects)
+
+    # El derivado no conserva EXIF.
+    derived_key = next(
+        key for key in storage.objects if "/derived/" in key
+    )
+    derived = Image.open(BytesIO(storage.objects[derived_key]))
+    assert dict(derived.getexif()) == {}
+
+    photo = repository.created_photos[0]
+    assert photo.exif_removed is True
+    assert photo.malware_scan == "clean"
+
+    # Campos sensibles cifrados y recuperables solo con la clave.
+    report = repository.created_report
+    fernet = build_fernet("dev-local-only-report-key")
+    assert report.document_number_encrypted != b"CC-1234567"
+    assert (
+        fernet.decrypt(report.document_number_encrypted).decode()
+        == "CC-1234567"
+    )
+    assert (
+        fernet.decrypt(report.reporter_phone_encrypted).decode()
+        == "+57 300 000 0000"
+    )
+    assert report.reporter_email_encrypted is None
+
+
+@pytest.mark.anyio
+async def test_report_accepts_five_photos_and_rejects_zero_and_six():
+    storage = FakeStorage()
+    app = report_app(storage=storage)
+
+    five = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(valid_payload())},
+        files=photos_form(5),
+        headers=IDEMPOTENCY,
+    )
+    zero = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(valid_payload())},
+        headers=IDEMPOTENCY,
+    )
+    six = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(valid_payload())},
+        files=photos_form(6),
+        headers=IDEMPOTENCY,
+    )
+
+    assert five.status_code == 201
+    assert len(storage.objects) == 10
+    assert zero.status_code == 422
+    assert six.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_report_rejects_content_that_is_not_an_image():
+    app = report_app()
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(valid_payload())},
+        files=[
+            (
+                "photos",
+                ("enganosa.jpg", b"no soy una imagen real", "image/jpeg"),
+            )
+        ],
+        headers=IDEMPOTENCY,
+    )
+
+    assert response.status_code == 415
+    assert response.headers["content-type"] == "application/problem+json"
+
+
+@pytest.mark.anyio
+async def test_report_rejects_malware_signature():
+    app = report_app()
+    infected = make_jpeg() + EICAR
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(valid_payload())},
+        files=[("photos", ("foto.jpg", infected, "image/jpeg"))],
+        headers=IDEMPOTENCY,
+    )
+
+    assert response.status_code == 415
+
+
+@pytest.mark.anyio
+async def test_report_rejects_oversized_photo_and_total():
+    small_limits = Settings(
+        database_url="postgresql://unused",
+        database_pool_min_size=1,
+        database_pool_max_size=2,
+        upload_dir="/tmp/unused",
+        report_encryption_key="test-key",
+        max_photo_bytes=64,
+        max_total_photo_bytes=100_000,
+    )
+    app = report_app(settings=small_limits)
+    oversized = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(valid_payload())},
+        files=photos_form(1),
+        headers=IDEMPOTENCY,
+    )
+
+    total_limits = Settings(
+        database_url="postgresql://unused",
+        database_pool_min_size=1,
+        database_pool_max_size=2,
+        upload_dir="/tmp/unused",
+        report_encryption_key="test-key",
+        max_total_photo_bytes=len(make_jpeg()) + 10,
+    )
+    app = report_app(settings=total_limits)
+    total_exceeded = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(valid_payload())},
+        files=photos_form(2),
+        headers=IDEMPOTENCY,
+    )
+
+    assert oversized.status_code == 413
+    assert total_exceeded.status_code == 413
+
+
+@pytest.mark.anyio
+async def test_report_validation_never_echoes_submitted_values():
+    app = report_app()
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={
+            "payload": json.dumps(
+                valid_payload(documentNumber="X" * 500, firstNames="")
+            )
+        },
+        files=photos_form(1),
+        headers=IDEMPOTENCY,
+    )
+
+    assert response.status_code == 422
+    text = response.text
+    assert "X" * 20 not in text
+    assert "documentNumber" in text  # nombra el campo, nunca el valor
+
+
+@pytest.mark.anyio
+async def test_report_requires_contact_and_past_date():
+    app = report_app()
+
+    no_contact = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={
+            "payload": json.dumps(valid_payload(reporterPhone=None))
+        },
+        files=photos_form(1),
+        headers=IDEMPOTENCY,
+    )
+    future = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={
+            "payload": json.dumps(valid_payload(lastSeenDate="2999-01-01"))
+        },
+        files=photos_form(1),
+        headers=IDEMPOTENCY,
+    )
+
+    assert no_contact.status_code == 422
+    assert future.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_report_requires_idempotency_key():
+    app = report_app()
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(valid_payload())},
+        files=photos_form(1),
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_report_idempotent_retry_returns_original_receipt():
+    storage = FakeStorage()
+    app = report_app(
+        repository=FakeMissingPersonRepository(duplicate=True),
+        storage=storage,
+    )
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(valid_payload())},
+        files=photos_form(1),
+        headers=IDEMPOTENCY,
+    )
+
+    assert response.status_code == 201
+    assert response.json()["publicCaseCode"] == "MP-2026-AAAA1111"
+    # Los archivos del reintento se descartan: no queda copia huérfana.
+    assert len(storage.deleted) == 2
+    assert storage.objects == {}
+
+
+@pytest.mark.anyio
+async def test_report_storage_failure_returns_503_without_publishing():
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository, storage=FakeStorage(fail=True))
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(valid_payload())},
+        files=photos_form(1),
+        headers=IDEMPOTENCY,
+    )
+
+    assert response.status_code == 503
+    assert response.headers["content-type"] == "application/problem+json"
+    assert repository.created_report is None
+
+
+@pytest.mark.anyio
+async def test_report_database_failure_cleans_stored_files():
+    storage = FakeStorage()
+    app = report_app(
+        repository=FakeMissingPersonRepository(fail=True),
+        storage=storage,
+    )
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(valid_payload())},
+        files=photos_form(1),
+        headers=IDEMPOTENCY,
+    )
+
+    assert response.status_code == 503
+    assert storage.objects == {}
+    assert len(storage.deleted) == 2
+
+
+# --- Unidades del pipeline de fotos ---
+
+
+def test_sniff_image_type_detects_real_content():
+    assert sniff_image_type(make_jpeg()) == "image/jpeg"
+    assert sniff_image_type(make_png()) == "image/png"
+    heic_header = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 8
+    assert sniff_image_type(heic_header) == "image/heic"
+    assert sniff_image_type(b"GIF89a" + b"\x00" * 32) is None
+    assert sniff_image_type(b"no imagen") is None
+
+
+def test_signature_scanner_flags_eicar_and_executables():
+    scanner = SignatureMalwareScanner()
+    assert scanner.scan(make_jpeg()) is True
+    assert scanner.scan(make_jpeg() + EICAR) is False
+    assert scanner.scan(b"\x7fELF" + b"\x00" * 32) is False
+
+
+def test_strip_metadata_removes_exif_and_reencodes():
+    original = make_jpeg(with_exif=True)
+    exif_before = Image.open(BytesIO(original)).getexif()
+    assert dict(exif_before) != {}
+
+    sanitized = strip_metadata(original, "image/jpeg")
+
+    assert sanitized.content_type == "image/jpeg"
+    derived = Image.open(BytesIO(sanitized.data))
+    assert dict(derived.getexif()) == {}
