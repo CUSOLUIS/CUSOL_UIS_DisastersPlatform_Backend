@@ -15,6 +15,7 @@ from .models import (
     MissingPersonReportReceipt,
     MissingPersonSearchResponse,
     OperationalMapOverview,
+    PeopleRecordPage,
 )
 from .ratelimit import SlidingWindowRateLimiter
 
@@ -181,6 +182,53 @@ def create_app(
         except (httpx.HTTPError, httpx.TimeoutException, ValueError):
             return problem_response(
                 "No fue posible consultar el resumen humano en este momento.",
+                title="Servicio de personas no disponible",
+            )
+
+    @application.get(
+        "/api/v1/people/records",
+        response_model=PeopleRecordPage,
+        response_model_by_alias=True,
+        responses={503: {"description": "Servicio no disponible"}},
+        tags=["People"],
+    )
+    async def list_people_records(
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        limit: Annotated[int, Query(ge=1, le=50)] = 10,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        statuses: Annotated[
+            list[HumanStatus] | None, Query()
+        ] = None,
+        q: Annotated[str | None, Query(max_length=100)] = None,
+    ):
+        if limit not in (10, 25, 50):
+            return problem_response(
+                "El tamaño de página debe ser 10, 25 o 50.",
+                title="Tamaño de página inválido",
+                status_code=422,
+                problem_type="invalid-parameters",
+            )
+        params: list[tuple[str, str]] = [
+            ("limit", str(limit)),
+            ("offset", str(offset)),
+        ]
+        for status in statuses or []:
+            params.append(("statuses", status))
+        if q is not None:
+            params.append(("q", q))
+        try:
+            response = await upstream.get(
+                "/internal/v1/people/records",
+                params=params,
+            )
+            if response.status_code == 422:
+                return passthrough(response)
+            response.raise_for_status()
+            return PeopleRecordPage.model_validate(response.json())
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar los registros de personas "
+                "en este momento.",
                 title="Servicio de personas no disponible",
             )
 

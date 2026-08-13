@@ -120,6 +120,14 @@ class DisasterRepository(Protocol):
         recent_limit: int,
     ) -> tuple[HumanImpactSummary, list[PersonRecord]]: ...
 
+    async def list_people_records(
+        self,
+        statuses: list[str] | None,
+        search: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[PersonRecord], int]: ...
+
     async def operational_map_overview(
         self,
         limit: int,
@@ -302,6 +310,94 @@ class PostgresDisasterRepository:
             for row in rows
         ]
         return summary, recent
+
+    async def list_people_records(
+        self,
+        statuses: list[str] | None,
+        search: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[PersonRecord], int]:
+        # CHG-018: búsqueda solo sobre campos públicos del contrato
+        # (nombre público, ubicación, evento y nombre de fuente); unaccent
+        # y lower cubren tildes y mayúsculas. Orden estable para paginar.
+        clauses: list[str] = []
+        filter_values: list[object] = []
+
+        if statuses:
+            filter_values.append(statuses)
+            clauses.append(
+                f"p.status::text = ANY(${len(filter_values)}::text[])"
+            )
+        if search:
+            filter_values.append(search)
+            position = len(filter_values)
+            clauses.append(
+                f"""(
+                lower(unaccent(p.display_name)) LIKE
+                    '%' || lower(unaccent(${position})) || '%'
+                OR lower(unaccent(p.location)) LIKE
+                    '%' || lower(unaccent(${position})) || '%'
+                OR lower(unaccent(p.related_event)) LIKE
+                    '%' || lower(unaccent(${position})) || '%'
+                OR lower(unaccent(s.name)) LIKE
+                    '%' || lower(unaccent(${position})) || '%'
+                )"""
+            )
+
+        where_clause = (
+            "WHERE " + " AND ".join(clauses) if clauses else ""
+        )
+        total = await self._pool.fetchval(
+            f"""
+            SELECT COUNT(*)
+            FROM disaster_service.people p
+            INNER JOIN disaster_service.sources s ON s.id = p.source_id
+            {where_clause}
+            """,
+            *filter_values,
+        )
+
+        query_values = [*filter_values, limit, offset]
+        limit_parameter = len(filter_values) + 1
+        offset_parameter = len(filter_values) + 2
+        rows = await self._pool.fetch(
+            f"""
+            SELECT
+                p.id,
+                p.display_name,
+                p.status,
+                p.location,
+                p.related_event,
+                p.created_at,
+                s.name AS source_name,
+                s.source_type,
+                s.url AS source_url
+            FROM disaster_service.people p
+            INNER JOIN disaster_service.sources s ON s.id = p.source_id
+            {where_clause}
+            ORDER BY p.created_at DESC, p.id DESC
+            LIMIT ${limit_parameter} OFFSET ${offset_parameter}
+            """,
+            *query_values,
+        )
+        records = [
+            PersonRecord(
+                id=row["id"],
+                display_name=row["display_name"],
+                status=row["status"],
+                location=row["location"],
+                related_event=row["related_event"],
+                created_at=row["created_at"],
+                source=SourceReference(
+                    name=row["source_name"],
+                    source_type=row["source_type"],
+                    url=row["source_url"],
+                ),
+            )
+            for row in rows
+        ]
+        return records, int(total)
 
     async def operational_map_overview(
         self,

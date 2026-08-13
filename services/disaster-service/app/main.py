@@ -29,6 +29,7 @@ from .models import (
     OperationalMapOverview,
     OperationalMapPoint,
     OperationalMapSummary,
+    PeopleRecordPage,
 )
 from .photos import (
     MalwareScanner,
@@ -339,6 +340,53 @@ def create_app(
         return HumanImpactOverview(
             summary=summary,
             recent_people=recent,
+            generated_at=datetime.now(UTC),
+        )
+
+    @application.get(
+        "/internal/v1/people/records",
+        response_model=PeopleRecordPage,
+        response_model_by_alias=True,
+        tags=["People"],
+    )
+    async def list_people_records(
+        data: Annotated[
+            DisasterRepository, Depends(get_repository)
+        ],
+        limit: Annotated[int, Query(ge=1, le=50)] = 10,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        statuses: Annotated[
+            list[HumanStatus] | None, Query()
+        ] = None,
+        q: Annotated[str | None, Query(max_length=100)] = None,
+    ) -> PeopleRecordPage | JSONResponse:
+        if limit not in (10, 25, 50):
+            return problem(
+                422,
+                "Tamaño de página inválido",
+                "El tamaño de página debe ser 10, 25 o 50.",
+            )
+        search = (q or "").strip()
+        if q is not None and q.strip() and len(search) < 2:
+            return problem(
+                422,
+                "Búsqueda inválida",
+                "La búsqueda requiere entre 2 y 100 caracteres.",
+            )
+        unique_statuses = (
+            list(dict.fromkeys(statuses)) if statuses else None
+        )
+        items, total = await data.list_people_records(
+            unique_statuses,
+            search or None,
+            limit,
+            offset,
+        )
+        return PeopleRecordPage(
+            items=items,
+            total=total,
+            limit=limit,
+            offset=offset,
             generated_at=datetime.now(UTC),
         )
 

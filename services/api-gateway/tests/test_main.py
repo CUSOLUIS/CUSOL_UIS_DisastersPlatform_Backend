@@ -174,6 +174,118 @@ async def test_people_overview_reports_upstream_failure_as_problem():
     assert response.json()["title"] == "Servicio de personas no disponible"
 
 
+PEOPLE_RECORD_PAGE = {
+    "items": [
+        {
+            "id": "33333333-3333-4333-8333-333333333301",
+            "displayName": "Persona demo 2000 — P.V.",
+            "status": "missing",
+            "location": "Bogotá, D.C.",
+            "relatedEvent": "Inundación en el norte de Bucaramanga",
+            "source": {
+                "name": "Reporte ciudadano — plataforma CUSOL",
+                "sourceType": "citizen",
+                "url": None,
+            },
+            "createdAt": "2026-08-13T04:00:00Z",
+        }
+    ],
+    "total": 2012,
+    "limit": 10,
+    "offset": 20,
+    "generatedAt": "2026-08-13T22:00:00Z",
+}
+
+
+@pytest.mark.anyio
+async def test_people_records_forwards_all_parameters():
+    def handler(request: httpx.Request):
+        assert request.url.path == "/internal/v1/people/records"
+        params = request.url.params
+        assert params["limit"] == "25"
+        assert params["offset"] == "50"
+        assert params.get_list("statuses") == [
+            "missing", "confirmed_alive"
+        ]
+        assert params["q"] == "bogotá"
+        return httpx.Response(200, json=PEOPLE_RECORD_PAGE)
+
+    upstream = mock_client(handler)
+    app = create_app(SETTINGS, upstream)
+
+    response = await get(
+        app,
+        "/api/v1/people/records?limit=25&offset=50"
+        "&statuses=missing&statuses=confirmed_alive&q=bogot%C3%A1",
+    )
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2012
+    assert body["items"][0]["displayName"] == "Persona demo 2000 — P.V."
+
+
+@pytest.mark.anyio
+async def test_people_records_rejects_invalid_limit_without_upstream():
+    def handler(request: httpx.Request):
+        raise AssertionError(
+            "no debe llamarse al upstream con parámetros inválidos"
+        )
+
+    upstream = mock_client(handler)
+    app = create_app(SETTINGS, upstream)
+
+    eleven = await get(app, "/api/v1/people/records?limit=11")
+    negative = await get(app, "/api/v1/people/records?offset=-1")
+    bad_status = await get(
+        app, "/api/v1/people/records?statuses=otro"
+    )
+    await upstream.aclose()
+
+    assert eleven.status_code == 422
+    assert negative.status_code == 422
+    assert bad_status.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_people_records_passes_through_upstream_422():
+    upstream = mock_client(
+        lambda _: httpx.Response(
+            422,
+            json={
+                "type": "about:blank",
+                "title": "Búsqueda inválida",
+                "status": 422,
+                "detail": "La búsqueda requiere entre 2 y 100 caracteres.",
+            },
+        )
+    )
+    app = create_app(SETTINGS, upstream)
+
+    response = await get(app, "/api/v1/people/records?q=ab")
+    await upstream.aclose()
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_people_records_reports_upstream_failure_as_problem():
+    upstream = mock_client(
+        lambda _: httpx.Response(500, json={"detail": "boom"})
+    )
+    app = create_app(SETTINGS, upstream)
+
+    response = await get(app, "/api/v1/people/records")
+    await upstream.aclose()
+
+    assert response.status_code == 503
+    assert response.headers["content-type"] == "application/problem+json"
+    assert response.json()["title"] == (
+        "Servicio de personas no disponible"
+    )
+
+
 HUMAN_MAP_OVERVIEW = {
     "features": [
         {

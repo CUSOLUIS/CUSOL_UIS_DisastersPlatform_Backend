@@ -81,6 +81,16 @@ class HumanImpactOverview(ApiModel):
     generated_at: datetime
 
 
+class PeopleRecordPage(ApiModel):
+    """Página de registros públicos (CHG-018): solo PersonRecord."""
+
+    items: list[PersonRecord] = Field(max_length=50)
+    total: int = Field(ge=0)
+    limit: Literal[10, 25, 50]
+    offset: int = Field(ge=0)
+    generated_at: datetime
+
+
 OperationalMapCategory = Literal[
     "missing_person",
     "collection_center",
