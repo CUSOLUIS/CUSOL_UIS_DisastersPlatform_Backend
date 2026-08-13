@@ -556,3 +556,94 @@ def test_strip_metadata_removes_exif_and_reencodes():
     assert sanitized.content_type == "image/jpeg"
     derived = Image.open(BytesIO(sanitized.data))
     assert dict(derived.getexif()) == {}
+
+
+# --- CHG-015: coordenadas privadas del último avistamiento ---
+
+
+@pytest.mark.anyio
+async def test_report_rejects_lone_or_out_of_range_coordinates():
+    app = report_app()
+
+    lone_latitude = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={
+            "payload": json.dumps(
+                valid_payload(lastSeenLatitude=7.1193)
+            )
+        },
+        files=photos_form(1),
+        headers=IDEMPOTENCY,
+    )
+    out_of_range = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={
+            "payload": json.dumps(
+                valid_payload(
+                    lastSeenLatitude=95.0, lastSeenLongitude=-73.1
+                )
+            )
+        },
+        files=photos_form(1),
+        headers=IDEMPOTENCY,
+    )
+
+    assert lone_latitude.status_code == 422
+    assert out_of_range.status_code == 422
+    # Nunca se devuelven los valores enviados.
+    assert "7.1193" not in lone_latitude.text
+    assert "95.0" not in out_of_range.text
+
+
+@pytest.mark.anyio
+async def test_report_persists_private_coordinates_without_publishing():
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={
+            "payload": json.dumps(
+                valid_payload(
+                    lastSeenLatitude=7.1193,
+                    lastSeenLongitude=-73.1227,
+                )
+            )
+        },
+        files=photos_form(1),
+        headers=IDEMPOTENCY,
+    )
+
+    assert response.status_code == 201
+    stored = repository.created_report
+    assert stored.last_seen_latitude == 7.1193
+    assert stored.last_seen_longitude == -73.1227
+    # La constancia pública no expone las coordenadas privadas.
+    assert set(response.json().keys()) == {
+        "id", "publicCaseCode", "status", "receivedAt"
+    }
+
+
+@pytest.mark.anyio
+async def test_report_without_coordinates_still_accepted():
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(valid_payload())},
+        files=photos_form(1),
+        headers=IDEMPOTENCY,
+    )
+
+    assert response.status_code == 201
+    assert repository.created_report.last_seen_latitude is None
+    assert repository.created_report.last_seen_longitude is None

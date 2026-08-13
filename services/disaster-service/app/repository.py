@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Protocol
 from uuid import UUID
 
@@ -16,6 +16,38 @@ from .models import (
     SourceReference,
     VerificationStatus,
 )
+
+
+@dataclass(frozen=True)
+class HumanMapCell:
+    """Agregado por celda de grilla para la capa humana (CHG-015).
+
+    Cuando `count == 1` los campos `point_*` describen el único punto
+    público anónimo de la celda; nunca incluyen identidad.
+    """
+
+    cell_x: int
+    cell_y: int
+    count: int
+    missing: int
+    reported_deceased: int
+    confirmed_alive: int
+    confirmed_deceased: int
+    latitude: float
+    longitude: float
+    west: float
+    south: float
+    east: float
+    north: float
+    all_operational: bool
+    point_id: UUID | None = None
+    point_status: str | None = None
+    point_precision: str | None = None
+    point_verification: str | None = None
+    point_source_name: str | None = None
+    point_source_type: str | None = None
+    point_source_url: str | None = None
+    point_updated_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +75,9 @@ class StoredReport:
     medical_information_encrypted: bytes | None
     last_seen_date: date
     last_seen_time: str | None
+    # CHG-015: coordenadas privadas; nunca se publican automáticamente.
+    last_seen_latitude: float | None
+    last_seen_longitude: float | None
     department: str
     municipality: str
     last_seen_area: str
@@ -89,6 +124,16 @@ class DisasterRepository(Protocol):
         self,
         limit: int,
     ) -> tuple[list[OperationalMapPoint], DataClassification]: ...
+
+    async def human_map_overview(
+        self,
+        west: float,
+        south: float,
+        east: float,
+        north: float,
+        cell_size: float,
+        statuses: list[str] | None,
+    ) -> tuple[list[HumanMapCell], int]: ...
 
     async def search_missing_persons(
         self,
@@ -318,6 +363,139 @@ class PostgresDisasterRepository:
         )
         return points, classification
 
+    async def human_map_overview(
+        self,
+        west: float,
+        south: float,
+        east: float,
+        north: float,
+        cell_size: float,
+        statuses: list[str] | None,
+    ) -> tuple[list[HumanMapCell], int]:
+        # Una sola consulta agregada por celda de grilla (sin N+1); el
+        # filtro espacial usa && sobre geography para aprovechar el GIST.
+        rows = await self._pool.fetch(
+            """
+            WITH filtered AS (
+                SELECT
+                    pr.id AS public_id,
+                    ST_Y(pr.location::geometry) AS latitude,
+                    ST_X(pr.location::geometry) AS longitude,
+                    pr.coordinate_precision,
+                    pr.verification_status,
+                    pr.data_classification,
+                    pr.updated_at,
+                    p.status,
+                    s.name AS source_name,
+                    s.source_type,
+                    s.url AS source_url
+                FROM disaster_service.people_map_projection pr
+                INNER JOIN disaster_service.people p
+                    ON p.id = pr.person_id
+                INNER JOIN disaster_service.sources s
+                    ON s.id = p.source_id
+                WHERE pr.visibility = 'published'
+                  AND (
+                    $5::text[] IS NULL
+                    OR p.status::text = ANY($5::text[])
+                  )
+                  AND pr.location && ST_MakeEnvelope(
+                        $1, $2, $3, $4, 4326
+                      )::geography
+            )
+            SELECT
+                floor((longitude + 180.0) / $6)::int AS cell_x,
+                floor((latitude + 90.0) / $6)::int AS cell_y,
+                COUNT(*)::int AS count,
+                COUNT(*) FILTER (WHERE status = 'missing')::int
+                    AS missing,
+                COUNT(*) FILTER (WHERE status = 'reported_deceased')::int
+                    AS reported_deceased,
+                COUNT(*) FILTER (WHERE status = 'confirmed_alive')::int
+                    AS confirmed_alive,
+                COUNT(*) FILTER (WHERE status = 'confirmed_deceased')::int
+                    AS confirmed_deceased,
+                AVG(latitude) AS latitude,
+                AVG(longitude) AS longitude,
+                MIN(longitude) AS west,
+                MIN(latitude) AS south,
+                MAX(longitude) AS east,
+                MAX(latitude) AS north,
+                bool_and(data_classification = 'operational')
+                    AS all_operational,
+                (array_agg(public_id ORDER BY public_id))[1]
+                    AS point_id,
+                (array_agg(status ORDER BY public_id))[1]
+                    AS point_status,
+                (array_agg(coordinate_precision ORDER BY public_id))[1]
+                    AS point_precision,
+                (array_agg(verification_status ORDER BY public_id))[1]
+                    AS point_verification,
+                (array_agg(source_name ORDER BY public_id))[1]
+                    AS point_source_name,
+                (array_agg(source_type ORDER BY public_id))[1]
+                    AS point_source_type,
+                (array_agg(source_url ORDER BY public_id))[1]
+                    AS point_source_url,
+                (array_agg(updated_at ORDER BY public_id))[1]
+                    AS point_updated_at
+            FROM filtered
+            GROUP BY cell_x, cell_y
+            ORDER BY count DESC, cell_x, cell_y
+            """,
+            west,
+            south,
+            east,
+            north,
+            statuses,
+            cell_size,
+        )
+        cells = [
+            HumanMapCell(
+                cell_x=row["cell_x"],
+                cell_y=row["cell_y"],
+                count=row["count"],
+                missing=row["missing"],
+                reported_deceased=row["reported_deceased"],
+                confirmed_alive=row["confirmed_alive"],
+                confirmed_deceased=row["confirmed_deceased"],
+                latitude=float(row["latitude"]),
+                longitude=float(row["longitude"]),
+                west=float(row["west"]),
+                south=float(row["south"]),
+                east=float(row["east"]),
+                north=float(row["north"]),
+                all_operational=row["all_operational"],
+                point_id=row["point_id"],
+                point_status=row["point_status"],
+                point_precision=row["point_precision"],
+                point_verification=row["point_verification"],
+                point_source_name=row["point_source_name"],
+                point_source_type=row["point_source_type"],
+                point_source_url=row["point_source_url"],
+                point_updated_at=row["point_updated_at"],
+            )
+            for row in rows
+        ]
+        unmapped = await self._pool.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM disaster_service.people p
+            WHERE (
+                $1::text[] IS NULL
+                OR p.status::text = ANY($1::text[])
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM disaster_service.people_map_projection pr
+                WHERE pr.person_id = p.id
+                  AND pr.visibility = 'published'
+            )
+            """,
+            statuses,
+        )
+        return cells, int(unmapped)
+
     async def search_missing_persons(
         self,
         query: str,
@@ -423,12 +601,13 @@ class PostgresDisasterRepository:
                             reporter_name_encrypted, reporter_relationship,
                             reporter_phone_encrypted,
                             reporter_email_encrypted,
-                            official_report_number
+                            official_report_number,
+                            last_seen_latitude, last_seen_longitude
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                             $11, $12, $13, $14, $15, $16, $17, $18, $19,
                             $20, $21, $22, $23, $24, $25, $26, $27, $28,
-                            $29, $30, $31, $32
+                            $29, $30, $31, $32, $33, $34
                         )
                         RETURNING id, public_case_code, status, received_at
                         """,
@@ -464,6 +643,8 @@ class PostgresDisasterRepository:
                         report.reporter_phone_encrypted,
                         report.reporter_email_encrypted,
                         report.official_report_number,
+                        report.last_seen_latitude,
+                        report.last_seen_longitude,
                     )
                     for photo in photos:
                         await connection.execute(

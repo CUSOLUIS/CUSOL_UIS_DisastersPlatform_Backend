@@ -17,6 +17,12 @@ from .models import (
     DisasterEventList,
     HealthStatus,
     HumanImpactOverview,
+    HumanMapBounds,
+    HumanMapCluster,
+    HumanMapOverview,
+    HumanMapPoint,
+    HumanMapStatusCounts,
+    HumanStatus,
     MissingPersonReportInput,
     MissingPersonReportReceipt,
     MissingPersonSearchResponse,
@@ -31,8 +37,10 @@ from .photos import (
     sniff_image_type,
     strip_metadata,
 )
+from .models import SourceReference
 from .repository import (
     DisasterRepository,
+    HumanMapCell,
     PostgresDisasterRepository,
     StoredPhoto,
     StoredReport,
@@ -88,6 +96,114 @@ def protect_missing_person(
             "longitude": round(point.longitude, 2),
         }
     )
+
+
+# CHG-015 — Capa geográfica de situación humana.
+HUMAN_MAP_GRID_DIVISIONS = 20
+
+
+def human_map_cell_size(
+    zoom: int,
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+) -> float:
+    """Tamaño determinista de celda de la grilla de clustering.
+
+    La componente de zoom divide el mundo en celdas de ~1/4 de tesela;
+    las componentes de bbox garantizan a lo sumo 20×20 celdas visibles,
+    de modo que la respuesta nunca supera 500 features.
+    """
+    zoom_cell = 360.0 / (2**zoom * 4)
+    return max(
+        zoom_cell,
+        (east - west) / HUMAN_MAP_GRID_DIVISIONS,
+        (north - south) / HUMAN_MAP_GRID_DIVISIONS,
+    )
+
+
+def encode_map_cursor(offset: int) -> str:
+    return base64.urlsafe_b64encode(f"o:{offset}".encode()).decode()
+
+
+def decode_map_cursor(cursor: str) -> int | None:
+    """Devuelve el offset del cursor opaco, o None si es inválido."""
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode()).decode()
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not raw.startswith("o:"):
+        return None
+    try:
+        offset = int(raw[2:])
+    except ValueError:
+        return None
+    return offset if offset >= 0 else None
+
+
+def build_human_map_features(
+    cells: list[HumanMapCell],
+    zoom: int,
+) -> list[HumanMapCluster | HumanMapPoint]:
+    """Convierte celdas en features: clusters primero, luego puntos.
+
+    El orden es determinista (clusters por count descendente e id;
+    puntos por id) para que el cursor sea estable entre páginas.
+    """
+    clusters: list[HumanMapCluster] = []
+    points: list[HumanMapPoint] = []
+    for cell in cells:
+        if cell.count == 1:
+            precision = cell.point_precision
+            latitude = cell.latitude
+            longitude = cell.longitude
+            if precision == "exact":
+                # Defensa en profundidad DEC-007: la base ya lo impide,
+                # pero jamás se publica una coordenada exacta.
+                precision = "approximate"
+                latitude = round(latitude, 2)
+                longitude = round(longitude, 2)
+            points.append(
+                HumanMapPoint(
+                    id=cell.point_id,
+                    status=cell.point_status,
+                    latitude=latitude,
+                    longitude=longitude,
+                    coordinate_precision=precision,
+                    verification_status=cell.point_verification,
+                    source=SourceReference(
+                        name=cell.point_source_name,
+                        source_type=cell.point_source_type,
+                        url=cell.point_source_url,
+                    ),
+                    updated_at=cell.point_updated_at,
+                )
+            )
+        else:
+            clusters.append(
+                HumanMapCluster(
+                    id=f"z{zoom}:x{cell.cell_x}:y{cell.cell_y}",
+                    latitude=cell.latitude,
+                    longitude=cell.longitude,
+                    count=cell.count,
+                    status_counts=HumanMapStatusCounts(
+                        missing=cell.missing,
+                        reported_deceased=cell.reported_deceased,
+                        confirmed_alive=cell.confirmed_alive,
+                        confirmed_deceased=cell.confirmed_deceased,
+                    ),
+                    bounds=HumanMapBounds(
+                        west=cell.west,
+                        south=cell.south,
+                        east=cell.east,
+                        north=cell.north,
+                    ),
+                )
+            )
+    clusters.sort(key=lambda cluster: (-cluster.count, cluster.id))
+    points.sort(key=lambda point: str(point.id))
+    return [*clusters, *points]
 
 
 def create_app(
@@ -224,6 +340,77 @@ def create_app(
             summary=summary,
             recent_people=recent,
             generated_at=datetime.now(UTC),
+        )
+
+    @application.get(
+        "/internal/v1/people/map-overview",
+        response_model=HumanMapOverview,
+        response_model_by_alias=True,
+        tags=["People"],
+    )
+    async def human_map_overview(
+        data: Annotated[
+            DisasterRepository, Depends(get_repository)
+        ],
+        west: Annotated[float, Query(ge=-180, le=180)],
+        south: Annotated[float, Query(ge=-90, le=90)],
+        east: Annotated[float, Query(ge=-180, le=180)],
+        north: Annotated[float, Query(ge=-90, le=90)],
+        zoom: Annotated[int, Query(ge=3, le=19)],
+        statuses: Annotated[
+            list[HumanStatus] | None, Query()
+        ] = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 200,
+        cursor: Annotated[str | None, Query(max_length=100)] = None,
+    ):
+        if west >= east or south >= north:
+            return problem(
+                422,
+                "Área inválida",
+                "El bbox requiere west < east y south < north.",
+            )
+        offset = 0
+        if cursor is not None:
+            decoded = decode_map_cursor(cursor)
+            if decoded is None:
+                return problem(
+                    422,
+                    "Cursor inválido",
+                    "El cursor no corresponde a esta consulta.",
+                )
+            offset = decoded
+
+        cell_size = human_map_cell_size(zoom, west, south, east, north)
+        cells, unmapped = await data.human_map_overview(
+            west,
+            south,
+            east,
+            north,
+            cell_size,
+            list(statuses) if statuses else None,
+        )
+        features = build_human_map_features(cells, zoom)
+        total_mapped = sum(cell.count for cell in cells)
+        page = features[offset:offset + limit]
+        next_cursor = (
+            encode_map_cursor(offset + limit)
+            if offset + limit < len(features)
+            else None
+        )
+        classification = (
+            "operational"
+            if cells and all(cell.all_operational for cell in cells)
+            else "demonstrative"
+        )
+        return HumanMapOverview(
+            features=page,
+            total_matched=total_mapped + unmapped,
+            total_mapped=total_mapped,
+            unmapped_count=unmapped,
+            returned_features=len(page),
+            next_cursor=next_cursor,
+            generated_at=datetime.now(UTC),
+            data_classification=classification,
         )
 
     @application.get(
@@ -501,6 +688,8 @@ def create_app(
             ),
             last_seen_date=payload.last_seen_date,
             last_seen_time=payload.last_seen_time,
+            last_seen_latitude=payload.last_seen_latitude,
+            last_seen_longitude=payload.last_seen_longitude,
             department=payload.department,
             municipality=payload.municipality,
             last_seen_area=payload.last_seen_area,

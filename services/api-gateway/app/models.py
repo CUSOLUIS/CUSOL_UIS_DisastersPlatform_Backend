@@ -92,6 +92,57 @@ CoordinatePrecision = Literal["exact", "approximate", "municipality"]
 DataClassification = Literal["demonstrative", "operational"]
 
 
+# CHG-015 — Capa geográfica de situación humana (espejo del contrato).
+HumanMapPrecision = Literal["approximate", "municipality"]
+
+
+class HumanMapStatusCounts(ApiModel):
+    missing: int = Field(ge=0)
+    reported_deceased: int = Field(ge=0)
+    confirmed_alive: int = Field(ge=0)
+    confirmed_deceased: int = Field(ge=0)
+
+
+class HumanMapBounds(ApiModel):
+    west: float = Field(ge=-180, le=180)
+    south: float = Field(ge=-90, le=90)
+    east: float = Field(ge=-180, le=180)
+    north: float = Field(ge=-90, le=90)
+
+
+class HumanMapCluster(ApiModel):
+    kind: Literal["cluster"] = "cluster"
+    id: str = Field(min_length=1)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    count: int = Field(ge=2)
+    status_counts: HumanMapStatusCounts
+    bounds: HumanMapBounds
+
+
+class HumanMapPoint(ApiModel):
+    kind: Literal["point"] = "point"
+    id: UUID
+    status: HumanStatus
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    coordinate_precision: HumanMapPrecision
+    verification_status: VerificationStatus
+    source: SourceReference
+    updated_at: datetime
+
+
+class HumanMapOverview(ApiModel):
+    features: list[HumanMapCluster | HumanMapPoint] = Field(max_length=500)
+    total_matched: int = Field(ge=0)
+    total_mapped: int = Field(ge=0)
+    unmapped_count: int = Field(ge=0)
+    returned_features: int = Field(ge=0)
+    next_cursor: str | None = None
+    generated_at: datetime
+    data_classification: DataClassification
+
+
 class OperationalMapPoint(ApiModel):
     id: UUID
     category: OperationalMapCategory

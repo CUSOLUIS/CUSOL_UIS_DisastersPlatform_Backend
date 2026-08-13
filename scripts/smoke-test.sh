@@ -22,4 +22,14 @@ curl --fail --silent --show-error \
   "http://127.0.0.1:${frontend_port}/api/v1/operational-map/overview" \
   | grep -q '"buildingPending"'
 
-printf '%s\n' "Smoke test correcto: frontend, gateway y disaster-service conectados (mapa operativo con buildingPending)."
+# CHG-015: la capa de situación humana responde con totales por el
+# gateway y por el proxy del frontend.
+human_map_query="west=-79.0&south=-4.3&east=-66.8&north=12.6&zoom=5"
+curl --fail --silent --show-error \
+  "http://127.0.0.1:${gateway_port}/api/v1/people/map-overview?${human_map_query}" \
+  | grep -q '"totalMapped"'
+curl --fail --silent --show-error \
+  "http://127.0.0.1:${frontend_port}/api/v1/people/map-overview?${human_map_query}" \
+  | grep -q '"totalMapped"'
+
+printf '%s\n' "Smoke test correcto: frontend, gateway y disaster-service conectados (mapa operativo con buildingPending; capa humana con clusters)."

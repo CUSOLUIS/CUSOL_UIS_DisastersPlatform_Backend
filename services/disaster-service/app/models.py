@@ -2,7 +2,7 @@ from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 VerificationStatus = Literal[
@@ -123,6 +123,60 @@ class OperationalMapOverview(ApiModel):
     data_classification: DataClassification
 
 
+# CHG-015 — Capa geográfica de situación humana. DEC-007: la precisión
+# pública nunca es "exact".
+HumanMapPrecision = Literal["approximate", "municipality"]
+
+
+class HumanMapStatusCounts(ApiModel):
+    missing: int = Field(ge=0)
+    reported_deceased: int = Field(ge=0)
+    confirmed_alive: int = Field(ge=0)
+    confirmed_deceased: int = Field(ge=0)
+
+
+class HumanMapBounds(ApiModel):
+    west: float = Field(ge=-180, le=180)
+    south: float = Field(ge=-90, le=90)
+    east: float = Field(ge=-180, le=180)
+    north: float = Field(ge=-90, le=90)
+
+
+class HumanMapCluster(ApiModel):
+    kind: Literal["cluster"] = "cluster"
+    id: str = Field(min_length=1)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    count: int = Field(ge=2)
+    status_counts: HumanMapStatusCounts
+    bounds: HumanMapBounds
+
+
+class HumanMapPoint(ApiModel):
+    """Punto público anónimo: sin identidad ni coordenada exacta."""
+
+    kind: Literal["point"] = "point"
+    id: UUID
+    status: HumanStatus
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    coordinate_precision: HumanMapPrecision
+    verification_status: VerificationStatus
+    source: SourceReference
+    updated_at: datetime
+
+
+class HumanMapOverview(ApiModel):
+    features: list[HumanMapCluster | HumanMapPoint] = Field(max_length=500)
+    total_matched: int = Field(ge=0)
+    total_mapped: int = Field(ge=0)
+    unmapped_count: int = Field(ge=0)
+    returned_features: int = Field(ge=0)
+    next_cursor: str | None = None
+    generated_at: datetime
+    data_classification: DataClassification
+
+
 class MissingPersonPublicRecord(ApiModel):
     """Proyección pública moderada: solo campos autorizados (FEATURE-004)."""
 
@@ -180,6 +234,12 @@ class MissingPersonReportInput(ApiModel):
     last_seen_time: str | None = Field(
         default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$"
     )
+    # CHG-015: coordenadas privadas del último avistamiento; llegan en
+    # pareja o no llegan. Nunca se publican automáticamente.
+    last_seen_latitude: float | None = Field(default=None, ge=-90, le=90)
+    last_seen_longitude: float | None = Field(
+        default=None, ge=-180, le=180
+    )
     department: str = Field(min_length=1, max_length=100)
     municipality: str = Field(min_length=1, max_length=100)
     last_seen_area: str = Field(min_length=1, max_length=300)
@@ -194,6 +254,17 @@ class MissingPersonReportInput(ApiModel):
     truth_confirmed: Literal[True]
     photo_authorization_confirmed: Literal[True]
     review_acknowledged: Literal[True]
+
+    @model_validator(mode="after")
+    def _last_seen_coordinates_pair(self):
+        latitude_missing = self.last_seen_latitude is None
+        longitude_missing = self.last_seen_longitude is None
+        if latitude_missing != longitude_missing:
+            raise ValueError(
+                "lastSeenLatitude y lastSeenLongitude deben enviarse "
+                "juntas o ambas ausentes"
+            )
+        return self
 
 
 class MissingPersonReportReceipt(ApiModel):

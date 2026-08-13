@@ -10,6 +10,8 @@ from .models import (
     DisasterEventList,
     HealthStatus,
     HumanImpactOverview,
+    HumanMapOverview,
+    HumanStatus,
     MissingPersonReportReceipt,
     MissingPersonSearchResponse,
     OperationalMapOverview,
@@ -179,6 +181,61 @@ def create_app(
         except (httpx.HTTPError, httpx.TimeoutException, ValueError):
             return problem_response(
                 "No fue posible consultar el resumen humano en este momento.",
+                title="Servicio de personas no disponible",
+            )
+
+    @application.get(
+        "/api/v1/people/map-overview",
+        response_model=HumanMapOverview,
+        response_model_by_alias=True,
+        responses={503: {"description": "Servicio no disponible"}},
+        tags=["People"],
+    )
+    async def human_map_overview(
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        west: Annotated[float, Query(ge=-180, le=180)],
+        south: Annotated[float, Query(ge=-90, le=90)],
+        east: Annotated[float, Query(ge=-180, le=180)],
+        north: Annotated[float, Query(ge=-90, le=90)],
+        zoom: Annotated[int, Query(ge=3, le=19)],
+        statuses: Annotated[
+            list[HumanStatus] | None, Query()
+        ] = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 200,
+        cursor: Annotated[str | None, Query(max_length=100)] = None,
+    ):
+        if west >= east or south >= north:
+            return problem_response(
+                "El bbox requiere west < east y south < north.",
+                title="Área inválida",
+                status_code=422,
+                problem_type="invalid-parameters",
+            )
+        params: list[tuple[str, str]] = [
+            ("west", str(west)),
+            ("south", str(south)),
+            ("east", str(east)),
+            ("north", str(north)),
+            ("zoom", str(zoom)),
+            ("limit", str(limit)),
+        ]
+        for status in statuses or []:
+            params.append(("statuses", status))
+        if cursor is not None:
+            params.append(("cursor", cursor))
+        try:
+            response = await upstream.get(
+                "/internal/v1/people/map-overview",
+                params=params,
+            )
+            if response.status_code == 422:
+                return passthrough(response)
+            response.raise_for_status()
+            return HumanMapOverview.model_validate(response.json())
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar el mapa de situación humana "
+                "en este momento.",
                 title="Servicio de personas no disponible",
             )
 

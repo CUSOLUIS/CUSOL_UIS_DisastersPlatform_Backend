@@ -174,6 +174,174 @@ async def test_people_overview_reports_upstream_failure_as_problem():
     assert response.json()["title"] == "Servicio de personas no disponible"
 
 
+HUMAN_MAP_OVERVIEW = {
+    "features": [
+        {
+            "kind": "cluster",
+            "id": "z5:x38:y34",
+            "latitude": 7.05,
+            "longitude": -73.15,
+            "count": 1999,
+            "statusCounts": {
+                "missing": 500,
+                "reportedDeceased": 500,
+                "confirmedAlive": 500,
+                "confirmedDeceased": 499,
+            },
+            "bounds": {
+                "west": -73.4,
+                "south": 6.8,
+                "east": -73.0,
+                "north": 7.2,
+            },
+        },
+        {
+            "kind": "point",
+            "id": "77777777-7777-4777-8777-777777777701",
+            "status": "missing",
+            "latitude": 7.13,
+            "longitude": -73.12,
+            "coordinatePrecision": "approximate",
+            "verificationStatus": "under_review",
+            "source": {
+                "name": "Reporte ciudadano — plataforma CUSOL",
+                "sourceType": "citizen",
+                "url": None,
+            },
+            "updatedAt": "2026-08-12T14:00:00Z",
+        },
+    ],
+    "totalMatched": 2012,
+    "totalMapped": 2000,
+    "unmappedCount": 12,
+    "returnedFeatures": 2,
+    "nextCursor": None,
+    "generatedAt": "2026-08-13T12:00:00Z",
+    "dataClassification": "demonstrative",
+}
+
+
+@pytest.mark.anyio
+async def test_human_map_forwards_all_parameters():
+    def handler(request: httpx.Request):
+        assert request.url.path == "/internal/v1/people/map-overview"
+        params = request.url.params
+        assert params["west"] == "-79.0"
+        assert params["south"] == "-4.3"
+        assert params["east"] == "-66.8"
+        assert params["north"] == "12.6"
+        assert params["zoom"] == "5"
+        assert params["limit"] == "200"
+        assert params.get_list("statuses") == [
+            "missing", "confirmed_alive"
+        ]
+        assert params["cursor"] == "bzo1MA=="
+        return httpx.Response(200, json=HUMAN_MAP_OVERVIEW)
+
+    upstream = mock_client(handler)
+    app = create_app(SETTINGS, upstream)
+
+    response = await get(
+        app,
+        "/api/v1/people/map-overview"
+        "?west=-79.0&south=-4.3&east=-66.8&north=12.6&zoom=5"
+        "&statuses=missing&statuses=confirmed_alive"
+        "&limit=200&cursor=bzo1MA%3D%3D",
+    )
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["totalMapped"] == 2000
+    assert body["unmappedCount"] == 12
+    assert body["features"][0]["kind"] == "cluster"
+    assert body["features"][1]["kind"] == "point"
+    assert body["features"][1]["coordinatePrecision"] == "approximate"
+
+
+@pytest.mark.anyio
+async def test_human_map_rejects_invalid_parameters_without_upstream():
+    def handler(request: httpx.Request):
+        raise AssertionError(
+            "no debe llamarse al upstream con parámetros inválidos"
+        )
+
+    upstream = mock_client(handler)
+    app = create_app(SETTINGS, upstream)
+
+    inverted = await get(
+        app,
+        "/api/v1/people/map-overview"
+        "?west=-66.8&south=-4.3&east=-79.0&north=12.6&zoom=5",
+    )
+    bad_zoom = await get(
+        app,
+        "/api/v1/people/map-overview"
+        "?west=-79.0&south=-4.3&east=-66.8&north=12.6&zoom=25",
+    )
+    bad_status = await get(
+        app,
+        "/api/v1/people/map-overview"
+        "?west=-79.0&south=-4.3&east=-66.8&north=12.6&zoom=5"
+        "&statuses=otro",
+    )
+    await upstream.aclose()
+
+    assert inverted.status_code == 422
+    assert inverted.headers["content-type"] == (
+        "application/problem+json"
+    )
+    assert bad_zoom.status_code == 422
+    assert bad_status.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_human_map_passes_through_upstream_422():
+    upstream = mock_client(
+        lambda _: httpx.Response(
+            422,
+            json={
+                "type": "about:blank",
+                "title": "Cursor inválido",
+                "status": 422,
+                "detail": "El cursor no corresponde a esta consulta.",
+            },
+        )
+    )
+    app = create_app(SETTINGS, upstream)
+
+    response = await get(
+        app,
+        "/api/v1/people/map-overview"
+        "?west=-79.0&south=-4.3&east=-66.8&north=12.6&zoom=5"
+        "&cursor=abcd",
+    )
+    await upstream.aclose()
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_human_map_reports_upstream_failure_as_problem():
+    upstream = mock_client(
+        lambda _: httpx.Response(500, json={"detail": "boom"})
+    )
+    app = create_app(SETTINGS, upstream)
+
+    response = await get(
+        app,
+        "/api/v1/people/map-overview"
+        "?west=-79.0&south=-4.3&east=-66.8&north=12.6&zoom=5",
+    )
+    await upstream.aclose()
+
+    assert response.status_code == 503
+    assert response.headers["content-type"] == "application/problem+json"
+    assert response.json()["title"] == (
+        "Servicio de personas no disponible"
+    )
+
+
 OPERATIONAL_MAP_OVERVIEW = {
     "summary": {
         "missingPerson": 1,
