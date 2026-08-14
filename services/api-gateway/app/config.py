@@ -19,6 +19,17 @@ class Settings:
         "http://localhost:3100",
         "http://127.0.0.1:3100",
     )
+    # CHG-034: límites separados por búsqueda de directorio, aporte
+    # anónimo (por origen) y aporte con cuenta (por cuenta).
+    directory_search_rate_limit_per_minute: int = 60
+    anonymous_contribution_rate_limit_per_minute: int = 5
+    account_contribution_rate_limit_per_minute: int = 10
+    # CHG-035: límite separado para el ingreso anónimo de reportes de
+    # edificio sin verificar.
+    building_reports_rate_limit_per_minute: int = 5
+    # CHG-036: límites administrativos por cuenta autenticada.
+    admin_rate_limit_per_minute: int = 240
+    admin_evidence_rate_limit_per_minute: int = 30
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -61,4 +72,32 @@ class Settings:
             ).strip().casefold()
             in {"1", "true", "yes"},
             allowed_origins=origins,
+            directory_search_rate_limit_per_minute=int(
+                os.getenv(
+                    "DIRECTORY_SEARCH_RATE_LIMIT_PER_MINUTE", "60"
+                )
+            ),
+            anonymous_contribution_rate_limit_per_minute=int(
+                os.getenv(
+                    "ANONYMOUS_CONTRIBUTION_RATE_LIMIT_PER_MINUTE", "5"
+                )
+            ),
+            account_contribution_rate_limit_per_minute=int(
+                os.getenv(
+                    "ACCOUNT_CONTRIBUTION_RATE_LIMIT_PER_MINUTE", "10"
+                )
+            ),
+            building_reports_rate_limit_per_minute=int(
+                os.getenv(
+                    "BUILDING_REPORTS_RATE_LIMIT_PER_MINUTE", "5"
+                )
+            ),
+            admin_rate_limit_per_minute=int(
+                os.getenv("ADMIN_RATE_LIMIT_PER_MINUTE", "240")
+            ),
+            admin_evidence_rate_limit_per_minute=int(
+                os.getenv(
+                    "ADMIN_EVIDENCE_RATE_LIMIT_PER_MINUTE", "30"
+                )
+            ),
         )

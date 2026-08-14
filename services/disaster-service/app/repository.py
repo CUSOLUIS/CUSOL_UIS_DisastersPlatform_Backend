@@ -6,16 +6,24 @@ from uuid import UUID
 import asyncpg
 
 from .models import (
+    AidLocationAvailability,
+    AidLocationDirectoryCard,
+    CommunityContributionReceipt,
+    ContributionActorKind,
     DataClassification,
     DisasterEvent,
     HumanImpactSummary,
+    MissingPersonDirectoryCard,
     MissingPersonPublicRecord,
     MissingPersonReportReceipt,
     OperationalMapPoint,
     PersonRecord,
+    PublicPersonStatus,
     SourceReference,
+    UnverifiedBuildingReportReceipt,
     VerificationStatus,
 )
+from . import moderation
 
 
 @dataclass(frozen=True)
@@ -91,6 +99,90 @@ class StoredReport:
     official_report_number: str | None
 
 
+# CHG-035 — Expediente privado de edificio; lo sensible llega cifrado
+# y la llave de idempotencia solo llega hasheada.
+@dataclass(frozen=True)
+class StoredBuildingReport:
+    id: UUID
+    public_tracking_code: str
+    idempotency_key_hash: str
+    building_reference: str
+    building_type: str
+    department: str
+    municipality: str
+    sector: str
+    location_reference_protected: bytes
+    address_protected: bytes | None
+    latitude_protected: bytes | None
+    longitude_protected: bytes | None
+    related_disaster_id: UUID | None
+    observed_date: date
+    observed_time: str | None
+    search_status: str
+    occupancy_report: str
+    pending_reasons: list[str]
+    observed_conditions: list[str]
+    observation_description_protected: bytes
+    reporter_name_protected: bytes
+    reporter_role_protected: bytes
+    reporter_organization_protected: bytes | None
+    reporter_phone_protected: bytes | None
+    reporter_email_protected: bytes | None
+    official_report_number_protected: bytes | None
+    truth_confirmed_at: datetime
+    photo_authorization_confirmed_at: datetime
+    review_acknowledged_at: datetime
+    legal_text_version: str
+    actor_account_id: UUID | None
+
+
+@dataclass(frozen=True)
+class BuildingProjection:
+    """Datos ya saneados y degradados para proyectar `building_pending`.
+
+    El llamador aplica DEC-014 (precisión y texto público) ANTES de
+    construir esto; el repositorio nunca ve campos privados en claro.
+    """
+
+    title: str
+    location_label: str
+    latitude: float
+    longitude: float
+    related_disaster_id: UUID | None
+    source_id: UUID
+
+
+# Fuente ciudadana fija de la proyección (insertada por la migración 012).
+BUILDING_REPORT_SOURCE_ID = UUID(
+    "11111111-1111-4111-8111-111111111106"
+)
+
+
+# CHG-034 — Aportes ciudadanos privados; lo sensible llega cifrado.
+@dataclass(frozen=True)
+class StoredStatusReport:
+    id: UUID
+    person_id: UUID
+    idempotency_key: str
+    claimed_outcome: str
+    evidence_description_encrypted: bytes
+    occurred_at: datetime | None
+    location_description_encrypted: bytes | None
+    actor_kind: ContributionActorKind
+    account_id: UUID | None
+
+
+@dataclass(frozen=True)
+class StoredRating:
+    id: UUID
+    location_id: UUID
+    idempotency_key: str
+    rating: int
+    evidence_description_encrypted: bytes
+    actor_kind: ContributionActorKind
+    account_id: UUID | None
+
+
 @dataclass(frozen=True)
 class StoredPhoto:
     id: UUID
@@ -154,6 +246,85 @@ class DisasterRepository(Protocol):
         report: StoredReport,
         photos: list[StoredPhoto],
     ) -> tuple[MissingPersonReportReceipt, bool]: ...
+
+    # CHG-034 — Directorio humanitario y aportes con evidencia.
+    async def search_directory_missing_persons(
+        self,
+        query: str,
+        person_status: PublicPersonStatus | None,
+        department: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[MissingPersonDirectoryCard], int]: ...
+
+    async def search_directory_aid_locations(
+        self,
+        kind: str,
+        query: str,
+        verification_status: VerificationStatus | None,
+        availability_status: AidLocationAvailability | None,
+        open_now: bool | None,
+        department: str | None,
+        min_rating: float | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[AidLocationDirectoryCard], int]: ...
+
+    async def person_is_publishable(self, person_id: UUID) -> bool: ...
+
+    async def aid_location_is_publishable(
+        self, location_id: UUID
+    ) -> bool: ...
+
+    async def create_person_status_report(
+        self,
+        report: StoredStatusReport,
+        photos: list[StoredPhoto],
+    ) -> tuple[CommunityContributionReceipt, bool]: ...
+
+    async def create_aid_location_rating(
+        self,
+        rating: StoredRating,
+        photos: list[StoredPhoto],
+    ) -> tuple[CommunityContributionReceipt, bool]: ...
+
+    async def decide_person_status_report(
+        self,
+        report_id: UUID,
+        decision: moderation.ModerationDecision,
+        decided_by_role: str,
+    ) -> bool: ...
+
+    async def decide_aid_location_rating(
+        self,
+        rating_id: UUID,
+        decision: moderation.ModerationDecision,
+        decided_by_role: str,
+    ) -> bool: ...
+
+    # CHG-035 — Reporte de edificio sin verificar.
+    async def create_unverified_building_report(
+        self,
+        report: StoredBuildingReport,
+        files: list[StoredPhoto],
+    ) -> tuple[UnverifiedBuildingReportReceipt, bool]: ...
+
+    async def decide_unverified_building_report(
+        self,
+        report_id: UUID,
+        decision: moderation.ModerationDecision,
+        decided_by_role: str,
+        moderation_reason_encrypted: bytes | None = None,
+        projection: BuildingProjection | None = None,
+    ) -> bool: ...
+
+
+# Tarjeta de persona sin fuente registrada: atribución genérica pública.
+FALLBACK_PERSON_SOURCE = SourceReference(
+    name="Registro público CUSOL",
+    source_type="citizen",
+    url=None,
+)
 
 
 class PostgresDisasterRepository:
@@ -806,3 +977,1487 @@ class PostgresDisasterRepository:
             ),
             True,
         )
+
+    # CHG-034 — Directorio humanitario y aportes con evidencia.
+
+    async def search_directory_missing_persons(
+        self,
+        query: str,
+        person_status: PublicPersonStatus | None,
+        department: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[MissingPersonDirectoryCard], int]:
+        # Solo proyecciones publicadas; el filtro se aplica antes de
+        # paginar y el orden es estable (updated_at DESC, id DESC).
+        clauses = ["mc.publication_status = 'published'"]
+        values: list[object] = [query.strip()]
+        clauses.append(
+            """(
+            lower(unaccent(mc.display_name)) LIKE
+                '%' || lower(unaccent($1)) || '%'
+            OR lower(unaccent(array_to_string(mc.aliases, ' '))) LIKE
+                '%' || lower(unaccent($1)) || '%'
+            OR lower(mc.public_case_code) LIKE '%' || lower($1) || '%'
+            OR lower(unaccent(mc.municipality)) LIKE
+                '%' || lower(unaccent($1)) || '%'
+            OR lower(unaccent(mc.department)) LIKE
+                '%' || lower(unaccent($1)) || '%'
+            OR lower(unaccent(mc.last_seen_area)) LIKE
+                '%' || lower(unaccent($1)) || '%'
+            )"""
+        )
+        if person_status is not None:
+            values.append(person_status)
+            clauses.append(f"mc.public_status::text = ${len(values)}")
+        if department is not None:
+            values.append(department.strip())
+            clauses.append(
+                f"lower(unaccent(mc.department)) = "
+                f"lower(unaccent(${len(values)}))"
+            )
+
+        where_clause = "WHERE " + " AND ".join(clauses)
+        total = await self._pool.fetchval(
+            f"""
+            SELECT COUNT(*)
+            FROM disaster_service.missing_person_cases mc
+            {where_clause}
+            """,
+            *values,
+        )
+        limit_parameter = len(values) + 1
+        offset_parameter = len(values) + 2
+        rows = await self._pool.fetch(
+            f"""
+            SELECT
+                mc.id, mc.public_case_code, mc.display_name,
+                mc.public_status, mc.approximate_age, mc.last_seen_at,
+                mc.last_seen_area, mc.municipality, mc.department,
+                mc.public_photo_url, mc.updated_at,
+                mc.data_classification,
+                s.name AS source_name,
+                s.source_type,
+                s.url AS source_url
+            FROM disaster_service.missing_person_cases mc
+            LEFT JOIN disaster_service.sources s ON s.id = mc.source_id
+            {where_clause}
+            ORDER BY mc.updated_at DESC, mc.id DESC
+            LIMIT ${limit_parameter} OFFSET ${offset_parameter}
+            """,
+            *values,
+            limit,
+            offset,
+        )
+        cards = [
+            MissingPersonDirectoryCard(
+                id=row["id"],
+                public_case_code=row["public_case_code"],
+                display_name=row["display_name"],
+                status=row["public_status"],
+                approximate_age=row["approximate_age"],
+                last_seen_at=row["last_seen_at"],
+                last_seen_area=row["last_seen_area"],
+                municipality=row["municipality"],
+                department=row["department"],
+                public_photo_url=row["public_photo_url"],
+                source=(
+                    SourceReference(
+                        name=row["source_name"],
+                        source_type=row["source_type"],
+                        url=row["source_url"],
+                    )
+                    if row["source_name"] is not None
+                    else FALLBACK_PERSON_SOURCE
+                ),
+                updated_at=row["updated_at"],
+                data_classification=row["data_classification"],
+            )
+            for row in rows
+        ]
+        return cards, int(total)
+
+    async def search_directory_aid_locations(
+        self,
+        kind: str,
+        query: str,
+        verification_status: VerificationStatus | None,
+        availability_status: AidLocationAvailability | None,
+        open_now: bool | None,
+        department: str | None,
+        min_rating: float | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[AidLocationDirectoryCard], int]:
+        clauses = [
+            "al.publication_status = 'published'",
+            "al.kind::text = $1",
+        ]
+        values: list[object] = [kind, query.strip()]
+        clauses.append(
+            """(
+            lower(unaccent(al.name)) LIKE
+                '%' || lower(unaccent($2)) || '%'
+            OR lower(unaccent(al.location_label)) LIKE
+                '%' || lower(unaccent($2)) || '%'
+            OR lower(unaccent(al.municipality)) LIKE
+                '%' || lower(unaccent($2)) || '%'
+            OR lower(unaccent(al.department)) LIKE
+                '%' || lower(unaccent($2)) || '%'
+            )"""
+        )
+        if verification_status is not None:
+            values.append(verification_status)
+            clauses.append(
+                f"al.verification_status::text = ${len(values)}"
+            )
+        if availability_status is not None:
+            values.append(availability_status)
+            clauses.append(
+                f"al.availability_status::text = ${len(values)}"
+            )
+        if open_now is not None:
+            values.append(open_now)
+            clauses.append(f"al.open_now IS NOT DISTINCT FROM ${len(values)}")
+        if department is not None:
+            values.append(department.strip())
+            clauses.append(
+                f"lower(unaccent(al.department)) = "
+                f"lower(unaccent(${len(values)}))"
+            )
+        if min_rating is not None:
+            values.append(min_rating)
+            clauses.append(f"al.average_rating >= ${len(values)}")
+
+        where_clause = "WHERE " + " AND ".join(clauses)
+        total = await self._pool.fetchval(
+            f"""
+            SELECT COUNT(*)
+            FROM disaster_service.aid_locations al
+            {where_clause}
+            """,
+            *values,
+        )
+        limit_parameter = len(values) + 1
+        offset_parameter = len(values) + 2
+        rows = await self._pool.fetch(
+            f"""
+            SELECT
+                al.id, al.kind, al.name, al.location_label,
+                al.municipality, al.department, al.verification_status,
+                al.availability_status, al.open_now,
+                al.accepted_supplies, al.average_rating,
+                al.ratings_count, al.updated_at, al.data_classification,
+                s.name AS source_name,
+                s.source_type,
+                s.url AS source_url
+            FROM disaster_service.aid_locations al
+            INNER JOIN disaster_service.sources s ON s.id = al.source_id
+            {where_clause}
+            ORDER BY al.updated_at DESC, al.id DESC
+            LIMIT ${limit_parameter} OFFSET ${offset_parameter}
+            """,
+            *values,
+            limit,
+            offset,
+        )
+        cards = [
+            AidLocationDirectoryCard(
+                kind=row["kind"],
+                id=row["id"],
+                name=row["name"],
+                location_label=row["location_label"],
+                municipality=row["municipality"],
+                department=row["department"],
+                verification_status=row["verification_status"],
+                availability_status=row["availability_status"],
+                open_now=row["open_now"],
+                accepted_supplies=list(row["accepted_supplies"]),
+                average_rating=(
+                    float(row["average_rating"])
+                    if row["average_rating"] is not None
+                    else None
+                ),
+                ratings_count=row["ratings_count"],
+                source=SourceReference(
+                    name=row["source_name"],
+                    source_type=row["source_type"],
+                    url=row["source_url"],
+                ),
+                updated_at=row["updated_at"],
+                data_classification=row["data_classification"],
+            )
+            for row in rows
+        ]
+        return cards, int(total)
+
+    async def person_is_publishable(self, person_id: UUID) -> bool:
+        # Existencia privada nunca se filtra: no publicable == inexistente.
+        return bool(
+            await self._pool.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM disaster_service.missing_person_cases
+                    WHERE id = $1 AND publication_status = 'published'
+                )
+                """,
+                person_id,
+            )
+        )
+
+    async def aid_location_is_publishable(self, location_id: UUID) -> bool:
+        return bool(
+            await self._pool.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM disaster_service.aid_locations
+                    WHERE id = $1 AND publication_status = 'published'
+                )
+                """,
+                location_id,
+            )
+        )
+
+    async def create_person_status_report(
+        self,
+        report: StoredStatusReport,
+        photos: list[StoredPhoto],
+    ) -> tuple[CommunityContributionReceipt, bool]:
+        async with self._pool.acquire() as connection:
+            try:
+                async with connection.transaction():
+                    # Crear la novedad NUNCA toca la proyección pública;
+                    # solo la decisión de moderación lo hace.
+                    row = await connection.fetchrow(
+                        """
+                        INSERT INTO disaster_service.person_status_reports (
+                            id, person_id, idempotency_key,
+                            claimed_outcome,
+                            evidence_description_encrypted, occurred_at,
+                            location_description_encrypted, actor_kind,
+                            account_id
+                        ) VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9
+                        )
+                        RETURNING id, moderation_status, actor_kind,
+                                  received_at
+                        """,
+                        report.id,
+                        report.person_id,
+                        report.idempotency_key,
+                        report.claimed_outcome,
+                        report.evidence_description_encrypted,
+                        report.occurred_at,
+                        report.location_description_encrypted,
+                        report.actor_kind,
+                        report.account_id,
+                    )
+                    for photo in photos:
+                        await connection.execute(
+                            """
+                            INSERT INTO
+                                disaster_service.person_status_report_photos (
+                                id, report_id, position, storage_key,
+                                derived_storage_key, content_type,
+                                size_bytes, sha256, exif_removed,
+                                malware_scan
+                            ) VALUES (
+                                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                            )
+                            """,
+                            photo.id,
+                            report.id,
+                            photo.position,
+                            photo.storage_key,
+                            photo.derived_storage_key,
+                            photo.content_type,
+                            photo.size_bytes,
+                            photo.sha256,
+                            photo.exif_removed,
+                            photo.malware_scan,
+                        )
+                    await connection.execute(
+                        """
+                        INSERT INTO
+                            disaster_service.community_contribution_audit (
+                            event_type, contribution_kind,
+                            contribution_id, detail
+                        ) VALUES ($1, $2, $3, $4)
+                        """,
+                        "status_report_received",
+                        "person_status_report",
+                        report.id,
+                        f"fotos={len(photos)} actor={report.actor_kind}",
+                    )
+            except asyncpg.UniqueViolationError:
+                existing = await connection.fetchrow(
+                    """
+                    SELECT id, moderation_status, actor_kind, received_at
+                    FROM disaster_service.person_status_reports
+                    WHERE idempotency_key = $1
+                    """,
+                    report.idempotency_key,
+                )
+                if existing is None:
+                    raise
+                return (
+                    _contribution_receipt(existing),
+                    False,
+                )
+        return _contribution_receipt(row), True
+
+    async def create_aid_location_rating(
+        self,
+        rating: StoredRating,
+        photos: list[StoredPhoto],
+    ) -> tuple[CommunityContributionReceipt, bool]:
+        async with self._pool.acquire() as connection:
+            try:
+                async with connection.transaction():
+                    # Crear la valoración no afecta promedio ni conteo;
+                    # solo las aceptadas cuentan, vía decide_*.
+                    row = await connection.fetchrow(
+                        """
+                        INSERT INTO disaster_service.aid_location_ratings (
+                            id, location_id, idempotency_key, rating,
+                            evidence_description_encrypted, actor_kind,
+                            account_id
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        RETURNING id, moderation_status, actor_kind,
+                                  received_at
+                        """,
+                        rating.id,
+                        rating.location_id,
+                        rating.idempotency_key,
+                        rating.rating,
+                        rating.evidence_description_encrypted,
+                        rating.actor_kind,
+                        rating.account_id,
+                    )
+                    for photo in photos:
+                        await connection.execute(
+                            """
+                            INSERT INTO
+                                disaster_service.aid_location_rating_photos (
+                                id, rating_id, position, storage_key,
+                                derived_storage_key, content_type,
+                                size_bytes, sha256, exif_removed,
+                                malware_scan
+                            ) VALUES (
+                                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                            )
+                            """,
+                            photo.id,
+                            rating.id,
+                            photo.position,
+                            photo.storage_key,
+                            photo.derived_storage_key,
+                            photo.content_type,
+                            photo.size_bytes,
+                            photo.sha256,
+                            photo.exif_removed,
+                            photo.malware_scan,
+                        )
+                    await connection.execute(
+                        """
+                        INSERT INTO
+                            disaster_service.community_contribution_audit (
+                            event_type, contribution_kind,
+                            contribution_id, detail
+                        ) VALUES ($1, $2, $3, $4)
+                        """,
+                        "rating_received",
+                        "aid_location_rating",
+                        rating.id,
+                        f"fotos={len(photos)} actor={rating.actor_kind}",
+                    )
+            except asyncpg.UniqueViolationError:
+                existing = await connection.fetchrow(
+                    """
+                    SELECT id, moderation_status, actor_kind, received_at
+                    FROM disaster_service.aid_location_ratings
+                    WHERE idempotency_key = $1
+                    """,
+                    rating.idempotency_key,
+                )
+                if existing is None:
+                    raise
+                return (
+                    _contribution_receipt(existing),
+                    False,
+                )
+        return _contribution_receipt(row), True
+
+    async def decide_person_status_report(
+        self,
+        report_id: UUID,
+        decision: moderation.ModerationDecision,
+        decided_by_role: str,
+    ) -> bool:
+        moderation.ensure_moderator_role(decided_by_role)
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                current = await connection.fetchrow(
+                    """
+                    SELECT moderation_status, person_id
+                    FROM disaster_service.person_status_reports
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    report_id,
+                )
+                if current is None:
+                    return False
+                moderation.ensure_transition(
+                    current["moderation_status"], decision
+                )
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.person_status_reports
+                    SET moderation_status = $2,
+                        decided_at = NOW(),
+                        decided_by_role = $3
+                    WHERE id = $1
+                    """,
+                    report_id,
+                    decision,
+                    decided_by_role,
+                )
+                # La proyección pública se recalcula en la MISMA
+                # transacción: el último aceptado define el estado;
+                # sin aceptados la persona vuelve a `missing`.
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.missing_person_cases mc
+                    SET public_status = COALESCE(
+                            (
+                                SELECT r.claimed_outcome
+                                FROM disaster_service.person_status_reports r
+                                WHERE r.person_id = $1
+                                  AND r.moderation_status = 'accepted'
+                                ORDER BY r.decided_at DESC NULLS LAST,
+                                         r.received_at DESC
+                                LIMIT 1
+                            ),
+                            'missing'
+                        ),
+                        updated_at = NOW()
+                    WHERE mc.id = $1
+                    """,
+                    current["person_id"],
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.community_contribution_audit (
+                        event_type, contribution_kind, contribution_id,
+                        detail
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    "status_report_decided",
+                    "person_status_report",
+                    report_id,
+                    f"decision={decision} rol={decided_by_role}",
+                )
+        return True
+
+    async def decide_aid_location_rating(
+        self,
+        rating_id: UUID,
+        decision: moderation.ModerationDecision,
+        decided_by_role: str,
+    ) -> bool:
+        moderation.ensure_moderator_role(decided_by_role)
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                current = await connection.fetchrow(
+                    """
+                    SELECT moderation_status, location_id
+                    FROM disaster_service.aid_location_ratings
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    rating_id,
+                )
+                if current is None:
+                    return False
+                moderation.ensure_transition(
+                    current["moderation_status"], decision
+                )
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.aid_location_ratings
+                    SET moderation_status = $2,
+                        decided_at = NOW(),
+                        decided_by_role = $3
+                    WHERE id = $1
+                    """,
+                    rating_id,
+                    decision,
+                    decided_by_role,
+                )
+                # Agregado transaccional: promedio y conteo se
+                # recalculan sobre valoraciones aceptadas únicamente.
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.aid_locations al
+                    SET average_rating = sub.avg_rating,
+                        ratings_count = sub.quantity,
+                        updated_at = NOW()
+                    FROM (
+                        SELECT
+                            ROUND(AVG(r.rating)::numeric, 2)
+                                AS avg_rating,
+                            COUNT(*)::int AS quantity
+                        FROM disaster_service.aid_location_ratings r
+                        WHERE r.location_id = $1
+                          AND r.moderation_status = 'accepted'
+                    ) sub
+                    WHERE al.id = $1
+                    """,
+                    current["location_id"],
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.community_contribution_audit (
+                        event_type, contribution_kind, contribution_id,
+                        detail
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    "rating_decided",
+                    "aid_location_rating",
+                    rating_id,
+                    f"decision={decision} rol={decided_by_role}",
+                )
+        return True
+
+
+    # CHG-035 — Reporte de edificio sin verificar.
+
+    async def create_unverified_building_report(
+        self,
+        report: StoredBuildingReport,
+        files: list[StoredPhoto],
+    ) -> tuple[UnverifiedBuildingReportReceipt, bool]:
+        async with self._pool.acquire() as connection:
+            try:
+                async with connection.transaction():
+                    # Crear el expediente NUNCA escribe el mapa operativo.
+                    row = await connection.fetchrow(
+                        """
+                        INSERT INTO
+                            disaster_service.unverified_building_reports (
+                            id, public_tracking_code,
+                            idempotency_key_hash, building_reference,
+                            building_type, department, municipality,
+                            sector, location_reference_protected,
+                            address_protected, latitude_protected,
+                            longitude_protected, related_disaster_id,
+                            observed_date, observed_time, search_status,
+                            occupancy_report, pending_reasons,
+                            observed_conditions,
+                            observation_description_protected,
+                            reporter_name_protected,
+                            reporter_role_protected,
+                            reporter_organization_protected,
+                            reporter_phone_protected,
+                            reporter_email_protected,
+                            official_report_number_protected,
+                            truth_confirmed_at,
+                            photo_authorization_confirmed_at,
+                            review_acknowledged_at, legal_text_version,
+                            actor_account_id
+                        ) VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                            $11, $12, $13, $14, $15, $16, $17, $18,
+                            $19, $20, $21, $22, $23, $24, $25, $26,
+                            $27, $28, $29, $30, $31
+                        )
+                        RETURNING id, public_tracking_code,
+                                  moderation_status, created_at
+                        """,
+                        report.id,
+                        report.public_tracking_code,
+                        report.idempotency_key_hash,
+                        report.building_reference,
+                        report.building_type,
+                        report.department,
+                        report.municipality,
+                        report.sector,
+                        report.location_reference_protected,
+                        report.address_protected,
+                        report.latitude_protected,
+                        report.longitude_protected,
+                        report.related_disaster_id,
+                        report.observed_date,
+                        report.observed_time,
+                        report.search_status,
+                        report.occupancy_report,
+                        report.pending_reasons,
+                        report.observed_conditions,
+                        report.observation_description_protected,
+                        report.reporter_name_protected,
+                        report.reporter_role_protected,
+                        report.reporter_organization_protected,
+                        report.reporter_phone_protected,
+                        report.reporter_email_protected,
+                        report.official_report_number_protected,
+                        report.truth_confirmed_at,
+                        report.photo_authorization_confirmed_at,
+                        report.review_acknowledged_at,
+                        report.legal_text_version,
+                        report.actor_account_id,
+                    )
+                    for file in files:
+                        await connection.execute(
+                            """
+                            INSERT INTO disaster_service
+                                .unverified_building_report_files (
+                                id, report_id, position, object_key,
+                                derived_object_key, content_type,
+                                size_bytes, sha256, malware_scan,
+                                exif_removed
+                            ) VALUES (
+                                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                            )
+                            """,
+                            file.id,
+                            report.id,
+                            file.position,
+                            file.storage_key,
+                            file.derived_storage_key,
+                            file.content_type,
+                            file.size_bytes,
+                            file.sha256,
+                            file.malware_scan,
+                            file.exif_removed,
+                        )
+                    await connection.execute(
+                        """
+                        INSERT INTO
+                            disaster_service.community_contribution_audit (
+                            event_type, contribution_kind,
+                            contribution_id, detail
+                        ) VALUES ($1, $2, $3, $4)
+                        """,
+                        "building_report_received",
+                        "unverified_building_report",
+                        report.id,
+                        f"fotos={len(files)}",
+                    )
+            except asyncpg.ForeignKeyViolationError:
+                raise
+            except asyncpg.UniqueViolationError:
+                # Reintento idempotente: misma constancia original.
+                existing = await connection.fetchrow(
+                    """
+                    SELECT id, public_tracking_code, moderation_status,
+                           created_at
+                    FROM disaster_service.unverified_building_reports
+                    WHERE idempotency_key_hash = $1
+                    """,
+                    report.idempotency_key_hash,
+                )
+                if existing is None:
+                    raise
+                return _building_receipt(existing), False
+        return _building_receipt(row), True
+
+    async def decide_unverified_building_report(
+        self,
+        report_id: UUID,
+        decision: moderation.ModerationDecision,
+        decided_by_role: str,
+        moderation_reason_encrypted: bytes | None = None,
+        projection: BuildingProjection | None = None,
+    ) -> bool:
+        moderation.ensure_moderator_role(decided_by_role)
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                current = await connection.fetchrow(
+                    """
+                    SELECT moderation_status, map_point_id
+                    FROM disaster_service.unverified_building_reports
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    report_id,
+                )
+                if current is None:
+                    return False
+                moderation.ensure_transition(
+                    current["moderation_status"], decision
+                )
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.unverified_building_reports
+                    SET moderation_status = $2,
+                        moderated_at = NOW(),
+                        moderated_by = $3,
+                        moderation_reason_protected = $4,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    report_id,
+                    decision,
+                    decided_by_role,
+                    moderation_reason_encrypted,
+                )
+                map_point_id = current["map_point_id"]
+                projected = False
+                if decision == "accepted" and projection is not None:
+                    # Proyección saneada creada o actualizada en la
+                    # MISMA transacción; el expediente conserva el
+                    # enlace interno (nunca público).
+                    if map_point_id is None:
+                        map_point_id = await connection.fetchval(
+                            """
+                            INSERT INTO
+                                disaster_service.operational_map_points (
+                                category, title, description,
+                                location_label, location,
+                                coordinate_precision,
+                                verification_status,
+                                related_disaster_id, source_id,
+                                data_classification, updated_at
+                            ) VALUES (
+                                'building_pending', $1, NULL, $2,
+                                ST_SetSRID(
+                                    ST_MakePoint($3, $4), 4326
+                                )::geography,
+                                'approximate', 'under_review',
+                                $5, $6, 'demonstrative', NOW()
+                            )
+                            RETURNING id
+                            """,
+                            projection.title,
+                            projection.location_label,
+                            projection.longitude,
+                            projection.latitude,
+                            projection.related_disaster_id,
+                            projection.source_id,
+                        )
+                        await connection.execute(
+                            """
+                            UPDATE disaster_service
+                                .unverified_building_reports
+                            SET map_point_id = $2
+                            WHERE id = $1
+                            """,
+                            report_id,
+                            map_point_id,
+                        )
+                    else:
+                        await connection.execute(
+                            """
+                            UPDATE disaster_service.operational_map_points
+                            SET title = $2,
+                                location_label = $3,
+                                location = ST_SetSRID(
+                                    ST_MakePoint($4, $5), 4326
+                                )::geography,
+                                related_disaster_id = $6,
+                                updated_at = NOW()
+                            WHERE id = $1
+                            """,
+                            map_point_id,
+                            projection.title,
+                            projection.location_label,
+                            projection.longitude,
+                            projection.latitude,
+                            projection.related_disaster_id,
+                        )
+                    projected = True
+                elif decision != "accepted" and map_point_id is not None:
+                    # Rechazo o retiro posterior elimina la proyección.
+                    await connection.execute(
+                        """
+                        UPDATE disaster_service.unverified_building_reports
+                        SET map_point_id = NULL
+                        WHERE id = $1
+                        """,
+                        report_id,
+                    )
+                    await connection.execute(
+                        """
+                        DELETE FROM disaster_service.operational_map_points
+                        WHERE id = $1
+                        """,
+                        map_point_id,
+                    )
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.community_contribution_audit (
+                        event_type, contribution_kind, contribution_id,
+                        detail
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    "building_report_decided",
+                    "unverified_building_report",
+                    report_id,
+                    f"decision={decision} rol={decided_by_role} "
+                    f"proyeccion={'si' if projected else 'no'}",
+                )
+        return True
+
+
+    # CHG-036 — Consola de superadministración (bandeja unificada,
+    # mutaciones con versión y auditoría append-only).
+
+    async def admin_list_submissions(
+        self,
+        q: str | None,
+        kind: str | None,
+        status: str | None,
+        received_from: datetime | None,
+        received_to: datetime | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict], int]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if q is not None:
+            values.append(q.strip())
+            position = len(values)
+            clauses.append(
+                f"""lower(unaccent(
+                    tracking_code || ' ' || title || ' ' ||
+                    coalesce(location_label, '')
+                )) LIKE '%' || lower(unaccent(${position})) || '%'"""
+            )
+        if kind is not None:
+            values.append(kind)
+            clauses.append(f"kind = ${len(values)}")
+        if status is not None:
+            values.append(status)
+            clauses.append(f"admin_status = ${len(values)}")
+        if received_from is not None:
+            values.append(received_from)
+            clauses.append(f"received_at >= ${len(values)}")
+        if received_to is not None:
+            values.append(received_to)
+            clauses.append(f"received_at <= ${len(values)}")
+        where_clause = (
+            "WHERE " + " AND ".join(clauses) if clauses else ""
+        )
+        base = f"""
+            WITH unified AS ({_ADMIN_UNIFIED_CTE}),
+            classified AS (
+                SELECT *, {_ADMIN_STATUS_EXPR} AS admin_status
+                FROM unified
+            )
+        """
+        total = await self._pool.fetchval(
+            f"{base} SELECT COUNT(*) FROM classified {where_clause}",
+            *values,
+        )
+        limit_parameter = len(values) + 1
+        offset_parameter = len(values) + 2
+        rows = await self._pool.fetch(
+            f"""
+            {base}
+            SELECT * FROM classified
+            {where_clause}
+            ORDER BY received_at DESC, id DESC
+            LIMIT ${limit_parameter} OFFSET ${offset_parameter}
+            """,
+            *values,
+            limit,
+            offset,
+        )
+        return [dict(row) for row in rows], int(total)
+
+    async def admin_submissions_overview(self) -> dict:
+        base = f"""
+            WITH unified AS ({_ADMIN_UNIFIED_CTE}),
+            classified AS (
+                SELECT *, {_ADMIN_STATUS_EXPR} AS admin_status
+                FROM unified
+            )
+        """
+        counts = await self._pool.fetch(
+            f"""
+            {base}
+            SELECT admin_status, kind, COUNT(*)::int AS quantity,
+                   MIN(received_at) AS oldest
+            FROM classified
+            GROUP BY admin_status, kind
+            """
+        )
+        accepted_today = await self._pool.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM administration.audit_events
+            WHERE action = 'submission_accepted'
+              AND result = 'success'
+              AND occurred_at >= date_trunc('day', NOW())
+            """
+        )
+        recent = await self._pool.fetch(
+            """
+            SELECT id, action, resource_kind, occurred_at, result
+            FROM administration.audit_events
+            ORDER BY occurred_at DESC, id DESC
+            LIMIT 10
+            """
+        )
+        return {
+            "counts": [dict(row) for row in counts],
+            "accepted_today": int(accepted_today),
+            "recent_activity": [dict(row) for row in recent],
+        }
+
+    async def admin_get_submission_summary(
+        self, submission_id: UUID
+    ) -> dict | None:
+        row = await self._pool.fetchrow(
+            f"""
+            WITH unified AS ({_ADMIN_UNIFIED_CTE}),
+            classified AS (
+                SELECT *, {_ADMIN_STATUS_EXPR} AS admin_status
+                FROM unified
+            )
+            SELECT * FROM classified WHERE id = $1
+            """,
+            submission_id,
+        )
+        return dict(row) if row is not None else None
+
+    async def admin_get_submission(
+        self, submission_id: UUID
+    ) -> tuple[str, dict, list[dict]] | None:
+        for kind, meta in _ADMIN_TABLES.items():
+            row = await self._pool.fetchrow(
+                meta["detail_sql"], submission_id
+            )
+            if row is None:
+                continue
+            evidence = await self._pool.fetch(
+                f"""
+                SELECT id, content_type, size_bytes, malware_scan,
+                       created_at, {meta['derived_column']}
+                       AS derived_key
+                FROM {meta['photo_table']}
+                WHERE {meta['photo_fk']} = $1
+                ORDER BY position
+                """,
+                submission_id,
+            )
+            return kind, dict(row), [dict(item) for item in evidence]
+        return None
+
+    async def _admin_audit(
+        self,
+        connection,
+        actor_account_id: UUID,
+        actor_display_name: str,
+        action: str,
+        resource_kind: str,
+        resource_id: UUID | None,
+        result: str,
+        reason_encrypted: bytes | None,
+        changed_fields: list[str],
+        correlation_id: UUID | None,
+    ) -> UUID:
+        return await connection.fetchval(
+            """
+            INSERT INTO administration.audit_events (
+                actor_account_id, actor_display_name, action,
+                resource_kind, resource_id, result, reason_protected,
+                changed_fields, request_correlation_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id
+            """,
+            actor_account_id,
+            actor_display_name,
+            action,
+            resource_kind,
+            resource_id,
+            result,
+            reason_encrypted,
+            changed_fields,
+            correlation_id,
+        )
+
+    async def admin_write_audit(
+        self,
+        actor_account_id: UUID,
+        actor_display_name: str,
+        action: str,
+        resource_kind: str,
+        resource_id: UUID | None,
+        result: str,
+        reason_encrypted: bytes | None = None,
+        changed_fields: list[str] | None = None,
+        correlation_id: UUID | None = None,
+    ) -> UUID:
+        async with self._pool.acquire() as connection:
+            return await self._admin_audit(
+                connection,
+                actor_account_id,
+                actor_display_name,
+                action,
+                resource_kind,
+                resource_id,
+                result,
+                reason_encrypted,
+                changed_fields or [],
+                correlation_id,
+            )
+
+    async def admin_mutate_submission(
+        self,
+        kind: str,
+        submission_id: UUID,
+        expected_version: int,
+        action: str,
+        actor_account_id: UUID,
+        actor_display_name: str,
+        reason_encrypted: bytes | None,
+        columns: dict[str, object] | None = None,
+        correlation_id: UUID | None = None,
+    ) -> tuple[str, UUID | None, int | None]:
+        """Aplica una mutación administrativa en UNA transacción.
+
+        `action`: edit | accept | reject | request_changes | archive |
+        restore. Devuelve (outcome, audit_event_id, nueva_version) con
+        outcome en {'ok', 'conflict', 'not_found'}. La verificación de
+        `expectedVersion` en el UPDATE garantiza el 409 ante carreras.
+        """
+        meta = _ADMIN_TABLES[kind]
+        table = meta["table"]
+        sets: list[str] = [
+            "version = version + 1",
+            "updated_at = NOW()",
+        ]
+        values: list[object] = []
+        changed_fields: list[str] = []
+
+        def add(expression: str, *expression_values: object) -> None:
+            placeholders = [
+                f"${len(values) + index + 1}"
+                for index in range(len(expression_values))
+            ]
+            sets.append(expression.format(*placeholders))
+            values.extend(expression_values)
+
+        if action == "edit":
+            for column, value in (columns or {}).items():
+                add(f"{column} = {{0}}", value)
+                changed_fields.append(column)
+        elif action == "accept":
+            add(f"{meta['status_column']} = '{meta['accepted_value']}'")
+            sets.append("needs_information = FALSE")
+            if meta["decided_columns"]:
+                sets.append(meta["decided_columns"])
+        elif action == "reject":
+            add(f"{meta['status_column']} = '{meta['rejected_value']}'")
+            sets.append("needs_information = FALSE")
+            if meta["decided_columns"]:
+                sets.append(meta["decided_columns"])
+        elif action == "request_changes":
+            sets.append("needs_information = TRUE")
+        elif action == "archive":
+            add("archived_at = NOW(), archived_by = {0}", actor_account_id)
+        elif action == "restore":
+            sets.append("archived_at = NULL, archived_by = NULL")
+        else:  # pragma: no cover - protegido por el contrato
+            raise ValueError(f"Acción administrativa desconocida: {action}")
+
+        values.append(submission_id)
+        id_parameter = len(values)
+        values.append(expected_version)
+        version_parameter = len(values)
+
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    f"""
+                    UPDATE {table}
+                    SET {', '.join(sets)}
+                    WHERE id = ${id_parameter}
+                      AND version = ${version_parameter}
+                    RETURNING id, version
+                    """,
+                    *values,
+                )
+                if row is None:
+                    exists = await connection.fetchval(
+                        f"SELECT 1 FROM {table} WHERE id = $1",
+                        submission_id,
+                    )
+                    outcome = "conflict" if exists else "not_found"
+                    if outcome == "conflict":
+                        # Auditoría mínima del intento fallido, sin
+                        # payload sensible.
+                        await self._admin_audit(
+                            connection,
+                            actor_account_id,
+                            actor_display_name,
+                            f"submission_{action}",
+                            kind,
+                            submission_id,
+                            "failed",
+                            None,
+                            [],
+                            correlation_id,
+                        )
+                    return outcome, None, None
+
+                # Efectos de dominio tras aceptar/rechazar/restaurar:
+                # misma transacción que el cambio de estado.
+                if action in ("accept", "reject") and kind == (
+                    "person_status_report"
+                ):
+                    await connection.execute(
+                        _PERSON_PROJECTION_RECOMPUTE_SQL,
+                        submission_id,
+                    )
+                if action in ("accept", "reject") and kind == (
+                    "aid_location_rating"
+                ):
+                    await connection.execute(
+                        _RATING_AGGREGATE_RECOMPUTE_SQL,
+                        submission_id,
+                    )
+                # unverified_building_report aceptado NO proyecta el
+                # mapa: DEC-012–DEC-014 pendientes (ver CHG-035).
+
+                audit_event_id = await self._admin_audit(
+                    connection,
+                    actor_account_id,
+                    actor_display_name,
+                    ("submission_accepted" if action == "accept"
+                     else f"submission_{action}"),
+                    kind,
+                    submission_id,
+                    "success",
+                    reason_encrypted,
+                    changed_fields,
+                    correlation_id,
+                )
+        return "ok", audit_event_id, int(row["version"])
+
+    async def admin_get_evidence(
+        self, submission_id: UUID, evidence_id: UUID
+    ) -> dict | None:
+        for kind, meta in _ADMIN_TABLES.items():
+            row = await self._pool.fetchrow(
+                f"""
+                SELECT id, content_type, size_bytes, malware_scan,
+                       created_at, {meta['derived_column']}
+                       AS derived_key
+                FROM {meta['photo_table']}
+                WHERE id = $1 AND {meta['photo_fk']} = $2
+                """,
+                evidence_id,
+                submission_id,
+            )
+            if row is not None:
+                return {**dict(row), "kind": kind}
+        return None
+
+    async def admin_list_audit_events(
+        self,
+        q: str | None,
+        action: str | None,
+        result: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict], int]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if q is not None:
+            values.append(q.strip())
+            position = len(values)
+            clauses.append(
+                f"""lower(unaccent(
+                    action || ' ' || resource_kind || ' ' ||
+                    actor_display_name
+                )) LIKE '%' || lower(unaccent(${position})) || '%'"""
+            )
+        if action is not None:
+            values.append(action)
+            clauses.append(f"action = ${len(values)}")
+        if result is not None:
+            values.append(result)
+            clauses.append(f"result = ${len(values)}")
+        where_clause = (
+            "WHERE " + " AND ".join(clauses) if clauses else ""
+        )
+        total = await self._pool.fetchval(
+            f"""
+            SELECT COUNT(*)
+            FROM administration.audit_events
+            {where_clause}
+            """,
+            *values,
+        )
+        limit_parameter = len(values) + 1
+        offset_parameter = len(values) + 2
+        rows = await self._pool.fetch(
+            f"""
+            SELECT id, occurred_at, actor_account_id,
+                   actor_display_name, action, resource_kind,
+                   resource_id, result, reason_protected
+            FROM administration.audit_events
+            {where_clause}
+            ORDER BY occurred_at DESC, id DESC
+            LIMIT ${limit_parameter} OFFSET ${offset_parameter}
+            """,
+            *values,
+            limit,
+            offset,
+        )
+        return [dict(row) for row in rows], int(total)
+
+
+# CHG-036 — Bandeja unificada: una fila por expediente, sin PII en el
+# resumen (títulos genéricos, códigos públicos y zona municipal).
+_ADMIN_UNIFIED_CTE = """
+    SELECT
+        r.id,
+        'missing_person_report' AS kind,
+        r.public_case_code AS tracking_code,
+        'Reporte de persona desaparecida' AS title,
+        r.municipality || ', ' || r.department AS location_label,
+        'Reporte ciudadano' AS source_label,
+        r.status::text AS domain_status,
+        r.needs_information,
+        r.archived_at,
+        r.received_at,
+        r.updated_at,
+        r.version,
+        (SELECT COUNT(*)
+         FROM disaster_service.missing_person_report_photos p
+         WHERE p.report_id = r.id)::int AS evidence_count
+    FROM disaster_service.missing_person_reports r
+    UNION ALL
+    SELECT
+        b.id,
+        'unverified_building_report',
+        b.public_tracking_code,
+        left('Edificio sin verificar — ' || b.building_reference, 200),
+        b.municipality || ', ' || b.department,
+        'Reporte ciudadano',
+        b.moderation_status::text,
+        b.needs_information,
+        b.archived_at,
+        b.created_at,
+        b.updated_at,
+        b.version,
+        (SELECT COUNT(*)
+         FROM disaster_service.unverified_building_report_files f
+         WHERE f.report_id = b.id)::int
+    FROM disaster_service.unverified_building_reports b
+    UNION ALL
+    SELECT
+        s.id,
+        'person_status_report',
+        'NOV-' || upper(left(s.id::text, 8)),
+        CASE s.claimed_outcome::text
+            WHEN 'found' THEN 'Novedad de persona — reportada con vida'
+            ELSE 'Novedad de persona — reportada fallecida'
+        END,
+        NULL,
+        CASE s.actor_kind::text
+            WHEN 'authenticated' THEN 'Aporte con cuenta'
+            ELSE 'Aporte anónimo'
+        END,
+        s.moderation_status::text,
+        s.needs_information,
+        s.archived_at,
+        s.received_at,
+        s.updated_at,
+        s.version,
+        (SELECT COUNT(*)
+         FROM disaster_service.person_status_report_photos p
+         WHERE p.report_id = s.id)::int
+    FROM disaster_service.person_status_reports s
+    UNION ALL
+    SELECT
+        t.id,
+        'aid_location_rating',
+        'VAL-' || upper(left(t.id::text, 8)),
+        left('Valoración ' || t.rating || '/5 — ' || al.name, 200),
+        al.municipality || ', ' || al.department,
+        CASE t.actor_kind::text
+            WHEN 'authenticated' THEN 'Aporte con cuenta'
+            ELSE 'Aporte anónimo'
+        END,
+        t.moderation_status::text,
+        t.needs_information,
+        t.archived_at,
+        t.received_at,
+        t.updated_at,
+        t.version,
+        (SELECT COUNT(*)
+         FROM disaster_service.aid_location_rating_photos p
+         WHERE p.rating_id = t.id)::int
+    FROM disaster_service.aid_location_ratings t
+    INNER JOIN disaster_service.aid_locations al
+        ON al.id = t.location_id
+"""
+
+# Proyección del estado del dominio al estado administrativo unificado
+# (espejo SQL de admin.unified_status).
+_ADMIN_STATUS_EXPR = """
+    CASE
+        WHEN archived_at IS NOT NULL OR domain_status = 'withdrawn'
+            THEN 'archived'
+        WHEN needs_information THEN 'needs_information'
+        WHEN domain_status IN ('verified', 'accepted') THEN 'accepted'
+        WHEN domain_status = 'rejected' THEN 'rejected'
+        ELSE 'under_review'
+    END
+"""
+
+# Misma regla que decide_person_status_report: el último aceptado define
+# el estado público; sin aceptados vuelve a `missing`.
+_PERSON_PROJECTION_RECOMPUTE_SQL = """
+    UPDATE disaster_service.missing_person_cases mc
+    SET public_status = COALESCE(
+            (
+                SELECT r.claimed_outcome
+                FROM disaster_service.person_status_reports r
+                WHERE r.person_id = mc.id
+                  AND r.moderation_status = 'accepted'
+                ORDER BY r.decided_at DESC NULLS LAST,
+                         r.received_at DESC
+                LIMIT 1
+            ),
+            'missing'
+        ),
+        updated_at = NOW()
+    WHERE mc.id = (
+        SELECT person_id
+        FROM disaster_service.person_status_reports
+        WHERE id = $1
+    )
+"""
+
+# Misma regla que decide_aid_location_rating: solo aceptadas suman.
+_RATING_AGGREGATE_RECOMPUTE_SQL = """
+    UPDATE disaster_service.aid_locations al
+    SET average_rating = sub.avg_rating,
+        ratings_count = sub.quantity,
+        updated_at = NOW()
+    FROM (
+        SELECT
+            ROUND(AVG(r.rating)::numeric, 2) AS avg_rating,
+            COUNT(*)::int AS quantity
+        FROM disaster_service.aid_location_ratings r
+        WHERE r.location_id = (
+            SELECT location_id
+            FROM disaster_service.aid_location_ratings
+            WHERE id = $1
+        )
+          AND r.moderation_status = 'accepted'
+    ) sub
+    WHERE al.id = (
+        SELECT location_id
+        FROM disaster_service.aid_location_ratings
+        WHERE id = $1
+    )
+"""
+
+# Metadatos por tipo: tabla, columna de estado, valores de decisión,
+# tabla de evidencia y consulta de detalle.
+_ADMIN_TABLES: dict[str, dict[str, str]] = {
+    "missing_person_report": {
+        "table": "disaster_service.missing_person_reports",
+        "status_column": "status",
+        "accepted_value": "verified",
+        "rejected_value": "rejected",
+        "decided_columns": "",
+        "photo_table": "disaster_service.missing_person_report_photos",
+        "photo_fk": "report_id",
+        "derived_column": "derived_storage_key",
+        "detail_sql": (
+            "SELECT * FROM disaster_service.missing_person_reports "
+            "WHERE id = $1"
+        ),
+    },
+    "unverified_building_report": {
+        "table": "disaster_service.unverified_building_reports",
+        "status_column": "moderation_status",
+        "accepted_value": "accepted",
+        "rejected_value": "rejected",
+        "decided_columns": (
+            "moderated_at = NOW(), moderated_by = 'super_admin'"
+        ),
+        "photo_table": (
+            "disaster_service.unverified_building_report_files"
+        ),
+        "photo_fk": "report_id",
+        "derived_column": "derived_object_key",
+        "detail_sql": (
+            "SELECT * FROM disaster_service.unverified_building_reports "
+            "WHERE id = $1"
+        ),
+    },
+    "person_status_report": {
+        "table": "disaster_service.person_status_reports",
+        "status_column": "moderation_status",
+        "accepted_value": "accepted",
+        "rejected_value": "rejected",
+        "decided_columns": (
+            "decided_at = NOW(), decided_by_role = 'super_admin'"
+        ),
+        "photo_table": (
+            "disaster_service.person_status_report_photos"
+        ),
+        "photo_fk": "report_id",
+        "derived_column": "derived_storage_key",
+        "detail_sql": (
+            "SELECT * FROM disaster_service.person_status_reports "
+            "WHERE id = $1"
+        ),
+    },
+    "aid_location_rating": {
+        "table": "disaster_service.aid_location_ratings",
+        "status_column": "moderation_status",
+        "accepted_value": "accepted",
+        "rejected_value": "rejected",
+        "decided_columns": (
+            "decided_at = NOW(), decided_by_role = 'super_admin'"
+        ),
+        "photo_table": (
+            "disaster_service.aid_location_rating_photos"
+        ),
+        "photo_fk": "rating_id",
+        "derived_column": "derived_storage_key",
+        "detail_sql": (
+            "SELECT t.*, al.name AS location_name "
+            "FROM disaster_service.aid_location_ratings t "
+            "INNER JOIN disaster_service.aid_locations al "
+            "ON al.id = t.location_id WHERE t.id = $1"
+        ),
+    },
+}
+
+
+def _building_receipt(row) -> UnverifiedBuildingReportReceipt:
+    # Respuesta estable al reintento: la constancia siempre informa
+    # `under_review`, aunque la moderación ya haya decidido.
+    return UnverifiedBuildingReportReceipt(
+        id=row["id"],
+        public_tracking_code=row["public_tracking_code"],
+        status="under_review",
+        received_at=row["created_at"],
+    )
+
+
+def _contribution_receipt(row) -> CommunityContributionReceipt:
+    # Respuesta estable al reintento (contrato): la constancia siempre
+    # informa `under_review`, aunque la moderación ya haya decidido.
+    return CommunityContributionReceipt(
+        id=row["id"],
+        status="under_review",
+        actor_kind=row["actor_kind"],
+        received_at=row["received_at"],
+    )

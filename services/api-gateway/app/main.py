@@ -1,8 +1,10 @@
+import base64
 import hashlib
 import json
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Literal
+from uuid import UUID
 
 import httpx
 from fastapi import Depends, FastAPI, Query, Request, Response
@@ -12,18 +14,37 @@ from fastapi.responses import JSONResponse
 from .config import Settings
 from .models import (
     AccountRegistrationReceipt,
+    AccountRole,
+    AdminAccountDetail,
+    AdminAccountPage,
+    AdminAccountStatus,
+    AdminAuditPage,
+    AdminEvidenceAccessGrant,
+    AdminModerationStatus,
+    AdminMutationReceipt,
+    AdminOverview,
+    AdminSubmissionDetail,
+    AdminSubmissionKind,
+    AdminSubmissionPage,
+    AidLocationAvailability,
     AuthenticatedAccount,
+    CommunityContributionReceipt,
     DisasterEventList,
     EmailVerificationReceipt,
     HealthStatus,
     HumanImpactOverview,
+    HumanitarianDirectoryKind,
+    HumanitarianDirectorySearchResponse,
     HumanMapOverview,
     HumanStatus,
     MissingPersonReportReceipt,
     MissingPersonSearchResponse,
     OperationalMapOverview,
     PeopleRecordPage,
+    PublicPersonStatus,
     SessionEnvelope,
+    UnverifiedBuildingReportReceipt,
+    VerificationStatus,
 )
 from .ratelimit import SlidingWindowRateLimiter
 
@@ -125,6 +146,27 @@ def create_app(
     )
     login_limiter = SlidingWindowRateLimiter(
         resolved_settings.login_rate_limit_per_minute
+    )
+    # CHG-034: límites separados por búsqueda, aporte anónimo y cuenta.
+    directory_search_limiter = SlidingWindowRateLimiter(
+        resolved_settings.directory_search_rate_limit_per_minute
+    )
+    anonymous_contribution_limiter = SlidingWindowRateLimiter(
+        resolved_settings.anonymous_contribution_rate_limit_per_minute
+    )
+    account_contribution_limiter = SlidingWindowRateLimiter(
+        resolved_settings.account_contribution_rate_limit_per_minute
+    )
+    # CHG-035: límite separado para reportes de edificio sin verificar.
+    building_reports_limiter = SlidingWindowRateLimiter(
+        resolved_settings.building_reports_rate_limit_per_minute
+    )
+    # CHG-036: límites administrativos por cuenta.
+    admin_limiter = SlidingWindowRateLimiter(
+        resolved_settings.admin_rate_limit_per_minute
+    )
+    admin_evidence_limiter = SlidingWindowRateLimiter(
+        resolved_settings.admin_evidence_rate_limit_per_minute
     )
 
     def get_client(request: Request) -> httpx.AsyncClient:
@@ -723,6 +765,1053 @@ def create_app(
                 "ningún dato quedó registrado.",
                 title="Servicio de reportes no disponible",
             )
+
+    # CHG-034 — Directorio humanitario y aportes con evidencia.
+
+    def origin_not_allowed(request: Request) -> JSONResponse | None:
+        """CSRF (CHG-022): mutaciones con cookie validan Origin."""
+        origin = request.headers.get("origin")
+        if origin is not None and origin.rstrip("/") not in (
+            resolved_settings.allowed_origins
+        ):
+            return problem_response(
+                "El origen de la solicitud no está permitido.",
+                title="Origen no permitido",
+                status_code=403,
+                problem_type="origin-not-allowed",
+            )
+        return None
+
+    async def resolve_account(
+        request: Request, identity: httpx.AsyncClient
+    ) -> AuthenticatedAccount | JSONResponse:
+        """Cuenta de la sesión o 401; jamás degrada a ruta anónima."""
+        token = request.cookies.get(SESSION_COOKIE)
+        if not token:
+            return problem_response(
+                "La sesión está ausente, vencida o revocada.",
+                title="Sesión requerida",
+                status_code=401,
+                problem_type="session-required",
+            )
+        try:
+            response = await identity.get(
+                "/internal/v1/auth/me",
+                headers={"X-Session-Token": token},
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return AuthenticatedAccount.model_validate(response.json())
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return identity_unavailable()
+
+    async def forward_contribution(
+        request: Request,
+        upstream: httpx.AsyncClient,
+        path: str,
+        actor_kind: Literal["anonymous", "authenticated"],
+        unavailable_title: str,
+        unavailable_detail: str,
+        account_id: UUID | None = None,
+    ) -> JSONResponse:
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        declared = request.headers.get("content-length")
+        if declared is not None and declared.isdigit():
+            if int(declared) > resolved_settings.max_report_body_bytes:
+                return problem_response(
+                    "El envío supera el máximo total permitido.",
+                    title="Carga demasiado grande",
+                    status_code=413,
+                    problem_type="payload-too-large",
+                )
+        # El actor lo declara el gateway, nunca el cliente final; la
+        # cookie y demás encabezados no se reenvían al upstream.
+        headers = {
+            "content-type": request.headers.get("content-type", ""),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": actor_kind,
+        }
+        if account_id is not None:
+            headers["x-account-id"] = str(account_id)
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                path, content=body, headers=headers
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=202,
+                content=CommunityContributionReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                unavailable_detail, title=unavailable_title
+            )
+
+    # CHG-036 — Consola de superadministración. Toda ruta /admin exige
+    # cookie válida y rol super_admin resuelto contra identity en cada
+    # solicitud; los encabezados internos de actor los escribe SOLO el
+    # gateway y jamás se aceptan del cliente.
+
+    def role_insufficient() -> JSONResponse:
+        return problem_response(
+            "La cuenta no tiene el rol administrativo requerido.",
+            title="Rol insuficiente",
+            status_code=403,
+            problem_type="admin-role-required",
+        )
+
+    async def require_super_admin(
+        request: Request, identity: httpx.AsyncClient
+    ) -> AuthenticatedAccount | JSONResponse:
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if account.assigned_role != "super_admin":
+            return role_insufficient()
+        if not admin_limiter.allow(f"admin:{account.id}"):
+            return rate_limited_response(
+                "Se superó el límite administrativo por minuto."
+            )
+        return account
+
+    def actor_headers(account: AuthenticatedAccount) -> dict[str, str]:
+        return {
+            "x-actor-account-id": str(account.id),
+            "x-actor-role": account.assigned_role,
+            "x-actor-display": base64.b64encode(
+                account.display_name.encode()
+            ).decode(),
+        }
+
+    def admin_unavailable() -> JSONResponse:
+        return problem_response(
+            "El servicio administrativo no está disponible en este "
+            "momento.",
+            title="Servicio administrativo no disponible",
+        )
+
+    async def admin_forward(
+        client: httpx.AsyncClient,
+        method: str,
+        path: str,
+        account: AuthenticatedAccount,
+        model,
+        params=None,
+        body: bytes | None = None,
+        success_status: int = 200,
+    ):
+        headers = actor_headers(account)
+        if body is not None:
+            headers["content-type"] = "application/json"
+        try:
+            response = await client.request(
+                method,
+                path,
+                params=params,
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            if response.status_code == 204 or model is None:
+                return Response(status_code=response.status_code)
+            return JSONResponse(
+                status_code=success_status,
+                content=model.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return admin_unavailable()
+
+    @application.get(
+        "/api/v1/admin/overview",
+        response_model=AdminOverview,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Rol insuficiente"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_overview(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        headers = actor_headers(account)
+        try:
+            submissions = await upstream.get(
+                "/internal/v1/admin/submissions-overview",
+                headers=headers,
+            )
+            submissions.raise_for_status()
+            accounts = await identity.get(
+                "/internal/v1/admin/accounts-overview",
+                headers=headers,
+            )
+            accounts.raise_for_status()
+            merged = {
+                **submissions.json(),
+                **accounts.json(),
+            }
+            return AdminOverview.model_validate(merged)
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return admin_unavailable()
+
+    @application.get(
+        "/api/v1/admin/submissions",
+        response_model=AdminSubmissionPage,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            422: {"description": "Filtros inválidos"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_list_submissions(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+        q: Annotated[
+            str | None, Query(min_length=2, max_length=100)
+        ] = None,
+        kind: Annotated[AdminSubmissionKind | None, Query()] = None,
+        status: Annotated[AdminModerationStatus | None, Query()] = None,
+        received_from: Annotated[
+            datetime | None, Query(alias="receivedFrom")
+        ] = None,
+        received_to: Annotated[
+            datetime | None, Query(alias="receivedTo")
+        ] = None,
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        params: list[tuple[str, str]] = [
+            ("limit", str(limit)),
+            ("offset", str(offset)),
+        ]
+        if q is not None:
+            params.append(("q", q))
+        if kind is not None:
+            params.append(("kind", kind))
+        if status is not None:
+            params.append(("status", status))
+        if received_from is not None:
+            params.append(("receivedFrom", received_from.isoformat()))
+        if received_to is not None:
+            params.append(("receivedTo", received_to.isoformat()))
+        return await admin_forward(
+            upstream,
+            "GET",
+            "/internal/v1/admin/submissions",
+            account,
+            AdminSubmissionPage,
+            params=params,
+        )
+
+    @application.get(
+        "/api/v1/admin/submissions/{submission_id}",
+        response_model=AdminSubmissionDetail,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            404: {"description": "Expediente no disponible"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_get_submission(
+        submission_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        return await admin_forward(
+            upstream,
+            "GET",
+            f"/internal/v1/admin/submissions/{submission_id}",
+            account,
+            AdminSubmissionDetail,
+        )
+
+    async def admin_mutation(
+        request: Request,
+        upstream: httpx.AsyncClient,
+        identity: httpx.AsyncClient,
+        method: str,
+        path: str,
+        model,
+        success_status: int = 200,
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        body = await request.body()
+        return await admin_forward(
+            upstream,
+            method,
+            path,
+            account,
+            model,
+            body=body,
+            success_status=success_status,
+        )
+
+    @application.patch(
+        "/api/v1/admin/submissions/{submission_id}",
+        response_model=AdminSubmissionDetail,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Expediente no disponible"},
+            409: {"description": "Conflicto de versión"},
+            422: {"description": "Campos inválidos"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_edit_submission(
+        submission_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "PATCH",
+            f"/internal/v1/admin/submissions/{submission_id}",
+            AdminSubmissionDetail,
+        )
+
+    @application.delete(
+        "/api/v1/admin/submissions/{submission_id}",
+        response_model=AdminMutationReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Expediente no disponible"},
+            409: {"description": "Conflicto de versión o transición"},
+            422: {"description": "Motivo inválido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_archive_submission(
+        submission_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "DELETE",
+            f"/internal/v1/admin/submissions/{submission_id}",
+            AdminMutationReceipt,
+        )
+
+    @application.post(
+        "/api/v1/admin/submissions/{submission_id}/decisions",
+        response_model=AdminMutationReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Expediente no disponible"},
+            409: {"description": "Conflicto de versión o transición"},
+            422: {"description": "Acción o motivo inválidos"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_decide_submission(
+        submission_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "POST",
+            f"/internal/v1/admin/submissions/{submission_id}/decisions",
+            AdminMutationReceipt,
+        )
+
+    @application.post(
+        "/api/v1/admin/submissions/{submission_id}/restore",
+        response_model=AdminMutationReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Expediente no disponible"},
+            409: {"description": "Conflicto de versión o transición"},
+            422: {"description": "Motivo inválido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_restore_submission(
+        submission_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "POST",
+            f"/internal/v1/admin/submissions/{submission_id}/restore",
+            AdminMutationReceipt,
+        )
+
+    @application.post(
+        "/api/v1/admin/submissions/{submission_id}"
+        "/evidence/{evidence_id}/access-grants",
+        status_code=201,
+        response_model=AdminEvidenceAccessGrant,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Evidencia no disponible"},
+            429: {"description": "Límite administrativo excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_grant_evidence_access(
+        submission_id: UUID,
+        evidence_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not admin_evidence_limiter.allow(f"evidence:{account.id}"):
+            return rate_limited_response(
+                "Se superó el límite de accesos a evidencia por minuto."
+            )
+        return await admin_forward(
+            upstream,
+            "POST",
+            f"/internal/v1/admin/submissions/{submission_id}"
+            f"/evidence/{evidence_id}/access-grants",
+            account,
+            AdminEvidenceAccessGrant,
+            success_status=201,
+        )
+
+    @application.get(
+        "/api/v1/admin/evidence-access/{token}",
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            404: {"description": "Acceso inválido o vencido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_serve_evidence(
+        token: str,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        try:
+            response = await upstream.get(
+                f"/internal/v1/admin/evidence-access/{token}",
+                headers=actor_headers(account),
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return Response(
+                content=response.content,
+                media_type=response.headers.get(
+                    "content-type", "application/octet-stream"
+                ),
+                headers={"Cache-Control": "no-store, private"},
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return admin_unavailable()
+
+    @application.get(
+        "/api/v1/admin/accounts",
+        response_model=AdminAccountPage,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            422: {"description": "Filtros inválidos"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_list_accounts(
+        request: Request,
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+        q: Annotated[
+            str | None, Query(min_length=2, max_length=100)
+        ] = None,
+        role: Annotated[AccountRole | None, Query()] = None,
+        status: Annotated[AdminAccountStatus | None, Query()] = None,
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        params: list[tuple[str, str]] = [
+            ("limit", str(limit)),
+            ("offset", str(offset)),
+        ]
+        if q is not None:
+            params.append(("q", q))
+        if role is not None:
+            params.append(("role", role))
+        if status is not None:
+            params.append(("status", status))
+        return await admin_forward(
+            identity,
+            "GET",
+            "/internal/v1/admin/accounts",
+            account,
+            AdminAccountPage,
+            params=params,
+        )
+
+    @application.get(
+        "/api/v1/admin/accounts/{account_id}",
+        response_model=AdminAccountDetail,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            404: {"description": "Cuenta no disponible"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_get_account(
+        account_id: UUID,
+        request: Request,
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        return await admin_forward(
+            identity,
+            "GET",
+            f"/internal/v1/admin/accounts/{account_id}",
+            account,
+            AdminAccountDetail,
+        )
+
+    @application.patch(
+        "/api/v1/admin/accounts/{account_id}",
+        response_model=AdminAccountDetail,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Cuenta no disponible"},
+            409: {"description": "Versión, self-action o último admin"},
+            422: {"description": "Campos inválidos"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_update_account(
+        account_id: UUID,
+        request: Request,
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        body = await request.body()
+        return await admin_forward(
+            identity,
+            "PATCH",
+            f"/internal/v1/admin/accounts/{account_id}",
+            account,
+            AdminAccountDetail,
+            body=body,
+        )
+
+    @application.delete(
+        "/api/v1/admin/accounts/{account_id}/sessions",
+        status_code=204,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Cuenta no disponible"},
+            422: {"description": "Motivo inválido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_revoke_account_sessions(
+        account_id: UUID,
+        request: Request,
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        body = await request.body()
+        return await admin_forward(
+            identity,
+            "DELETE",
+            f"/internal/v1/admin/accounts/{account_id}/sessions",
+            account,
+            None,
+            body=body,
+        )
+
+    @application.get(
+        "/api/v1/admin/audit-events",
+        response_model=AdminAuditPage,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            422: {"description": "Filtros inválidos"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_list_audit_events(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+        q: Annotated[
+            str | None, Query(min_length=2, max_length=100)
+        ] = None,
+        action: Annotated[str | None, Query(max_length=80)] = None,
+        result: Annotated[
+            Literal["success", "denied", "failed"] | None, Query()
+        ] = None,
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        params: list[tuple[str, str]] = [
+            ("limit", str(limit)),
+            ("offset", str(offset)),
+        ]
+        if q is not None:
+            params.append(("q", q))
+        if action is not None:
+            params.append(("action", action))
+        if result is not None:
+            params.append(("result", result))
+        return await admin_forward(
+            upstream,
+            "GET",
+            "/internal/v1/admin/audit-events",
+            account,
+            AdminAuditPage,
+            params=params,
+        )
+
+    # CHG-035 — Reporte ciudadano de edificio sin verificar.
+
+    @application.post(
+        "/api/v1/unverified-building-reports",
+        status_code=201,
+        response_model=UnverifiedBuildingReportReceipt,
+        response_model_by_alias=True,
+        responses={
+            413: {"description": "Carga demasiado grande"},
+            415: {"description": "Fotografía no permitida"},
+            422: {"description": "Datos o fotografías inválidos"},
+            429: {"description": "Límite de reportes excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["BuildingReports"],
+    )
+    async def create_unverified_building_report(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        if not building_reports_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de reportes por minuto."
+            )
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        declared = request.headers.get("content-length")
+        if declared is not None and declared.isdigit():
+            if int(declared) > resolved_settings.max_report_body_bytes:
+                return problem_response(
+                    "El envío supera el máximo total permitido.",
+                    title="Carga demasiado grande",
+                    status_code=413,
+                    problem_type="payload-too-large",
+                )
+        # Reenvío multipart en streaming: el gateway no interpreta el
+        # cuerpo, no registra sus partes y no reenvía cookies.
+        headers = {
+            "content-type": request.headers.get("content-type", ""),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": "anonymous",
+        }
+        try:
+            response = await upstream.post(
+                "/internal/v1/unverified-building-reports",
+                content=request.stream(),
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=201,
+                content=UnverifiedBuildingReportReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible recibir el reporte en este momento; "
+                "ningún dato quedó registrado.",
+                title="Servicio de reportes no disponible",
+            )
+
+    @application.get(
+        "/api/v1/humanitarian-directory/search",
+        response_model=HumanitarianDirectorySearchResponse,
+        response_model_by_alias=True,
+        responses={
+            422: {"description": "Consulta o filtros inválidos"},
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Directorio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def search_humanitarian_directory(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        kind: Annotated[HumanitarianDirectoryKind, Query()],
+        q: Annotated[str, Query(min_length=2, max_length=100)],
+        person_status: Annotated[
+            PublicPersonStatus | None, Query(alias="personStatus")
+        ] = None,
+        verification_status: Annotated[
+            VerificationStatus | None, Query(alias="verificationStatus")
+        ] = None,
+        availability_status: Annotated[
+            AidLocationAvailability | None,
+            Query(alias="availabilityStatus"),
+        ] = None,
+        open_now: Annotated[bool | None, Query(alias="openNow")] = None,
+        department: Annotated[
+            str | None, Query(min_length=2, max_length=100)
+        ] = None,
+        min_rating: Annotated[
+            float | None, Query(alias="minRating", ge=1, le=5)
+        ] = None,
+        limit: Annotated[int, Query(ge=1, le=20)] = 20,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        if not directory_search_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de búsquedas por minuto."
+            )
+        params: list[tuple[str, str]] = [
+            ("kind", kind),
+            ("q", q),
+            ("limit", str(limit)),
+            ("offset", str(offset)),
+        ]
+        if person_status is not None:
+            params.append(("personStatus", person_status))
+        if verification_status is not None:
+            params.append(("verificationStatus", verification_status))
+        if availability_status is not None:
+            params.append(("availabilityStatus", availability_status))
+        if open_now is not None:
+            params.append(("openNow", "true" if open_now else "false"))
+        if department is not None:
+            params.append(("department", department))
+        if min_rating is not None:
+            params.append(("minRating", str(min_rating)))
+        try:
+            response = await upstream.get(
+                "/internal/v1/humanitarian-directory/search",
+                params=params,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return HumanitarianDirectorySearchResponse.model_validate(
+                response.json()
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar el directorio en este momento.",
+                title="Directorio no disponible",
+            )
+
+    @application.post(
+        "/api/v1/public/missing-persons/{person_id}/status-reports",
+        status_code=202,
+        response_model=CommunityContributionReceipt,
+        response_model_by_alias=True,
+        responses={
+            404: {"description": "Persona inexistente o no publicable"},
+            413: {"description": "Carga demasiado grande"},
+            415: {"description": "Fotografía no permitida"},
+            422: {"description": "Evidencia o datos inválidos"},
+            429: {"description": "Límite de aportes excedido"},
+            503: {"description": "Servicio de evidencia no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_anonymous_person_status_report(
+        person_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        if not anonymous_contribution_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de aportes por minuto."
+            )
+        return await forward_contribution(
+            request,
+            upstream,
+            f"/internal/v1/missing-persons/{person_id}/status-reports",
+            "anonymous",
+            "Servicio de evidencia no disponible",
+            "No fue posible recibir la novedad en este momento; "
+            "ningún dato quedó registrado.",
+        )
+
+    @application.post(
+        "/api/v1/me/missing-persons/{person_id}/status-reports",
+        status_code=202,
+        response_model=CommunityContributionReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Origen no permitido"},
+            404: {"description": "Persona inexistente o no publicable"},
+            413: {"description": "Carga demasiado grande"},
+            415: {"description": "Fotografía no permitida"},
+            422: {"description": "Evidencia o datos inválidos"},
+            429: {"description": "Límite de aportes excedido"},
+            503: {"description": "Servicio de evidencia no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_authenticated_person_status_report(
+        person_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not account_contribution_limiter.allow(
+            f"account:{account.id}"
+        ):
+            return rate_limited_response(
+                "Se superó el límite de aportes por minuto."
+            )
+        return await forward_contribution(
+            request,
+            upstream,
+            f"/internal/v1/missing-persons/{person_id}/status-reports",
+            "authenticated",
+            "Servicio de evidencia no disponible",
+            "No fue posible recibir la novedad en este momento; "
+            "ningún dato quedó registrado.",
+            account_id=account.id,
+        )
+
+    @application.post(
+        "/api/v1/public/aid-locations/{location_id}/ratings",
+        status_code=202,
+        response_model=CommunityContributionReceipt,
+        response_model_by_alias=True,
+        responses={
+            404: {"description": "Lugar inexistente o no publicable"},
+            413: {"description": "Carga demasiado grande"},
+            415: {"description": "Fotografía no permitida"},
+            422: {"description": "Valoración inválida"},
+            429: {"description": "Límite de aportes excedido"},
+            503: {"description": "Servicio de valoraciones no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_anonymous_aid_location_rating(
+        location_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        if not anonymous_contribution_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de aportes por minuto."
+            )
+        return await forward_contribution(
+            request,
+            upstream,
+            f"/internal/v1/aid-locations/{location_id}/ratings",
+            "anonymous",
+            "Servicio de valoraciones no disponible",
+            "No fue posible recibir la valoración en este momento; "
+            "ningún dato quedó registrado.",
+        )
+
+    @application.post(
+        "/api/v1/me/aid-locations/{location_id}/ratings",
+        status_code=202,
+        response_model=CommunityContributionReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Origen no permitido"},
+            404: {"description": "Lugar inexistente o no publicable"},
+            413: {"description": "Carga demasiado grande"},
+            415: {"description": "Fotografía no permitida"},
+            422: {"description": "Valoración inválida"},
+            429: {"description": "Límite de aportes excedido"},
+            503: {"description": "Servicio de valoraciones no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_authenticated_aid_location_rating(
+        location_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not account_contribution_limiter.allow(
+            f"account:{account.id}"
+        ):
+            return rate_limited_response(
+                "Se superó el límite de aportes por minuto."
+            )
+        return await forward_contribution(
+            request,
+            upstream,
+            f"/internal/v1/aid-locations/{location_id}/ratings",
+            "authenticated",
+            "Servicio de valoraciones no disponible",
+            "No fue posible recibir la valoración en este momento; "
+            "ningún dato quedó registrado.",
+            account_id=account.id,
+        )
 
     return application
 

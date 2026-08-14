@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 RequestedAccountType = Literal[
     "citizen", "volunteer", "organization_representative"
 ]
+AccountRole = Literal["user", "moderator", "super_admin"]
 AccountStatus = Literal["pending_verification", "active", "suspended"]
 
 
@@ -105,7 +106,7 @@ class AuthenticatedAccount(ApiModel):
     id: UUID
     display_name: str = Field(min_length=1, max_length=161)
     email: str = Field(max_length=254)
-    assigned_role: Literal["user"]
+    assigned_role: AccountRole
     status: Literal["active"]
     session_expires_at: datetime
 
@@ -117,6 +118,69 @@ class SessionEnvelope(ApiModel):
     account: AuthenticatedAccount
     session_token: str
     session_expires_at: datetime
+
+
+# CHG-036 — Administración de cuentas (espejo del contrato). Nunca
+# exponen hash de contraseña, tokens ni teléfono.
+class AdminAccountSummary(ApiModel):
+    id: UUID
+    display_name: str = Field(min_length=1, max_length=161)
+    email: str = Field(max_length=254)
+    assigned_role: AccountRole
+    status: AccountStatus
+    active_sessions: int = Field(ge=0)
+    created_at: datetime
+    updated_at: datetime
+    version: int = Field(ge=1)
+
+
+class AdminAccountDetail(AdminAccountSummary):
+    department: str = Field(min_length=1, max_length=100)
+    municipality: str = Field(min_length=1, max_length=100)
+    requested_account_type: RequestedAccountType
+    organization_name: str | None = Field(default=None, max_length=160)
+    organization_role: str | None = Field(default=None, max_length=120)
+
+
+class AdminAccountPage(ApiModel):
+    items: list[AdminAccountSummary] = Field(max_length=50)
+    total: int = Field(ge=0)
+    limit: Literal[10, 25, 50]
+    offset: int = Field(ge=0)
+    generated_at: datetime
+
+
+class AdminAccountUpdateInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    expected_version: int = Field(ge=1)
+    reason: str = Field(min_length=10, max_length=500)
+    assigned_role: AccountRole | None = None
+    status: AccountStatus | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one_change(self):
+        if self.assigned_role is None and self.status is None:
+            raise ValueError(
+                "se requiere assignedRole o status"
+            )
+        return self
+
+
+class AdminReasonInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    reason: str = Field(min_length=10, max_length=500)
 
 
 class HealthStatus(BaseModel):

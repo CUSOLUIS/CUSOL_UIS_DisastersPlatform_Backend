@@ -77,11 +77,18 @@ services:
       SMTP_HOST: mailpit
       SMTP_PORT: 1025
       PUBLIC_BASE_URL: http://localhost:${FRONTEND_PORT:-3100}
+      # CHG-036: cuenta inicial local. La contraseña nunca vive en Compose.
+      ADMIN_BOOTSTRAP_EMAIL: ${ADMIN_BOOTSTRAP_EMAIL:-admin@cusol.local}
+      # CHG-036: misma clave que disaster-service para que el motivo de
+      # auditoría administrativa sea legible por la consola.
+      REPORT_ENCRYPTION_KEY: ${REPORT_ENCRYPTION_KEY:-dev-local-only-report-key}
     volumes:
       - ./services/identity-service/app:/app/app:ro
     depends_on:
       disasters-db:
         condition: service_healthy
+      admin-bootstrap:
+        condition: service_completed_successfully
       mailpit:
         condition: service_started
     expose:
@@ -98,6 +105,32 @@ services:
       timeout: 3s
       retries: 10
       start_period: 10s
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+
+  admin-bootstrap:
+    build:
+      context: ./services/identity-service
+      target: development
+    command: ["python", "-m", "app.bootstrap_admin"]
+    user: "${ADMIN_BOOTSTRAP_UID:-1001}:${ADMIN_BOOTSTRAP_GID:-1001}"
+    environment:
+      DATABASE_URL: >-
+        postgresql://${POSTGRES_USER:-disasters}:${POSTGRES_PASSWORD:-disasters-local-only}@disasters-db:5432/${POSTGRES_DB:-disasters}
+      ADMIN_BOOTSTRAP_EMAIL: ${ADMIN_BOOTSTRAP_EMAIL:-admin@cusol.local}
+      ADMIN_BOOTSTRAP_PASSWORD_FILE: /run/secrets/cusol/admin_password
+      ADMIN_BOOTSTRAP_RECONCILE: ${ADMIN_BOOTSTRAP_RECONCILE:-false}
+      ADMIN_BOOTSTRAP_ROTATE_PASSWORD: ${ADMIN_BOOTSTRAP_ROTATE_PASSWORD:-false}
+    volumes:
+      - ./services/identity-service/app:/app/app:ro
+      - ${HOME}/.cusol-secrets:/run/secrets/cusol:ro
+    depends_on:
+      disasters-db:
+        condition: service_healthy
+    restart: "no"
     init: true
     security_opt:
       - no-new-privileges:true
@@ -168,6 +201,8 @@ services:
       EXPO_PUBLIC_OPERATIONAL_MAP_DATA_MODE: ${OPERATIONAL_MAP_DATA_MODE:-api}
       # CHG-007/T016: búsqueda y reportes de personas usan la API real; `demo` solo sin backend.
       EXPO_PUBLIC_MISSING_PERSON_DATA_MODE: ${MISSING_PERSON_DATA_MODE:-api}
+      # CHG-036: sesión real con bandeja demo hasta que se implementen /api/v1/admin.
+      EXPO_PUBLIC_ADMIN_DATA_MODE: ${ADMIN_DATA_MODE:-demo}
     volumes:
       - ../CUSOL_UIS_DisastersPlatform_Frontend:/app
       - frontend-node-modules:/app/node_modules

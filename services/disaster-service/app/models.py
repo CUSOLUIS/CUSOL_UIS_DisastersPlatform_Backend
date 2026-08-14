@@ -284,6 +284,386 @@ class MissingPersonReportReceipt(ApiModel):
     received_at: datetime
 
 
+# CHG-034 — Directorio humanitario y aportes con evidencia.
+HumanitarianDirectoryKind = Literal[
+    "missing_person", "collection_center", "collection_point"
+]
+PublicPersonStatus = Literal["missing", "found", "deceased"]
+AidLocationAvailability = Literal["active", "inactive", "unknown"]
+AidSupplyCategory = Literal[
+    "water", "food", "medicine", "clothing", "tools", "shelter", "other"
+]
+ContributionActorKind = Literal["anonymous", "authenticated"]
+
+
+class MissingPersonDirectoryCard(ApiModel):
+    """Tarjeta pública de persona: solo la proyección moderada."""
+
+    kind: Literal["missing_person"] = "missing_person"
+    id: UUID
+    public_case_code: str = Field(min_length=1)
+    display_name: str = Field(min_length=1)
+    status: PublicPersonStatus
+    approximate_age: int | None = Field(default=None, ge=0, le=120)
+    last_seen_at: datetime
+    last_seen_area: str = Field(min_length=1)
+    municipality: str = Field(min_length=1)
+    department: str = Field(min_length=1)
+    public_photo_url: str | None = None
+    source: SourceReference
+    updated_at: datetime
+    data_classification: DataClassification
+
+
+class AidLocationDirectoryCard(ApiModel):
+    """Tarjeta pública de lugar de ayuda; el promedio usa únicamente
+    valoraciones aceptadas."""
+
+    kind: Literal["collection_center", "collection_point"]
+    id: UUID
+    name: str = Field(min_length=1, max_length=180)
+    location_label: str = Field(min_length=1, max_length=300)
+    municipality: str = Field(min_length=1, max_length=100)
+    department: str = Field(min_length=1, max_length=100)
+    verification_status: VerificationStatus
+    availability_status: AidLocationAvailability
+    open_now: bool | None = None
+    accepted_supplies: list[AidSupplyCategory] = Field(max_length=12)
+    average_rating: float | None = Field(default=None, ge=1, le=5)
+    ratings_count: int = Field(ge=0)
+    source: SourceReference
+    updated_at: datetime
+    data_classification: DataClassification
+
+
+class HumanitarianDirectorySearchResponse(ApiModel):
+    items: list[MissingPersonDirectoryCard | AidLocationDirectoryCard] = (
+        Field(max_length=20)
+    )
+    total: int = Field(ge=0)
+    limit: int = Field(ge=1, le=20)
+    offset: int = Field(ge=0)
+    query: str = Field(min_length=2, max_length=100)
+    kind: HumanitarianDirectoryKind
+    generated_at: datetime
+
+
+class MissingPersonStatusReportInput(ApiModel):
+    """Novedad privada sobre una persona; nunca se serializa en
+    respuestas ni cambia el estado público al crearse."""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    claimed_outcome: Literal["found", "deceased"]
+    evidence_description: str = Field(min_length=30, max_length=2000)
+    occurred_at: datetime | None = None
+    location_description: str | None = Field(default=None, max_length=300)
+    truth_confirmed: Literal[True]
+    review_acknowledged: Literal[True]
+
+
+class AidLocationRatingInput(ApiModel):
+    """Valoración privada de un lugar; queda pendiente de revisión."""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    rating: int = Field(ge=1, le=5)
+    evidence_description: str = Field(min_length=20, max_length=1200)
+    truth_confirmed: Literal[True]
+    review_acknowledged: Literal[True]
+
+
+class CommunityContributionReceipt(ApiModel):
+    id: UUID
+    status: Literal["under_review"]
+    actor_kind: ContributionActorKind
+    received_at: datetime
+
+
+# CHG-035 — Reporte ciudadano de edificio sin verificar.
+BuildingReportType = Literal[
+    "residential",
+    "commercial",
+    "institutional",
+    "industrial",
+    "mixed_use",
+    "other",
+]
+BuildingSearchStatus = Literal[
+    "not_started", "interrupted", "incomplete", "unknown"
+]
+BuildingOccupancyReport = Literal[
+    "unknown", "possibly_occupied", "reported_empty"
+]
+BuildingPendingReason = Literal[
+    "access_blocked",
+    "structural_risk_observed",
+    "debris",
+    "fire_or_smoke",
+    "flooding",
+    "no_response_team",
+    "communication_loss",
+    "evacuation",
+    "other",
+]
+BuildingObservedCondition = Literal[
+    "obstructed_access",
+    "visible_debris",
+    "fire_or_smoke",
+    "flooding",
+    "visible_cracks",
+    "partial_collapse_observed",
+    "total_collapse_observed",
+    "other",
+]
+
+
+class UnverifiedBuildingReportInput(ApiModel):
+    """Expediente privado; nunca se serializa en respuestas ni publica
+    un punto del mapa al crearse."""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    building_reference: str = Field(min_length=2, max_length=180)
+    building_type: BuildingReportType
+    department: str = Field(min_length=1, max_length=100)
+    municipality: str = Field(min_length=1, max_length=100)
+    sector: str = Field(min_length=1, max_length=160)
+    location_reference: str = Field(min_length=1, max_length=300)
+    address: str | None = Field(default=None, max_length=300)
+    # Coordenadas exactas privadas: llegan en pareja o no llegan.
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    related_disaster_id: UUID | None = None
+    observed_date: date
+    observed_time: str | None = Field(
+        default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$"
+    )
+    search_status: BuildingSearchStatus
+    occupancy_report: BuildingOccupancyReport
+    pending_reasons: list[BuildingPendingReason] = Field(
+        min_length=1, max_length=9
+    )
+    observed_conditions: list[BuildingObservedCondition] = Field(
+        default_factory=list, max_length=8
+    )
+    observation_description: str = Field(min_length=20, max_length=2000)
+    reporter_name: str = Field(min_length=1, max_length=160)
+    reporter_role: str = Field(min_length=1, max_length=100)
+    reporter_organization: str | None = Field(default=None, max_length=160)
+    reporter_phone: str | None = Field(default=None, max_length=40)
+    reporter_email: str | None = Field(default=None, max_length=254)
+    official_report_number: str | None = Field(default=None, max_length=100)
+    truth_confirmed: Literal[True]
+    photo_authorization_confirmed: Literal[True]
+    review_acknowledged: Literal[True]
+
+    @model_validator(mode="after")
+    def _coordinates_pair(self):
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError(
+                "latitude y longitude deben enviarse juntas o ambas "
+                "ausentes"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _contact_required(self):
+        phone = (self.reporter_phone or "").strip()
+        email = (self.reporter_email or "").strip()
+        if not phone and not email:
+            raise ValueError(
+                "se requiere reporterPhone o reporterEmail"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _unique_selections(self):
+        if len(set(self.pending_reasons)) != len(self.pending_reasons):
+            raise ValueError("pendingReasons no admite repetidos")
+        if len(set(self.observed_conditions)) != len(
+            self.observed_conditions
+        ):
+            raise ValueError("observedConditions no admite repetidos")
+        return self
+
+
+class UnverifiedBuildingReportReceipt(ApiModel):
+    id: UUID
+    public_tracking_code: str = Field(min_length=1, max_length=40)
+    status: Literal["under_review"]
+    received_at: datetime
+
+
+# CHG-036 — Consola de superadministración (espejo del contrato).
+AdminSubmissionKind = Literal[
+    "missing_person_report",
+    "unverified_building_report",
+    "person_status_report",
+    "aid_location_rating",
+    "collection_center_registration",
+    "collection_point_registration",
+]
+AdminModerationStatus = Literal[
+    "under_review", "needs_information", "accepted", "rejected", "archived"
+]
+AdminActionName = Literal[
+    "accept", "reject", "request_changes", "archive", "restore"
+]
+AdminFieldClassification = Literal["public", "private", "protected"]
+AdminAuditResult = Literal["success", "denied", "failed"]
+
+
+class AdminSubmissionSummary(ApiModel):
+    """Resumen de bandeja: sin PII (títulos genéricos y zona municipal)."""
+
+    id: UUID
+    kind: AdminSubmissionKind
+    tracking_code: str = Field(min_length=1, max_length=80)
+    title: str = Field(min_length=1, max_length=200)
+    location_label: str | None = Field(default=None, max_length=200)
+    status: AdminModerationStatus
+    source_label: str = Field(min_length=1, max_length=120)
+    evidence_count: int = Field(ge=0, le=20)
+    received_at: datetime
+    updated_at: datetime
+    version: int = Field(ge=1)
+
+
+class AdminSubmissionPage(ApiModel):
+    items: list[AdminSubmissionSummary] = Field(max_length=50)
+    total: int = Field(ge=0)
+    limit: Literal[10, 25, 50]
+    offset: int = Field(ge=0)
+    generated_at: datetime
+
+
+class AdminField(ApiModel):
+    key: str = Field(pattern=r"^[a-z][A-Za-z0-9]{0,79}$")
+    label: str = Field(min_length=1, max_length=120)
+    display_value: str = Field(max_length=4000)
+    edit_value: str | None = Field(default=None, max_length=4000)
+    classification: AdminFieldClassification
+    editable: bool
+    input_kind: Literal[
+        "text", "multiline", "date", "time", "number", "email", "select"
+    ] = "text"
+    options: list[str] = Field(default_factory=list, max_length=30)
+
+
+class AdminEvidence(ApiModel):
+    id: UUID
+    media_type: str = Field(max_length=100)
+    size_bytes: int = Field(ge=0)
+    scan_status: Literal["safe", "pending", "rejected"]
+    created_at: datetime
+
+
+class AdminSubmissionDetail(AdminSubmissionSummary):
+    fields: list[AdminField] = Field(max_length=100)
+    evidence: list[AdminEvidence] = Field(max_length=20)
+    available_actions: list[AdminActionName]
+
+
+class AdminFieldChange(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    field: str = Field(pattern=r"^[a-z][A-Za-z0-9]{0,79}$")
+    value: str | None = Field(default=None, max_length=4000)
+
+
+class AdminSubmissionEditInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    expected_version: int = Field(ge=1)
+    reason: str = Field(min_length=10, max_length=500)
+    changes: list[AdminFieldChange] = Field(min_length=1, max_length=50)
+
+
+class AdminDecisionInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    expected_version: int = Field(ge=1)
+    action: Literal["accept", "reject", "request_changes"]
+    reason: str = Field(min_length=10, max_length=500)
+
+
+class AdminVersionedReasonInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    expected_version: int = Field(ge=1)
+    reason: str = Field(min_length=10, max_length=500)
+
+
+class AdminMutationReceipt(ApiModel):
+    id: UUID
+    status: AdminModerationStatus
+    version: int = Field(ge=1)
+    audit_event_id: UUID
+    updated_at: datetime
+
+
+class AdminEvidenceAccessGrant(ApiModel):
+    url: str = Field(min_length=1)
+    expires_at: datetime
+    audit_event_id: UUID
+
+
+class AdminAuditEvent(ApiModel):
+    id: UUID
+    actor_account_id: UUID
+    actor_display_name: str = Field(min_length=1, max_length=161)
+    action: str = Field(min_length=1, max_length=80)
+    resource_kind: str = Field(min_length=1, max_length=80)
+    resource_id: UUID
+    result: AdminAuditResult
+    reason_summary: str | None = Field(default=None, max_length=500)
+    occurred_at: datetime
+
+
+class AdminAuditPage(ApiModel):
+    items: list[AdminAuditEvent] = Field(max_length=50)
+    total: int = Field(ge=0)
+    limit: Literal[10, 25, 50]
+    offset: int = Field(ge=0)
+    generated_at: datetime
+
+
 class HealthStatus(BaseModel):
     status: Literal["ok"]
     service: str

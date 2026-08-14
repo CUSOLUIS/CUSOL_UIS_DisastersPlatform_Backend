@@ -17,6 +17,9 @@ class Settings:
     argon2_time_cost: int = 3
     argon2_memory_cost: int = 65536
     argon2_parallelism: int = 2
+    # CHG-036: misma clave que disaster-service para que el motivo de
+    # auditoría sea legible por la consola.
+    report_encryption_key: str = "dev-local-only-report-key"
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -46,4 +49,7 @@ class Settings:
                 os.getenv("ARGON2_MEMORY_COST", "65536")
             ),
             argon2_parallelism=int(os.getenv("ARGON2_PARALLELISM", "2")),
+            report_encryption_key=os.getenv(
+                "REPORT_ENCRYPTION_KEY", "dev-local-only-report-key"
+            ),
         )

@@ -12,6 +12,8 @@ class Settings:
     max_photos: int = 5
     max_photo_bytes: int = 10 * 1024 * 1024
     max_total_photo_bytes: int = 50 * 1024 * 1024
+    # CHG-036: vigencia del acceso temporal a evidencia (tope 300 s).
+    evidence_grant_ttl_seconds: int = 300
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -29,5 +31,9 @@ class Settings:
             upload_dir=os.getenv("UPLOAD_DIR", "/data/uploads"),
             report_encryption_key=os.getenv(
                 "REPORT_ENCRYPTION_KEY", "dev-local-only-report-key"
+            ),
+            evidence_grant_ttl_seconds=min(
+                300,
+                int(os.getenv("EVIDENCE_GRANT_TTL_SECONDS", "300")),
             ),
         )

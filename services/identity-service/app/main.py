@@ -9,13 +9,16 @@ genérico con verificación Argon2id ficticia para correos inexistentes,
 tokens solo hasheados en base y jamás en respuestas o logs.
 """
 
+import base64
+import hashlib
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
-from uuid import uuid4
+from typing import Annotated, Literal
+from uuid import UUID, uuid4
 
 import asyncpg
-from fastapi import Depends, FastAPI, Header, Request
+from cryptography.fernet import Fernet
+from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 
@@ -25,6 +28,11 @@ from .models import (
     AccountRegistrationInput,
     AccountRegistrationReceipt,
     AccountSessionInput,
+    AdminAccountDetail,
+    AdminAccountPage,
+    AdminAccountSummary,
+    AdminAccountUpdateInput,
+    AdminReasonInput,
     AuthenticatedAccount,
     EmailVerificationInput,
     EmailVerificationReceipt,
@@ -388,6 +396,256 @@ def create_app(
         return authenticated_account(
             found.account, found.session_expires_at
         )
+
+    # CHG-036 — Administración de cuentas (rutas internas). El gateway
+    # autentica la cookie; aquí se revalida el rol de los encabezados
+    # internos como defensa en profundidad.
+
+    audit_fernet = Fernet(
+        base64.urlsafe_b64encode(
+            hashlib.sha256(
+                resolved_settings.report_encryption_key.encode()
+            ).digest()
+        )
+    )
+
+    def encrypt_reason(value: str) -> bytes:
+        return audit_fernet.encrypt(value.encode())
+
+    def admin_actor(
+        request: Request,
+    ) -> tuple[UUID, str] | JSONResponse:
+        role = request.headers.get("x-actor-role", "").strip()
+        if role != "super_admin":
+            return problem(
+                403,
+                "Rol insuficiente",
+                "La operación exige rol super_admin.",
+            )
+        try:
+            account_id = UUID(
+                request.headers.get("x-actor-account-id", "").strip()
+            )
+        except ValueError:
+            return problem(
+                403, "Actor inválido", "Actor administrativo ausente."
+            )
+        display_raw = request.headers.get("x-actor-display", "").strip()
+        try:
+            display_name = base64.b64decode(
+                display_raw.encode()
+            ).decode() or "Superadministración"
+        except Exception:
+            display_name = "Superadministración"
+        return account_id, display_name[:161]
+
+    def account_summary(row: dict) -> AdminAccountSummary:
+        return AdminAccountSummary(
+            id=row["id"],
+            display_name=(
+                f"{row['first_names']} {row['last_names']}"[:161]
+            ),
+            email=row["email"],
+            assigned_role=row["assigned_role"],
+            status=row["status"],
+            active_sessions=row["active_sessions"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            version=row["version"],
+        )
+
+    def account_detail(row: dict) -> AdminAccountDetail:
+        summary = account_summary(row)
+        return AdminAccountDetail(
+            **summary.model_dump(by_alias=False),
+            department=row["department"],
+            municipality=row["municipality"],
+            requested_account_type=row["requested_account_type"],
+            organization_name=row["organization_name"],
+            organization_role=row["organization_role"],
+        )
+
+    def account_not_found() -> JSONResponse:
+        return problem(
+            404,
+            "Cuenta no disponible",
+            "La cuenta no existe o no es visible.",
+        )
+
+    @application.get(
+        "/internal/v1/admin/accounts-overview",
+        tags=["Administration"],
+    )
+    async def admin_accounts_overview(
+        request: Request,
+        data: Annotated[IdentityRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        overview = await data.admin_accounts_overview()
+        return JSONResponse(
+            content={
+                "activeAccounts": overview["active_accounts"],
+                "suspendedAccounts": overview["suspended_accounts"],
+            }
+        )
+
+    @application.get(
+        "/internal/v1/admin/accounts",
+        response_model=AdminAccountPage,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_list_accounts(
+        request: Request,
+        data: Annotated[IdentityRepository, Depends(get_repository)],
+        q: Annotated[
+            str | None, Query(min_length=2, max_length=100)
+        ] = None,
+        role: Annotated[
+            Literal["user", "moderator", "super_admin"] | None, Query()
+        ] = None,
+        status: Annotated[
+            Literal["pending_verification", "active", "suspended"]
+            | None,
+            Query(),
+        ] = None,
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        if limit not in (10, 25, 50):
+            return problem(
+                422,
+                "Tamaño de página inválido",
+                "El tamaño de página debe ser 10, 25 o 50.",
+            )
+        rows, total = await data.admin_list_accounts(
+            q, role, status, limit, offset
+        )
+        return AdminAccountPage(
+            items=[account_summary(row) for row in rows],
+            total=total,
+            limit=limit,
+            offset=offset,
+            generated_at=datetime.now(UTC),
+        )
+
+    @application.get(
+        "/internal/v1/admin/accounts/{account_id}",
+        response_model=AdminAccountDetail,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_get_account(
+        account_id: UUID,
+        request: Request,
+        data: Annotated[IdentityRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        row = await data.admin_get_account(account_id)
+        if row is None:
+            return account_not_found()
+        return account_detail(row)
+
+    @application.patch(
+        "/internal/v1/admin/accounts/{account_id}",
+        response_model=AdminAccountDetail,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_update_account(
+        account_id: UUID,
+        request: Request,
+        data: Annotated[IdentityRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display = actor
+        try:
+            payload = AdminAccountUpdateInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return validation_problem(error)
+        if account_id == actor_account_id:
+            # Separación de funciones: nadie cambia su propio rol o
+            # estado desde la consola.
+            await data.admin_write_audit(
+                actor_account_id,
+                actor_display,
+                "account_updated",
+                account_id,
+                "denied",
+            )
+            return problem(
+                409,
+                "Operación sobre la propia cuenta",
+                "No puedes cambiar tu propio rol o estado.",
+            )
+        outcome, _audit_id = await data.admin_update_account(
+            account_id,
+            payload.expected_version,
+            payload.assigned_role,
+            payload.status,
+            actor_account_id,
+            actor_display,
+            encrypt_reason(payload.reason),
+        )
+        if outcome == "not_found":
+            return account_not_found()
+        if outcome == "conflict":
+            return problem(
+                409,
+                "Conflicto de versión",
+                "La cuenta cambió; recarga y reintenta con la versión "
+                "vigente.",
+            )
+        if outcome == "last_admin":
+            return problem(
+                409,
+                "Último superadministrador",
+                "No es posible degradar o suspender al último "
+                "super_admin activo.",
+            )
+        row = await data.admin_get_account(account_id)
+        return account_detail(row)
+
+    @application.delete(
+        "/internal/v1/admin/accounts/{account_id}/sessions",
+        status_code=204,
+        tags=["Administration"],
+    )
+    async def admin_revoke_account_sessions(
+        account_id: UUID,
+        request: Request,
+        data: Annotated[IdentityRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display = actor
+        try:
+            payload = AdminReasonInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return validation_problem(error)
+        found, _audit_id = await data.admin_revoke_sessions(
+            account_id,
+            actor_account_id,
+            actor_display,
+            encrypt_reason(payload.reason),
+        )
+        if not found:
+            return account_not_found()
+        return Response(status_code=204)
 
     return application
 

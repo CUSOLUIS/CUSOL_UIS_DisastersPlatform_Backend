@@ -50,4 +50,120 @@ me_status_proxy=$(curl --silent --output /dev/null --write-out '%{http_code}' \
   "http://127.0.0.1:${frontend_port}/api/v1/auth/me")
 [ "$me_status_proxy" = "401" ]
 
-printf '%s\n' "Smoke test correcto: frontend, gateway, disaster-service e identity-service conectados (mapa operativo, capa humana y autenticación)."
+# CHG-034: búsqueda unificada del directorio humanitario por el gateway
+# y por el proxy del frontend, para personas y lugares de ayuda.
+directory_people_query="kind=missing_person&q=demo"
+directory_places_query="kind=collection_center&q=acopio"
+curl --fail --silent --show-error \
+  "http://127.0.0.1:${gateway_port}/api/v1/humanitarian-directory/search?${directory_people_query}" \
+  | grep -q '"publicCaseCode"'
+curl --fail --silent --show-error \
+  "http://127.0.0.1:${frontend_port}/api/v1/humanitarian-directory/search?${directory_people_query}" \
+  | grep -q '"publicCaseCode"'
+curl --fail --silent --show-error \
+  "http://127.0.0.1:${gateway_port}/api/v1/humanitarian-directory/search?${directory_places_query}" \
+  | grep -q '"ratingsCount"'
+curl --fail --silent --show-error \
+  "http://127.0.0.1:${frontend_port}/api/v1/humanitarian-directory/search?${directory_places_query}" \
+  | grep -q '"ratingsCount"'
+
+# CHG-034: los aportes autenticados exigen sesión (401 sin cookie).
+me_rating_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -X POST -H "Idempotency-Key: smoke-idempotency-chg034" \
+  "http://127.0.0.1:${gateway_port}/api/v1/me/aid-locations/44444444-4444-4444-8444-444444444404/ratings")
+[ "$me_rating_status" = "401" ]
+me_rating_status_proxy=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -X POST -H "Idempotency-Key: smoke-idempotency-chg034" \
+  "http://127.0.0.1:${frontend_port}/api/v1/me/aid-locations/44444444-4444-4444-8444-444444444404/ratings")
+[ "$me_rating_status_proxy" = "401" ]
+
+# CHG-035: la ruta de reportes de edificio está viva por el gateway y el
+# proxy (422 por cabecera faltante, no 404), sin crear expedientes.
+building_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -X POST "http://127.0.0.1:${gateway_port}/api/v1/unverified-building-reports")
+[ "$building_status" = "422" ]
+building_status_proxy=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -X POST "http://127.0.0.1:${frontend_port}/api/v1/unverified-building-reports")
+[ "$building_status_proxy" = "422" ]
+
+# CHG-036: consola administrativa. Sin sesión 401; user 403;
+# super_admin 200 por el gateway y por el proxy del frontend.
+admin_secret_file="${ADMIN_BOOTSTRAP_PASSWORD_FILE:-$HOME/.cusol-secrets/admin_password}"
+if [ -f "$admin_secret_file" ]; then
+  smoke_dir=$(mktemp -d)
+  trap 'rm -rf "$smoke_dir"' EXIT
+
+  admin_anon_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    "http://127.0.0.1:${gateway_port}/api/v1/admin/overview")
+  [ "$admin_anon_status" = "401" ]
+
+  # Usuario normal verificado con contraseña conocida (solo smoke local).
+  docker compose -f compose.yaml exec -T identity-service python - <<'PYEOF' >/dev/null
+import asyncio, uuid
+import asyncpg
+from app.config import Settings
+from app.security import build_password_hasher
+
+async def main():
+    settings = Settings.from_environment()
+    hasher = build_password_hasher(1, 8192, 1)
+    connection = await asyncpg.connect(settings.database_url)
+    await connection.execute(
+        """
+        INSERT INTO identity_service.accounts (
+            id, email, first_names, last_names, department, municipality,
+            requested_account_type, assigned_role, password_hash, status,
+            email_verified_at, created_at, updated_at
+        ) VALUES ($1, 'smoke-user@cusol.local', 'Usuaria', 'Smoke',
+            'Santander', 'Bucaramanga', 'citizen', 'user', $2, 'active',
+            NOW(), NOW(), NOW())
+        ON CONFLICT (email) DO UPDATE SET password_hash = $2,
+            status = 'active', assigned_role = 'user'
+        """,
+        uuid.uuid4(), hasher.hash("SmokeUser#2026aa"),
+    )
+    await connection.close()
+
+asyncio.run(main())
+PYEOF
+
+  printf '{"email":"smoke-user@cusol.local","password":"SmokeUser#2026aa"}' \
+    > "$smoke_dir/user-login.json"
+  python3 - "$admin_secret_file" > "$smoke_dir/admin-login.json" <<'PYEOF'
+import json, sys
+password = open(sys.argv[1], encoding="utf-8").read().rstrip("\r\n")
+print(json.dumps({"email": "admin@cusol.local", "password": password}))
+PYEOF
+
+  curl --fail --silent --show-error -c "$smoke_dir/user.jar" \
+    -X POST -H "Content-Type: application/json" \
+    -d @"$smoke_dir/user-login.json" \
+    "http://127.0.0.1:${gateway_port}/api/v1/auth/sessions" >/dev/null
+  curl --fail --silent --show-error -c "$smoke_dir/admin.jar" \
+    -X POST -H "Content-Type: application/json" \
+    -d @"$smoke_dir/admin-login.json" \
+    "http://127.0.0.1:${gateway_port}/api/v1/auth/sessions" >/dev/null
+
+  admin_user_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    -b "$smoke_dir/user.jar" \
+    "http://127.0.0.1:${gateway_port}/api/v1/admin/overview")
+  [ "$admin_user_status" = "403" ]
+  admin_user_status_proxy=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    -b "$smoke_dir/user.jar" \
+    "http://127.0.0.1:${frontend_port}/api/v1/admin/overview")
+  [ "$admin_user_status_proxy" = "403" ]
+
+  curl --fail --silent --show-error -b "$smoke_dir/admin.jar" \
+    "http://127.0.0.1:${gateway_port}/api/v1/admin/overview" \
+    | grep -q '"underReview"'
+  curl --fail --silent --show-error -b "$smoke_dir/admin.jar" \
+    "http://127.0.0.1:${frontend_port}/api/v1/admin/overview" \
+    | grep -q '"underReview"'
+  curl --fail --silent --show-error -b "$smoke_dir/admin.jar" \
+    "http://127.0.0.1:${gateway_port}/api/v1/admin/submissions?limit=10" \
+    | grep -q '"trackingCode"'
+else
+  printf '%s\n' "AVISO: sin secreto administrativo; se omite el smoke CHG-036."
+fi
+
+printf '%s\n' "Smoke test correcto: frontend, gateway, disaster-service e identity-service conectados (mapa operativo, capa humana, autenticación, directorio humanitario, reporte de edificio y consola administrativa)."

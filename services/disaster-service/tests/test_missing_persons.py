@@ -102,6 +102,13 @@ class FakeStorage:
         self.deleted.append(key)
         self.objects.pop(key, None)
 
+    def load(self, key: str) -> bytes | None:
+        if self.fail:
+            from app.storage import StorageUnavailableError
+
+            raise StorageUnavailableError("sin acceso")
+        return self.objects.get(key)
+
 
 def make_jpeg(with_exif: bool = True, size=(48, 48)) -> bytes:
     image = Image.new("RGB", size, "red")

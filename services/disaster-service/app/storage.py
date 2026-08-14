@@ -15,6 +15,10 @@ class ObjectStorage(Protocol):
 
     def delete(self, key: str) -> None: ...
 
+    def load(self, key: str) -> bytes | None:
+        """Bytes del objeto, o None si no existe."""
+        ...
+
 
 class StorageUnavailableError(Exception):
     """El backend de objetos no está disponible."""
@@ -49,3 +53,15 @@ class LocalObjectStorage:
             self._path(key).unlink(missing_ok=True)
         except OSError:  # la limpieza no debe ocultar el error original
             pass
+
+    def load(self, key: str) -> bytes | None:
+        # CHG-036: lectura mediada para la consola; nunca URL pública.
+        try:
+            path = self._path(key)
+            if not path.is_file():
+                return None
+            return path.read_bytes()
+        except OSError as error:
+            raise StorageUnavailableError(
+                "No fue posible leer el archivo."
+            ) from error
