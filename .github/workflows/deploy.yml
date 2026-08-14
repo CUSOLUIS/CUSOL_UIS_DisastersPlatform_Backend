@@ -1,0 +1,45 @@
+# CHG-037 — Despliegue continuo del backend al servidor de producción
+# local (runner self-hosted `disasters-backend` en la Raspberry Pi).
+#
+# Cada push a main actualiza la carpeta viva del stack, reconstruye los
+# servicios, aplica migraciones idempotentes y ejecuta el smoke completo.
+# Si el árbol de producción tiene cambios trackeados sin commit, el
+# despliegue ABORTA: nunca se destruye trabajo local.
+name: Deploy Backend
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-backend-production
+  cancel-in-progress: false
+
+env:
+  DEPLOY_DIR: /home/dev/DesatreNaturalColombia/CUSOL_UIS_DisastersPlatform_Backend
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, disasters-backend]
+    steps:
+      - name: Actualizar código en la carpeta de despliegue
+        run: |
+          cd "$DEPLOY_DIR"
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            echo "::error::El árbol de producción tiene cambios sin commit; despliegue abortado para no destruir trabajo local."
+            exit 1
+          fi
+          git fetch origin ${{ github.sha }}
+          git reset --hard ${{ github.sha }}
+
+      - name: Validar composición
+        run: cd "$DEPLOY_DIR" && make config
+
+      - name: Reconstruir y levantar servicios
+        run: cd "$DEPLOY_DIR" && make up
+
+      - name: Aplicar migraciones idempotentes
+        run: cd "$DEPLOY_DIR" && make migrate
+
+      - name: Smoke de la plataforma
+        run: cd "$DEPLOY_DIR" && make smoke

@@ -1,0 +1,27 @@
+# CHG-037 — Pruebas de los tres microservicios en runners de GitHub.
+# El despliegue a producción vive en deploy.yml (runner self-hosted).
+name: CI Backend
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [api-gateway, disaster-service, identity-service]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pruebas en Docker (${{ matrix.service }})
+        run: |
+          docker build --target test \
+            -t cusol-${{ matrix.service }}-test \
+            services/${{ matrix.service }}
+          docker run --rm cusol-${{ matrix.service }}-test
