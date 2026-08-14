@@ -166,6 +166,8 @@ services:
       VITE_API_PROXY_TARGET: http://api-gateway:8000
       # CHG-006/T013: el mapa consume la API real; usar `demo` para volver al fixture.
       EXPO_PUBLIC_OPERATIONAL_MAP_DATA_MODE: ${OPERATIONAL_MAP_DATA_MODE:-api}
+      # CHG-007/T016: búsqueda y reportes de personas usan la API real; `demo` solo sin backend.
+      EXPO_PUBLIC_MISSING_PERSON_DATA_MODE: ${MISSING_PERSON_DATA_MODE:-api}
     volumes:
       - ../CUSOL_UIS_DisastersPlatform_Frontend:/app
       - frontend-node-modules:/app/node_modules
