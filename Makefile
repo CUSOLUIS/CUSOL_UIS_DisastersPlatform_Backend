@@ -44,6 +44,10 @@ migrate:
 	done
 
 seed:
+	@if [ -n "$(CI)$(GITHUB_ACTIONS)" ]; then \
+		echo "ERROR: 'make seed' escribe datos sintéticos sobre la base viva y está prohibido bajo CI/despliegue automático."; \
+		exit 1; \
+	fi
 	@echo "Aplicando datos semilla sintéticos (infra/postgres/seed) a la base local"
 	@for f in infra/postgres/seed/*.sql; do \
 		echo "  -> $$f"; \
@@ -53,6 +57,18 @@ seed:
 smoke:
 	./scripts/smoke-test.sh
 
+# CHG-039: la única puerta hacia `--volumes`. Nunca bajo CI; solo un
+# operador humano en el servidor, con confirmación explícita.
 clean:
+	@if [ -n "$(CI)$(GITHUB_ACTIONS)" ]; then \
+		echo "ERROR: 'make clean' destruye la base de datos (cusol-disasters-data) y está prohibido bajo CI/despliegue automático."; \
+		exit 1; \
+	fi
+	@if [ "$(CONFIRM_DB_RESET)" != "yes" ]; then \
+		echo "ERROR: 'make clean' borra los volúmenes cusol-disasters-data y cusol-disasters-report-uploads."; \
+		echo "Si de verdad quieres reiniciar la base, ejecútalo a mano en el servidor:"; \
+		echo "  CONFIRM_DB_RESET=yes make clean"; \
+		exit 1; \
+	fi
 	@echo "Eliminando contenedores y volumen local cusol-disasters-data"
 	$(COMPOSE) down --volumes --remove-orphans
