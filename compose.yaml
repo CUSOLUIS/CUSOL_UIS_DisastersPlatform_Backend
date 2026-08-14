@@ -62,18 +62,77 @@ services:
     networks:
       - backend
 
+  identity-service:
+    build:
+      context: ./services/identity-service
+      target: development
+    environment:
+      DATABASE_URL: >-
+        postgresql://${POSTGRES_USER:-disasters}:${POSTGRES_PASSWORD:-disasters-local-only}@disasters-db:5432/${POSTGRES_DB:-disasters}
+      DATABASE_POOL_MIN_SIZE: 1
+      DATABASE_POOL_MAX_SIZE: 5
+      WATCHFILES_FORCE_POLLING: "true"
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-24}
+      VERIFICATION_TTL_HOURS: ${VERIFICATION_TTL_HOURS:-24}
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      PUBLIC_BASE_URL: http://localhost:${FRONTEND_PORT:-3100}
+    volumes:
+      - ./services/identity-service/app:/app/app:ro
+    depends_on:
+      disasters-db:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    expose:
+      - "8002"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health/ready', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+
+  mailpit:
+    # CHG-022: captura de correo SOLO para desarrollo local.
+    image: axllent/mailpit:v1.21
+    ports:
+      - "${MAILPIT_UI_PORT:-8025}:8025"
+    networks:
+      - edge
+      - backend
+    init: true
+    security_opt:
+      - no-new-privileges:true
+
   api-gateway:
     build:
       context: ./services/api-gateway
       target: development
     environment:
       DISASTER_SERVICE_URL: http://disaster-service:8001
+      IDENTITY_SERVICE_URL: http://identity-service:8002
       UPSTREAM_TIMEOUT_SECONDS: 5
       WATCHFILES_FORCE_POLLING: "true"
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3100,http://127.0.0.1:3100}
     volumes:
       - ./services/api-gateway/app:/app/app:ro
     depends_on:
       disaster-service:
+        condition: service_healthy
+      identity-service:
         condition: service_healthy
     ports:
       - "${GATEWAY_PORT:-8000}:8000"

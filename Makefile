@@ -23,7 +23,7 @@ logs-frontend:
 	$(COMPOSE) logs -f --tail=100 frontend
 
 logs-backend:
-	$(COMPOSE) logs -f --tail=100 api-gateway disaster-service
+	$(COMPOSE) logs -f --tail=100 api-gateway disaster-service identity-service
 
 ps:
 	$(COMPOSE) ps
@@ -33,6 +33,8 @@ test:
 	docker run --rm cusol-api-gateway-test
 	docker build --quiet --target test -t cusol-disaster-service-test services/disaster-service
 	docker run --rm cusol-disaster-service-test
+	docker build --quiet --target test -t cusol-identity-service-test services/identity-service
+	docker run --rm cusol-identity-service-test
 
 migrate:
 	@echo "Aplicando esquema (infra/postgres/init) a la base local existente"

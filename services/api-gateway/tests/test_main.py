@@ -794,3 +794,312 @@ async def test_report_upstream_failure_returns_problem():
     assert response.json()["title"] == (
         "Servicio de reportes no disponible"
     )
+
+
+# --- CHG-022: autenticación ---
+
+
+SESSION_ENVELOPE = {
+    "account": {
+        "id": "88888888-8888-4888-8888-888888888801",
+        "displayName": "Ana Rojas",
+        "email": "ana.rojas@example.com",
+        "assignedRole": "user",
+        "status": "active",
+        "sessionExpiresAt": "2027-08-14T22:00:00Z",
+    },
+    "sessionToken": "token-opaco-de-prueba-1234567890abcdef",
+    "sessionExpiresAt": "2027-08-14T22:00:00Z",
+}
+
+REGISTRATION_RECEIPT = {
+    "requestId": "99999999-9999-4999-8999-999999999901",
+    "status": "email_verification_required",
+    "emailMasked": "a***@example.com",
+    "verificationExpiresAt": "2026-08-14T22:00:00Z",
+    "assignedRole": "user",
+    "createdAt": "2026-08-13T22:00:00Z",
+}
+
+
+def identity_mock(handler):
+    transport = httpx.MockTransport(handler)
+    return httpx.AsyncClient(
+        transport=transport,
+        base_url="http://identity-service:8002",
+    )
+
+
+async def delete(app, path: str, **kwargs) -> httpx.Response:
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            return await client.delete(path, **kwargs)
+
+
+@pytest.mark.anyio
+async def test_readiness_ok_with_both_upstreams():
+    upstream = mock_client(
+        lambda _: httpx.Response(200, json={"status": "ok"})
+    )
+    identity = identity_mock(
+        lambda _: httpx.Response(200, json={"status": "ok"})
+    )
+    app = create_app(SETTINGS, upstream, identity)
+
+    response = await get(app, "/health/ready")
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_readiness_fails_when_identity_down_but_others_alive():
+    upstream = mock_client(
+        lambda request: httpx.Response(
+            200,
+            json={"status": "ok"}
+            if request.url.path == "/health/ready"
+            else {"items": [], "total": 0, "limit": 50, "offset": 0},
+        )
+    )
+
+    def identity_handler(request: httpx.Request):
+        raise httpx.ConnectError("identity caído")
+
+    identity = identity_mock(identity_handler)
+    app = create_app(SETTINGS, upstream, identity)
+
+    ready = await get(app, "/health/ready")
+    registration = await post(
+        app,
+        "/api/v1/auth/registrations",
+        json={"email": "x@example.com"},
+    )
+    disasters = await get(app, "/api/v1/disasters")
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert ready.status_code == 503
+    assert registration.status_code == 503
+    assert registration.headers["content-type"] == (
+        "application/problem+json"
+    )
+    # Los demás endpoints siguen vivos aunque identity esté caído.
+    assert disasters.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_registration_is_forwarded_and_typed():
+    def handler(request: httpx.Request):
+        assert request.url.path == "/internal/v1/auth/registrations"
+        return httpx.Response(202, json=REGISTRATION_RECEIPT)
+
+    upstream = mock_client(lambda _: httpx.Response(200, json={}))
+    identity = identity_mock(handler)
+    app = create_app(SETTINGS, upstream, identity)
+
+    response = await post(
+        app,
+        "/api/v1/auth/registrations",
+        json={"email": "ana.rojas@example.com"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["assignedRole"] == "user"
+    assert body["emailMasked"] == "a***@example.com"
+    assert "sessionToken" not in response.text
+    assert "set-cookie" not in response.headers
+
+
+@pytest.mark.anyio
+async def test_registration_rate_limit_returns_429():
+    identity = identity_mock(
+        lambda _: httpx.Response(202, json=REGISTRATION_RECEIPT)
+    )
+    upstream = mock_client(lambda _: httpx.Response(200, json={}))
+    app = create_app(
+        custom_settings(registration_rate_limit_per_minute=2),
+        upstream,
+        identity,
+    )
+
+    results = []
+    for _ in range(3):
+        response = await post(
+            app,
+            "/api/v1/auth/registrations",
+            json={"email": "misma@example.com"},
+        )
+        results.append(response.status_code)
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert results == [202, 202, 429]
+
+
+@pytest.mark.anyio
+async def test_login_sets_opaque_cookie_with_local_attributes():
+    identity = identity_mock(
+        lambda _: httpx.Response(200, json=SESSION_ENVELOPE)
+    )
+    upstream = mock_client(lambda _: httpx.Response(200, json={}))
+    app = create_app(SETTINGS, upstream, identity)
+
+    response = await post(
+        app,
+        "/api/v1/auth/sessions",
+        json={
+            "email": "ana.rojas@example.com",
+            "password": "ClaveSegura#2026",
+        },
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["displayName"] == "Ana Rojas"
+    assert "sessionToken" not in body
+    cookie = response.headers["set-cookie"]
+    assert cookie.startswith(
+        "cusol_session=token-opaco-de-prueba-1234567890abcdef"
+    )
+    assert "HttpOnly" in cookie
+    assert "SameSite=lax" in cookie
+    assert "Path=/" in cookie
+    assert "Secure" not in cookie  # entorno local
+
+
+@pytest.mark.anyio
+async def test_login_cookie_is_secure_outside_local():
+    identity = identity_mock(
+        lambda _: httpx.Response(200, json=SESSION_ENVELOPE)
+    )
+    upstream = mock_client(lambda _: httpx.Response(200, json={}))
+    app = create_app(
+        custom_settings(session_cookie_secure=True),
+        upstream,
+        identity,
+    )
+
+    response = await post(
+        app,
+        "/api/v1/auth/sessions",
+        json={
+            "email": "ana.rojas@example.com",
+            "password": "ClaveSegura#2026",
+        },
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert "Secure" in response.headers["set-cookie"]
+
+
+@pytest.mark.anyio
+async def test_login_passes_through_generic_401():
+    identity = identity_mock(
+        lambda _: httpx.Response(
+            401,
+            json={
+                "type": "about:blank",
+                "title": "Credenciales inválidas",
+                "status": 401,
+                "detail": "Correo o contraseña incorrectos.",
+            },
+        )
+    )
+    upstream = mock_client(lambda _: httpx.Response(200, json={}))
+    app = create_app(SETTINGS, upstream, identity)
+
+    response = await post(
+        app,
+        "/api/v1/auth/sessions",
+        json={"email": "x@example.com", "password": "mala"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 401
+    assert "set-cookie" not in response.headers
+
+
+@pytest.mark.anyio
+async def test_logout_expires_cookie_and_is_idempotent():
+    revoked = []
+
+    def handler(request: httpx.Request):
+        revoked.append(request.headers.get("x-session-token"))
+        return httpx.Response(204)
+
+    identity = identity_mock(handler)
+    upstream = mock_client(lambda _: httpx.Response(200, json={}))
+    app = create_app(SETTINGS, upstream, identity)
+
+    with_cookie = await delete(
+        app,
+        "/api/v1/auth/sessions/current",
+        cookies={"cusol_session": "token-a-revocar"},
+    )
+    without_cookie = await delete(app, "/api/v1/auth/sessions/current")
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert with_cookie.status_code == 204
+    assert without_cookie.status_code == 204
+    assert revoked == ["token-a-revocar"]
+    assert 'cusol_session=""' in with_cookie.headers["set-cookie"]
+
+
+@pytest.mark.anyio
+async def test_logout_rejects_disallowed_origin():
+    identity = identity_mock(lambda _: httpx.Response(204))
+    upstream = mock_client(lambda _: httpx.Response(200, json={}))
+    app = create_app(SETTINGS, upstream, identity)
+
+    response = await delete(
+        app,
+        "/api/v1/auth/sessions/current",
+        headers={"Origin": "https://malicioso.example"},
+        cookies={"cusol_session": "token"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_me_requires_cookie_and_forwards_session():
+    def handler(request: httpx.Request):
+        assert request.headers["x-session-token"] == "token-vigente"
+        return httpx.Response(200, json=SESSION_ENVELOPE["account"])
+
+    identity = identity_mock(handler)
+    upstream = mock_client(lambda _: httpx.Response(200, json={}))
+    app = create_app(SETTINGS, upstream, identity)
+
+    without_cookie = await get(app, "/api/v1/auth/me")
+
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            cookies={"cusol_session": "token-vigente"},
+        ) as client:
+            with_cookie = await client.get("/api/v1/auth/me")
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert without_cookie.status_code == 401
+    assert with_cookie.status_code == 200
+    assert with_cookie.json()["email"] == "ana.rojas@example.com"

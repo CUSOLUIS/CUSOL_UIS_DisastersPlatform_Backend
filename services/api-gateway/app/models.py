@@ -217,6 +217,40 @@ class MissingPersonReportReceipt(ApiModel):
     received_at: datetime
 
 
+# CHG-022 — Autenticación (espejo del contrato; el token de sesión nunca
+# integra estas respuestas públicas).
+class AccountRegistrationReceipt(ApiModel):
+    request_id: UUID
+    status: Literal["email_verification_required"]
+    email_masked: str = Field(min_length=3)
+    verification_expires_at: datetime
+    assigned_role: Literal["user"]
+    created_at: datetime
+
+
+class EmailVerificationReceipt(ApiModel):
+    status: Literal["active"]
+    verified_at: datetime
+
+
+class AuthenticatedAccount(ApiModel):
+    id: UUID
+    display_name: str = Field(min_length=1, max_length=161)
+    email: str = Field(max_length=254)
+    assigned_role: Literal["user"]
+    status: Literal["active"]
+    session_expires_at: datetime
+
+
+class SessionEnvelope(ApiModel):
+    """Respuesta interna del identity-service; el gateway convierte el
+    token en cookie `cusol_session` y nunca lo reenvía en el cuerpo."""
+
+    account: AuthenticatedAccount
+    session_token: str
+    session_expires_at: datetime
+
+
 class HealthStatus(BaseModel):
     status: Literal["ok"]
     service: str

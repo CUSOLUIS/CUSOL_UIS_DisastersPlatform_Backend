@@ -32,4 +32,22 @@ curl --fail --silent --show-error \
   "http://127.0.0.1:${frontend_port}/api/v1/people/map-overview?${human_map_query}" \
   | grep -q '"totalMapped"'
 
-printf '%s\n' "Smoke test correcto: frontend, gateway y disaster-service conectados (mapa operativo con buildingPending; capa humana con clusters)."
+# CHG-022: registro (202 anti-enumeración, re-ejecutable) y sesión ausente
+# (401) por el gateway y por el proxy del frontend.
+auth_payload='{"firstNames":"Smoke","lastNames":"Test","email":"smoke-test@cusol.local","department":"Santander","municipality":"Bucaramanga","requestedAccountType":"citizen","password":"SmokeTest#2026aa","termsAccepted":true,"privacyAccepted":true,"accuracyConfirmed":true}'
+curl --fail --silent --show-error \
+  -X POST -H "Content-Type: application/json" -d "$auth_payload" \
+  "http://127.0.0.1:${gateway_port}/api/v1/auth/registrations" \
+  | grep -q '"emailMasked"'
+curl --fail --silent --show-error \
+  -X POST -H "Content-Type: application/json" -d "$auth_payload" \
+  "http://127.0.0.1:${frontend_port}/api/v1/auth/registrations" \
+  | grep -q '"emailMasked"'
+me_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:${gateway_port}/api/v1/auth/me")
+[ "$me_status" = "401" ]
+me_status_proxy=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:${frontend_port}/api/v1/auth/me")
+[ "$me_status_proxy" = "401" ]
+
+printf '%s\n' "Smoke test correcto: frontend, gateway, disaster-service e identity-service conectados (mapa operativo, capa humana y autenticación)."
