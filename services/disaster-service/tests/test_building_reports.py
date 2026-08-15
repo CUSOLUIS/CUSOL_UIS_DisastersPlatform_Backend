@@ -543,3 +543,55 @@ async def test_event_autocomplete_returns_suggestions():
     assert item["title"] == "Sismo en el Centro"
     assert item["similarity"] == 0.9
     assert item["verificationStatus"] == "verified"
+
+
+# --- CHG-093: detalle obligatorio del motivo "Otro" ---
+
+
+@pytest.mark.anyio
+async def test_other_reason_requires_detail():
+    app = building_app()
+
+    response = await post_report(
+        app,
+        payload=building_payload(
+            pendingReasons=["access_blocked", "other"],
+        ),
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_detail_without_other_reason_is_rejected():
+    app = building_app()
+
+    response = await post_report(
+        app,
+        payload=building_payload(
+            pendingReasonDetail="Cierre por orden de la alcaldía",
+        ),
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_other_reason_detail_is_stored_encrypted():
+    repository = FakeBuildingRepository()
+    app = building_app(repository=repository)
+
+    response = await post_report(
+        app,
+        payload=building_payload(
+            pendingReasons=["other"],
+            pendingReasonDetail="Cierre por orden de la alcaldía",
+        ),
+    )
+
+    assert response.status_code == 201
+    stored = repository.created_report
+    assert stored.pending_reasons == ["other"]
+    # Cifrado: nunca el texto en claro.
+    assert stored.pending_reason_detail_protected is not None
+    assert b"alcald" not in stored.pending_reason_detail_protected

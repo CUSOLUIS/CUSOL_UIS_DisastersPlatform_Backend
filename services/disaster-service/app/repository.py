@@ -138,6 +138,8 @@ class StoredBuildingReport:
     search_status: str
     occupancy_report: str
     pending_reasons: list[str]
+    # CHG-093: detalle cifrado del motivo "Otro".
+    pending_reason_detail_protected: bytes | None
     observed_conditions: list[str]
     observation_description_protected: bytes
     reporter_name_protected: bytes
@@ -2255,6 +2257,7 @@ class PostgresDisasterRepository:
                             longitude_protected, related_disaster_id,
                             observed_date, observed_time, search_status,
                             occupancy_report, pending_reasons,
+                            pending_reason_detail_protected,
                             observed_conditions,
                             observation_description_protected,
                             reporter_name_protected,
@@ -2273,7 +2276,7 @@ class PostgresDisasterRepository:
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                             $11, $12, $13, $14, $15, $16, $17, $18,
                             $19, $20, $21, $22, $23, $24, $25, $26,
-                            $27, $28, $29, $30, $31, $32, $33
+                            $27, $28, $29, $30, $31, $32, $33, $34
                         )
                         RETURNING id, public_tracking_code,
                                   moderation_status, created_at
@@ -2296,6 +2299,7 @@ class PostgresDisasterRepository:
                         report.search_status,
                         report.occupancy_report,
                         report.pending_reasons,
+                        report.pending_reason_detail_protected,
                         report.observed_conditions,
                         report.observation_description_protected,
                         report.reporter_name_protected,

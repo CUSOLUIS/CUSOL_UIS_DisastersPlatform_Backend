@@ -233,6 +233,9 @@ ADMIN_FIELD_SPECS: dict[str, list[tuple]] = {
          "public", None, "text"),
         ("pendingReasons", "Motivos pendientes", "pending_reasons",
          "public", "list", "text"),
+        ("pendingReasonDetail", "Detalle de otro motivo",
+         "pending_reason_detail_protected", "protected", "decrypt",
+         "multiline"),
         ("observedConditions", "Condiciones visibles",
          "observed_conditions", "public", "list", "text"),
         ("observationDescription", "Descripción de la observación",
@@ -1978,6 +1981,9 @@ def create_app(
             search_status=payload.search_status,
             occupancy_report=payload.occupancy_report,
             pending_reasons=list(payload.pending_reasons),
+            pending_reason_detail_protected=encrypt(
+                payload.pending_reason_detail
+            ),
             observed_conditions=list(payload.observed_conditions),
             observation_description_protected=encrypt(
                 payload.observation_description

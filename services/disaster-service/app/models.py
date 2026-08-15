@@ -806,6 +806,10 @@ class UnverifiedBuildingReportInput(ApiModel):
     pending_reasons: list[BuildingPendingReason] = Field(
         min_length=1, max_length=9
     )
+    # CHG-093: detalle obligatorio cuando el motivo es "other".
+    pending_reason_detail: str | None = Field(
+        default=None, min_length=3, max_length=300
+    )
     observed_conditions: list[BuildingObservedCondition] = Field(
         default_factory=list, max_length=8
     )
@@ -832,6 +836,24 @@ class UnverifiedBuildingReportInput(ApiModel):
             raise ValueError(
                 "latitude y longitude deben enviarse juntas o ambas "
                 "ausentes"
+            )
+        return self
+
+    # CHG-093: el detalle acompaña al motivo "other" en ambos sentidos
+    # — obligatorio si está y rechazado si llega sin él.
+    @model_validator(mode="after")
+    def _other_reason_detail(self):
+        has_other = "other" in self.pending_reasons
+        has_detail = bool((self.pending_reason_detail or "").strip())
+        if has_other and not has_detail:
+            raise ValueError(
+                "pendingReasonDetail es obligatorio cuando los motivos "
+                "incluyen 'other'"
+            )
+        if has_detail and not has_other:
+            raise ValueError(
+                "pendingReasonDetail solo aplica cuando los motivos "
+                "incluyen 'other'"
             )
         return self
 
