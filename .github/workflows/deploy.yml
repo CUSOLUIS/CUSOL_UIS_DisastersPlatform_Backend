@@ -84,6 +84,16 @@ jobs:
           # cliente; aquí se ataca en el origen. El resto de servicios
           # sigue en compose, y el build de arriba no cambia.
           docker compose up -d --wait disasters-db identity-service mail-service admin-bootstrap
+          # CHG-103: `docker stack deploy` no lee el .env del directorio
+          # como sí hace `docker compose`, así que sin esto
+          # POSTGRES_PASSWORD y ALLOWED_ORIGINS llegan vacíos al
+          # contenedor y el servicio arranca en bucle con
+          # InvalidPasswordError. `set -a` exporta lo que defina el
+          # archivo para que el proceso de deploy lo herede; tiene que
+          # ser en este mismo shell.
+          set -a
+          . "$COMPOSE_DIR/.env"
+          set +a
           docker stack deploy -c docker-compose.swarm-hotpath.yml borde-hp
 
       - name: Aplicar migraciones idempotentes
