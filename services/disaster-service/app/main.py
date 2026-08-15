@@ -61,6 +61,8 @@ from .models import (
     OperationalMapPoint,
     OperationalMapSummary,
     PeopleRecordPage,
+    PersonStatusReportPublic,
+    PersonStatusReportsPage,
     PublicPersonStatus,
     UnverifiedBuildingReportInput,
     UnverifiedBuildingReportReceipt,
@@ -1533,6 +1535,12 @@ def create_app(
             ),
             actor_kind=actor_kind,
             account_id=account_id,
+            # CHG-077: la bandera la declara el gateway (resuelta
+            # contra identity), jamás el cliente final.
+            reporter_health_sector=(
+                actor_kind == "authenticated"
+                and request.headers.get("x-actor-health") == "true"
+            ),
         )
         try:
             receipt, created = await data.create_person_status_report(
@@ -1550,6 +1558,66 @@ def create_app(
             # Reintento idempotente: los archivos de este intento sobran.
             cleanup()
         return receipt
+
+    # CHG-077 — Novedades visibles al abrir la tarjeta de la persona:
+    # qué dicen quienes la vieron, sin identidad del reportante ni
+    # fotografías. Solo personas publicadas; 404 uniforme.
+    @application.get(
+        "/internal/v1/missing-persons/{person_id}/status-reports",
+        response_model=PersonStatusReportsPage,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_person_status_reports(
+        person_id: UUID,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    ):
+        try:
+            result = await data.list_person_status_reports(
+                person_id, limit
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Consulta no disponible",
+                "No fue posible consultar las novedades en este momento.",
+            )
+        if result is None:
+            return problem(
+                404,
+                "Persona no disponible",
+                "La persona no existe o no está publicada.",
+            )
+        public_status, rows = result
+        items = [
+            PersonStatusReportPublic(
+                id=row["id"],
+                claimed_outcome=row["claimed_outcome"],
+                evidence_description=decrypt_text(
+                    row["evidence_description_encrypted"]
+                )
+                or "",
+                location_description=decrypt_text(
+                    row["location_description_encrypted"]
+                ),
+                occurred_at=row["occurred_at"],
+                received_at=row["received_at"],
+                reporter_kind=(
+                    "health_sector"
+                    if row["reporter_health_sector"]
+                    else row["actor_kind"]
+                ),
+                moderation_status=row["moderation_status"],
+            )
+            for row in rows
+        ]
+        return PersonStatusReportsPage(
+            person_id=person_id,
+            public_status=public_status,
+            items=items,
+            total=len(items),
+        )
 
     @application.post(
         "/internal/v1/aid-locations/{location_id}/ratings",

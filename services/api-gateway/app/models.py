@@ -223,9 +223,11 @@ class MissingPersonSearchResponse(ApiModel):
 
 
 class MissingPersonReportReceipt(ApiModel):
+    # CHG-075: el caso público se crea junto con el reporte, así que
+    # la constancia informa `published`.
     id: UUID
     public_case_code: str = Field(min_length=1)
-    status: Literal["under_review"]
+    status: Literal["published"]
     received_at: datetime
 
 
@@ -241,12 +243,15 @@ class AccountRegistrationReceipt(ApiModel):
 
 
 class AuthenticatedAccount(ApiModel):
+    # CHG-077: `is_health_sector` viaja desde identity para que el
+    # gateway declare la bandera al registrar novedades.
     id: UUID
     display_name: str = Field(min_length=1, max_length=161)
     email: str = Field(max_length=254)
     assigned_role: Literal["user", "moderator", "super_admin"]
     status: Literal["active"]
     session_expires_at: datetime
+    is_health_sector: bool = False
 
 
 class SessionEnvelope(ApiModel):
@@ -439,6 +444,25 @@ class CommunityContributionReceipt(ApiModel):
     status: Literal["under_review"]
     actor_kind: Literal["anonymous", "authenticated"]
     received_at: datetime
+
+
+# CHG-077 — Novedades visibles de una persona (espejo del contrato).
+class PersonStatusReportPublic(ApiModel):
+    id: UUID
+    claimed_outcome: Literal["found", "deceased"]
+    evidence_description: str
+    location_description: str | None = None
+    occurred_at: datetime | None = None
+    received_at: datetime
+    reporter_kind: Literal["anonymous", "authenticated", "health_sector"]
+    moderation_status: Literal["under_review", "accepted"]
+
+
+class PersonStatusReportsPage(ApiModel):
+    person_id: UUID
+    public_status: PublicPersonStatus
+    items: list[PersonStatusReportPublic] = Field(max_length=100)
+    total: int = Field(ge=0)
 
 
 # CHG-035 — Reporte de edificio sin verificar (espejo del contrato).

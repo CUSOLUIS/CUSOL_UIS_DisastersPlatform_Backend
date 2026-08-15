@@ -522,3 +522,147 @@ async def test_contribution_upstream_failure_is_503():
     assert response.json()["title"] == (
         "Servicio de valoraciones no disponible"
     )
+
+
+# --- CHG-077: verificación comunitaria del estado ---
+
+
+HEALTH_ACCOUNT = {**ACCOUNT, "isHealthSector": True}
+
+NOVELTIES_PAGE = {
+    "personId": PERSON_ID,
+    "publicStatus": "found",
+    "items": [
+        {
+            "id": "77777777-7777-4777-8777-777777777701",
+            "claimedOutcome": "found",
+            "evidenceDescription": "La vi en el albergue del colegio.",
+            "locationDescription": "Albergue del colegio central",
+            "occurredAt": "2026-08-14T10:00:00Z",
+            "receivedAt": "2026-08-14T11:00:00Z",
+            "reporterKind": "health_sector",
+            "moderationStatus": "under_review",
+        }
+    ],
+    "total": 1,
+}
+
+
+def identity_with_health_session():
+    def handler(request: httpx.Request):
+        assert request.url.path == "/internal/v1/auth/me"
+        if request.headers.get("x-session-token") == "token-valido":
+            return httpx.Response(200, json=HEALTH_ACCOUNT)
+        return httpx.Response(401, json={"status": 401})
+
+    return identity_client(handler)
+
+
+@pytest.mark.anyio
+async def test_me_status_report_forwards_health_sector_flag():
+    seen = {}
+
+    def upstream_handler(request: httpx.Request):
+        seen["health"] = request.headers.get("x-actor-health")
+        seen["account"] = request.headers.get("x-account-id")
+        return httpx.Response(202, json=RECEIPT_AUTHENTICATED)
+
+    upstream = upstream_client(upstream_handler)
+    identity = identity_with_health_session()
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        f"/api/v1/me/missing-persons/{PERSON_ID}/status-reports",
+        headers=IDEMPOTENCY,
+        cookies={"cusol_session": "token-valido"},
+        files={"payload": (None, "{}", "application/json")},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 202
+    assert seen["health"] == "true"
+    assert seen["account"] == ACCOUNT["id"]
+
+
+@pytest.mark.anyio
+async def test_me_status_report_without_health_flag_omits_header():
+    seen = {}
+
+    def upstream_handler(request: httpx.Request):
+        seen["health"] = request.headers.get("x-actor-health")
+        return httpx.Response(202, json=RECEIPT_AUTHENTICATED)
+
+    upstream = upstream_client(upstream_handler)
+    identity = identity_with_session()
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        f"/api/v1/me/missing-persons/{PERSON_ID}/status-reports",
+        headers=IDEMPOTENCY,
+        cookies={"cusol_session": "token-valido"},
+        files={"payload": (None, "{}", "application/json")},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 202
+    assert seen["health"] is None
+
+
+@pytest.mark.anyio
+async def test_person_novelties_are_forwarded_and_typed():
+    seen = {}
+
+    def upstream_handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["limit"] = request.url.params.get("limit")
+        return httpx.Response(200, json=NOVELTIES_PAGE)
+
+    upstream = upstream_client(upstream_handler)
+    app = create_app(gateway_settings(), upstream)
+
+    response = await request_gateway(
+        app,
+        "GET",
+        f"/api/v1/missing-persons/{PERSON_ID}/status-reports?limit=10",
+    )
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    assert seen["path"] == (
+        f"/internal/v1/missing-persons/{PERSON_ID}/status-reports"
+    )
+    assert seen["limit"] == "10"
+    body = response.json()
+    assert body["publicStatus"] == "found"
+    assert body["items"][0]["reporterKind"] == "health_sector"
+
+
+@pytest.mark.anyio
+async def test_person_novelties_pass_through_upstream_404():
+    upstream = upstream_client(
+        lambda _: httpx.Response(
+            404,
+            json={
+                "type": "about:blank",
+                "title": "Persona no disponible",
+                "status": 404,
+                "detail": "La persona no existe o no está publicada.",
+            },
+        )
+    )
+    app = create_app(gateway_settings(), upstream)
+
+    response = await request_gateway(
+        app,
+        "GET",
+        f"/api/v1/missing-persons/{PERSON_ID}/status-reports",
+    )
+    await upstream.aclose()
+
+    assert response.status_code == 404

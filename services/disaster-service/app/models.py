@@ -283,7 +283,10 @@ class MissingPersonReportInput(ApiModel):
     )
     truth_confirmed: Literal[True]
     photo_authorization_confirmed: Literal[True]
-    review_acknowledged: Literal[True]
+    # CHG-075: la publicación es inmediata y ya no se exige aceptar
+    # una revisión previa; se acepta el campo por compatibilidad con
+    # clientes antiguos y se ignora su valor.
+    review_acknowledged: bool = True
 
     # CHG-073: listas cerradas y fecha de nacimiento plausible; el
     # mismo criterio vive en el frontend y en la base (migración 020).
@@ -341,9 +344,11 @@ class MissingPersonReportInput(ApiModel):
 
 
 class MissingPersonReportReceipt(ApiModel):
+    # CHG-075: el caso público se crea junto con el reporte, así que
+    # la constancia informa `published`.
     id: UUID
     public_case_code: str = Field(min_length=1)
-    status: Literal["under_review"]
+    status: Literal["published"]
     received_at: datetime
 
 
@@ -662,6 +667,31 @@ class CommunityContributionReceipt(ApiModel):
     status: Literal["under_review"]
     actor_kind: ContributionActorKind
     received_at: datetime
+
+
+# CHG-077 — Proyección pública de las novedades de una persona: qué
+# dijeron quienes la vieron, sin identidad del reportante ni fotos.
+PersonNoveltyReporterKind = Literal[
+    "anonymous", "authenticated", "health_sector"
+]
+
+
+class PersonStatusReportPublic(ApiModel):
+    id: UUID
+    claimed_outcome: Literal["found", "deceased"]
+    evidence_description: str
+    location_description: str | None = None
+    occurred_at: datetime | None = None
+    received_at: datetime
+    reporter_kind: PersonNoveltyReporterKind
+    moderation_status: Literal["under_review", "accepted"]
+
+
+class PersonStatusReportsPage(ApiModel):
+    person_id: UUID
+    public_status: PublicPersonStatus
+    items: list[PersonStatusReportPublic] = Field(max_length=100)
+    total: int = Field(ge=0)
 
 
 # CHG-035 — Reporte ciudadano de edificio sin verificar.

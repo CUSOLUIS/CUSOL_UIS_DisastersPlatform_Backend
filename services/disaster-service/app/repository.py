@@ -1,5 +1,6 @@
+import re
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from typing import Protocol
 from uuid import UUID
 
@@ -28,6 +29,10 @@ from .models import (
     VerificationStatus,
 )
 from . import moderation, offers
+
+# CHG-075: hora local de Colombia (sin horario de verano) para fijar
+# el instante público del último avistamiento.
+_BOGOTA_TZ = timezone(timedelta(hours=-5))
 
 
 @dataclass(frozen=True)
@@ -182,6 +187,9 @@ class StoredStatusReport:
     location_description_encrypted: bytes | None
     actor_kind: ContributionActorKind
     account_id: UUID | None
+    # CHG-077: el reportante era del sector salud al reportar; lo
+    # declara el gateway, nunca el cliente final.
+    reporter_health_sector: bool = False
 
 
 @dataclass(frozen=True)
@@ -341,6 +349,10 @@ class DisasterRepository(Protocol):
         report: StoredStatusReport,
         photos: list[StoredPhoto],
     ) -> tuple[CommunityContributionReceipt, bool]: ...
+
+    async def list_person_status_reports(
+        self, person_id: UUID, limit: int
+    ) -> tuple[str, list[dict]] | None: ...
 
     async def create_aid_location_rating(
         self,
@@ -962,6 +974,71 @@ class PostgresDisasterRepository:
         ]
         return records, int(total)
 
+    # CHG-075: el caso público nace junto con el reporte; solo campos
+    # autorizados (nada cifrado, sin contacto, sin coordenadas ni
+    # fotografías).
+    @staticmethod
+    def _public_case_projection(
+        report: StoredReport,
+    ) -> tuple[str, list[str], int | None, datetime, str | None]:
+        display_name = " ".join(
+            f"{report.first_names} {report.last_names}".split()
+        )
+        aliases: list[str] = []
+        if report.aliases:
+            aliases = [
+                alias.strip()
+                for alias in re.split(r"[,;]", report.aliases)
+                if alias.strip()
+            ][:10]
+        approximate_age = report.approximate_age
+        if approximate_age is None and report.birth_date is not None:
+            reference = report.last_seen_date
+            birthday = report.birth_date
+            years = reference.year - birthday.year - (
+                (reference.month, reference.day)
+                < (birthday.month, birthday.day)
+            )
+            if 0 <= years <= 120:
+                approximate_age = years
+        hour, minute = 0, 0
+        if report.last_seen_time:
+            hour_text, minute_text = report.last_seen_time.split(":")
+            hour, minute = int(hour_text), int(minute_text)
+        last_seen_at = datetime(
+            report.last_seen_date.year,
+            report.last_seen_date.month,
+            report.last_seen_date.day,
+            hour,
+            minute,
+            tzinfo=_BOGOTA_TZ,
+        )
+        physical_parts = [
+            part
+            for part in (
+                f"Estatura {report.height_cm} cm"
+                if report.height_cm
+                else None,
+                f"Contextura: {report.build}" if report.build else None,
+                f"Piel: {report.skin_tone}" if report.skin_tone else None,
+                f"Cabello: {report.hair_description}"
+                if report.hair_description
+                else None,
+                f"Ojos: {report.eye_description}"
+                if report.eye_description
+                else None,
+            )
+            if part
+        ]
+        physical_description = " · ".join(physical_parts) or None
+        return (
+            display_name,
+            aliases,
+            approximate_age,
+            last_seen_at,
+            physical_description,
+        )
+
     async def create_missing_person_report(
         self,
         report: StoredReport,
@@ -1063,6 +1140,42 @@ class PostgresDisasterRepository:
                             photo.exif_removed,
                             photo.malware_scan,
                         )
+                    # CHG-075: publicación inmediata — la proyección
+                    # pública se crea en la misma transacción.
+                    (
+                        display_name,
+                        aliases,
+                        approximate_age,
+                        last_seen_at,
+                        physical_description,
+                    ) = self._public_case_projection(report)
+                    await connection.execute(
+                        """
+                        INSERT INTO
+                            disaster_service.missing_person_cases (
+                            public_case_code, display_name, aliases,
+                            approximate_age, last_seen_at,
+                            last_seen_area, municipality, department,
+                            clothing_description,
+                            physical_description, distinctive_marks,
+                            publication_status, data_classification
+                        ) VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                            $11, 'published', 'operational'
+                        )
+                        """,
+                        report.public_case_code,
+                        display_name,
+                        aliases,
+                        approximate_age,
+                        last_seen_at,
+                        report.last_seen_area,
+                        report.municipality,
+                        report.department,
+                        report.clothing_description,
+                        physical_description,
+                        report.distinctive_marks,
+                    )
                     await connection.execute(
                         """
                         INSERT INTO disaster_service.missing_person_audit (
@@ -1072,6 +1185,16 @@ class PostgresDisasterRepository:
                         "report_received",
                         report.id,
                         f"fotos={len(photos)}",
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO disaster_service.missing_person_audit (
+                            event_type, report_id, detail
+                        ) VALUES ($1, $2, $3)
+                        """,
+                        "case_published",
+                        report.id,
+                        report.public_case_code,
                     )
             except asyncpg.UniqueViolationError:
                 # Reintento idempotente: devolver la constancia original.
@@ -1085,11 +1208,13 @@ class PostgresDisasterRepository:
                 )
                 if existing is None:
                     raise
+                # CHG-075: la constancia informa la publicación del
+                # caso, no el estado interno de verificación.
                 return (
                     MissingPersonReportReceipt(
                         id=existing["id"],
                         public_case_code=existing["public_case_code"],
-                        status=existing["status"],
+                        status="published",
                         received_at=existing["received_at"],
                     ),
                     False,
@@ -1098,7 +1223,7 @@ class PostgresDisasterRepository:
             MissingPersonReportReceipt(
                 id=row["id"],
                 public_case_code=row["public_case_code"],
-                status=row["status"],
+                status="published",
                 received_at=row["received_at"],
             ),
             True,
@@ -1346,6 +1471,44 @@ class PostgresDisasterRepository:
             )
         )
 
+    async def list_person_status_reports(
+        self, person_id: UUID, limit: int
+    ) -> tuple[str, list[dict]] | None:
+        """Novedades visibles de una persona publicada (CHG-077).
+
+        Devuelve (public_status, filas sin descifrar) o None si la
+        persona no existe o no está publicada. Las rechazadas,
+        retiradas o archivadas jamás se listan.
+        """
+        status = await self._pool.fetchval(
+            """
+            SELECT public_status
+            FROM disaster_service.missing_person_cases
+            WHERE id = $1 AND publication_status = 'published'
+            """,
+            person_id,
+        )
+        if status is None:
+            return None
+        rows = await self._pool.fetch(
+            """
+            SELECT id, claimed_outcome,
+                   evidence_description_encrypted,
+                   location_description_encrypted,
+                   occurred_at, received_at, actor_kind,
+                   reporter_health_sector, moderation_status
+            FROM disaster_service.person_status_reports
+            WHERE person_id = $1
+              AND moderation_status NOT IN ('rejected', 'withdrawn')
+              AND archived_at IS NULL
+            ORDER BY received_at DESC
+            LIMIT $2
+            """,
+            person_id,
+            limit,
+        )
+        return str(status), [dict(row) for row in rows]
+
     async def create_person_status_report(
         self,
         report: StoredStatusReport,
@@ -1354,8 +1517,10 @@ class PostgresDisasterRepository:
         async with self._pool.acquire() as connection:
             try:
                 async with connection.transaction():
-                    # Crear la novedad NUNCA toca la proyección pública;
-                    # solo la decisión de moderación lo hace.
+                    # CHG-077: crear una novedad SÍ puede cambiar el
+                    # estado público — sector salud de inmediato y el
+                    # umbral comunitario de 5 coincidencias; el
+                    # recálculo corre en esta misma transacción.
                     row = await connection.fetchrow(
                         """
                         INSERT INTO disaster_service.person_status_reports (
@@ -1363,9 +1528,9 @@ class PostgresDisasterRepository:
                             claimed_outcome,
                             evidence_description_encrypted, occurred_at,
                             location_description_encrypted, actor_kind,
-                            account_id
+                            account_id, reporter_health_sector
                         ) VALUES (
-                            $1, $2, $3, $4, $5, $6, $7, $8, $9
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
                         )
                         RETURNING id, moderation_status, actor_kind,
                                   received_at
@@ -1379,6 +1544,11 @@ class PostgresDisasterRepository:
                         report.location_description_encrypted,
                         report.actor_kind,
                         report.account_id,
+                        report.reporter_health_sector,
+                    )
+                    await connection.execute(
+                        _PERSON_PUBLIC_STATUS_BY_PERSON_SQL,
+                        report.person_id,
                     )
                     for photo in photos:
                         await connection.execute(
@@ -1552,26 +1722,10 @@ class PostgresDisasterRepository:
                     decided_by_role,
                 )
                 # La proyección pública se recalcula en la MISMA
-                # transacción: el último aceptado define el estado;
-                # sin aceptados la persona vuelve a `missing`.
+                # transacción con las reglas de prioridad de CHG-077
+                # (admin > sector salud > umbral comunitario).
                 await connection.execute(
-                    """
-                    UPDATE disaster_service.missing_person_cases mc
-                    SET public_status = COALESCE(
-                            (
-                                SELECT r.claimed_outcome
-                                FROM disaster_service.person_status_reports r
-                                WHERE r.person_id = $1
-                                  AND r.moderation_status = 'accepted'
-                                ORDER BY r.decided_at DESC NULLS LAST,
-                                         r.received_at DESC
-                                LIMIT 1
-                            ),
-                            'missing'
-                        ),
-                        updated_at = NOW()
-                    WHERE mc.id = $1
-                    """,
+                    _PERSON_PUBLIC_STATUS_BY_PERSON_SQL,
                     current["person_id"],
                 )
                 await connection.execute(
@@ -3003,9 +3157,11 @@ class PostgresDisasterRepository:
 
                 # Efectos de dominio tras aceptar/rechazar/restaurar:
                 # misma transacción que el cambio de estado.
-                if action in ("accept", "reject") and kind == (
-                    "person_status_report"
-                ):
+                # CHG-077: archivar/restaurar también cuenta — las
+                # novedades archivadas no suman al umbral comunitario.
+                if action in (
+                    "accept", "reject", "archive", "restore"
+                ) and kind == "person_status_report":
                     await connection.execute(
                         _PERSON_PROJECTION_RECOMPUTE_SQL,
                         submission_id,
@@ -3017,6 +3173,21 @@ class PostgresDisasterRepository:
                         _RATING_AGGREGATE_RECOMPUTE_SQL,
                         submission_id,
                     )
+                # CHG-075: el reporte de persona nace publicado.
+                # Rechazar lo retira (`rejected`), borrar/archivar lo
+                # oculta (`withdrawn`), aceptar o restaurar lo vuelve
+                # a publicar; editar propaga los campos compartidos.
+                if kind == "missing_person_report":
+                    if action == "edit":
+                        await connection.execute(
+                            _CASE_EDIT_SYNC_SQL, submission_id
+                        )
+                    elif action in _CASE_PUBLICATION_BY_ACTION:
+                        await connection.execute(
+                            _CASE_PUBLICATION_SYNC_SQL,
+                            submission_id,
+                            _CASE_PUBLICATION_BY_ACTION[action],
+                        )
                 # unverified_building_report aceptado NO proyecta el
                 # mapa: DEC-012–DEC-014 pendientes (ver CHG-035).
                 # CHG-044: rechazar o archivar una oferta oculta su
@@ -3319,22 +3490,62 @@ _ADMIN_STATUS_EXPR = """
     END
 """
 
-# Misma regla que decide_person_status_report: el último aceptado define
-# el estado público; sin aceptados vuelve a `missing`.
-_PERSON_PROJECTION_RECOMPUTE_SQL = """
-    UPDATE disaster_service.missing_person_cases mc
-    SET public_status = COALESCE(
-            (
-                SELECT r.claimed_outcome
-                FROM disaster_service.person_status_reports r
-                WHERE r.person_id = mc.id
-                  AND r.moderation_status = 'accepted'
-                ORDER BY r.decided_at DESC NULLS LAST,
-                         r.received_at DESC
-                LIMIT 1
-            ),
-            'missing'
+# CHG-077 — Estado público de la persona, por prioridad:
+# 1) la última novedad ACEPTADA por el super admin manda;
+# 2) la última novedad no rechazada del SECTOR SALUD aplica de
+#    inmediato el desenlace que declara;
+# 3) umbral comunitario: >= 5 novedades no rechazadas con el mismo
+#    desenlace (más reportes gana; empate: la más reciente);
+# 4) sin nada de lo anterior: `missing`.
+_PERSON_PUBLIC_STATUS_EXPRESSION = """
+    COALESCE(
+        (
+            SELECT r.claimed_outcome
+            FROM disaster_service.person_status_reports r
+            WHERE r.person_id = mc.id
+              AND r.moderation_status = 'accepted'
+              AND r.archived_at IS NULL
+            ORDER BY r.decided_at DESC NULLS LAST,
+                     r.received_at DESC
+            LIMIT 1
         ),
+        (
+            SELECT r.claimed_outcome
+            FROM disaster_service.person_status_reports r
+            WHERE r.person_id = mc.id
+              AND r.moderation_status NOT IN ('rejected', 'withdrawn')
+              AND r.archived_at IS NULL
+              AND r.reporter_health_sector
+            ORDER BY r.received_at DESC
+            LIMIT 1
+        ),
+        (
+            SELECT r.claimed_outcome
+            FROM disaster_service.person_status_reports r
+            WHERE r.person_id = mc.id
+              AND r.moderation_status NOT IN ('rejected', 'withdrawn')
+              AND r.archived_at IS NULL
+            GROUP BY r.claimed_outcome
+            HAVING COUNT(*) >= 5
+            ORDER BY COUNT(*) DESC, MAX(r.received_at) DESC
+            LIMIT 1
+        ),
+        'missing'
+    )
+"""
+
+# Variante por persona (creación de novedades y decisiones directas).
+_PERSON_PUBLIC_STATUS_BY_PERSON_SQL = f"""
+    UPDATE disaster_service.missing_person_cases mc
+    SET public_status = {_PERSON_PUBLIC_STATUS_EXPRESSION},
+        updated_at = NOW()
+    WHERE mc.id = $1
+"""
+
+# Variante por novedad (consola administrativa unificada).
+_PERSON_PROJECTION_RECOMPUTE_SQL = f"""
+    UPDATE disaster_service.missing_person_cases mc
+    SET public_status = {_PERSON_PUBLIC_STATUS_EXPRESSION},
         updated_at = NOW()
     WHERE mc.id = (
         SELECT person_id
@@ -3367,6 +3578,40 @@ _RATING_AGGREGATE_RECOMPUTE_SQL = """
         WHERE id = $1
     )
 """
+
+# CHG-075 — El caso público nace publicado con el reporte; las
+# decisiones del admin sobre el expediente privado se reflejan en la
+# proyección pública dentro de la misma transacción.
+_CASE_PUBLICATION_SYNC_SQL = """
+    UPDATE disaster_service.missing_person_cases mc
+    SET publication_status =
+            $2::disaster_service.case_publication_status,
+        updated_at = NOW()
+    FROM disaster_service.missing_person_reports r
+    WHERE r.id = $1
+      AND mc.public_case_code = r.public_case_code
+"""
+
+# CHG-075 — Editar el expediente propaga los campos publicados que
+# comparten reporte y caso.
+_CASE_EDIT_SYNC_SQL = """
+    UPDATE disaster_service.missing_person_cases mc
+    SET department = r.department,
+        municipality = r.municipality,
+        last_seen_area = r.last_seen_area,
+        clothing_description = r.clothing_description,
+        updated_at = NOW()
+    FROM disaster_service.missing_person_reports r
+    WHERE r.id = $1
+      AND mc.public_case_code = r.public_case_code
+"""
+
+_CASE_PUBLICATION_BY_ACTION = {
+    "accept": "published",
+    "restore": "published",
+    "reject": "rejected",
+    "archive": "withdrawn",
+}
 
 # Metadatos por tipo: tabla, columna de estado, valores de decisión,
 # tabla de evidencia y consulta de detalle.

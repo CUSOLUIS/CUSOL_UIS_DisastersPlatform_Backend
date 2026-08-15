@@ -39,6 +39,7 @@ from .models import (
     AidLocationAvailability,
     AuthenticatedAccount,
     CommunityContributionReceipt,
+    PersonStatusReportsPage,
     DisasterEventList,
     EmailVerificationEnvelope,
     EmailVerificationReceipt,
@@ -897,6 +898,7 @@ def create_app(
         unavailable_title: str,
         unavailable_detail: str,
         account_id: UUID | None = None,
+        health_sector: bool = False,
     ) -> JSONResponse:
         idempotency_key = request.headers.get(
             "idempotency-key", ""
@@ -926,6 +928,10 @@ def create_app(
         }
         if account_id is not None:
             headers["x-account-id"] = str(account_id)
+            # CHG-077: bandera del sector salud resuelta contra
+            # identity; nunca la declara el cliente final.
+            if health_sector:
+                headers["x-actor-health"] = "true"
         body = await request.body()
         try:
             response = await upstream.post(
@@ -2231,6 +2237,47 @@ def create_app(
             body=body,
         )
 
+    # CHG-077 — Novedades visibles al abrir la tarjeta de la persona.
+    @application.get(
+        "/api/v1/missing-persons/{person_id}/status-reports",
+        response_model=PersonStatusReportsPage,
+        response_model_by_alias=True,
+        responses={
+            404: {"description": "Persona inexistente o no publicable"},
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_person_status_reports(
+        person_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    ):
+        if not directory_search_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        try:
+            response = await upstream.get(
+                f"/internal/v1/missing-persons/{person_id}"
+                "/status-reports",
+                params={"limit": str(limit)},
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return PersonStatusReportsPage.model_validate(
+                response.json()
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar las novedades en este "
+                "momento.",
+                title="Novedades no disponibles",
+            )
+
     @application.post(
         "/api/v1/public/missing-persons/{person_id}/status-reports",
         status_code=202,
@@ -2311,6 +2358,7 @@ def create_app(
             "No fue posible recibir la novedad en este momento; "
             "ningún dato quedó registrado.",
             account_id=account.id,
+            health_sector=account.is_health_sector,
         )
 
     @application.post(

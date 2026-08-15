@@ -611,7 +611,7 @@ SEARCH_RESPONSE = {
 RECEIPT_RESPONSE = {
     "id": "66666666-6666-4666-8666-666666666601",
     "publicCaseCode": "MP-2026-AAAA1111",
-    "status": "under_review",
+    "status": "published",
     "receivedAt": "2026-08-12T16:00:00Z",
 }
 

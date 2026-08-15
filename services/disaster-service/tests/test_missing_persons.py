@@ -49,7 +49,7 @@ PUBLIC_RECORD = MissingPersonPublicRecord(
 RECEIPT = MissingPersonReportReceipt(
     id=UUID("66666666-6666-4666-8666-666666666601"),
     public_case_code="MP-2026-AAAA1111",
-    status="under_review",
+    status="published",
     received_at=datetime(2026, 8, 12, 16, 0, tzinfo=UTC),
 )
 
@@ -80,7 +80,7 @@ class FakeMissingPersonRepository:
             MissingPersonReportReceipt(
                 id=report.id,
                 public_case_code=report.public_case_code,
-                status="under_review",
+                status="published",
                 received_at=datetime(2026, 8, 12, 16, 0, tzinfo=UTC),
             ),
             True,
@@ -233,7 +233,7 @@ async def test_search_rejects_short_queries():
 
 
 @pytest.mark.anyio
-async def test_report_with_one_photo_creates_under_review_receipt():
+async def test_report_with_one_photo_creates_published_receipt():
     repository = FakeMissingPersonRepository()
     storage = FakeStorage()
     app = report_app(repository=repository, storage=storage)
@@ -249,7 +249,8 @@ async def test_report_with_one_photo_creates_under_review_receipt():
 
     assert response.status_code == 201
     body = response.json()
-    assert body["status"] == "under_review"
+    # CHG-075: la constancia informa publicación inmediata.
+    assert body["status"] == "published"
     assert body["publicCaseCode"].startswith("MP-")
     assert set(body.keys()) == {
         "id", "publicCaseCode", "status", "receivedAt"
@@ -700,3 +701,88 @@ async def test_report_validates_person_field_options():
 
     ancient_birth = await post(valid_payload(birthDate="1850-01-01"))
     assert ancient_birth.status_code == 422
+
+
+# --- CHG-075: publicación inmediata del reporte ---
+
+
+@pytest.mark.anyio
+async def test_report_without_review_acknowledged_is_accepted():
+    # La revisión previa ya no existe; los clientes nuevos no envían
+    # el campo y los antiguos (que mandan True) siguen funcionando.
+    payload = valid_payload()
+    payload.pop("reviewAcknowledged")
+    app = report_app()
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={"payload": json.dumps(payload)},
+        files=photos_form(1),
+        headers=IDEMPOTENCY,
+    )
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "published"
+
+
+def test_public_case_projection_composes_public_fields():
+    from datetime import date
+
+    from app.repository import PostgresDisasterRepository, StoredReport
+
+    report = StoredReport(
+        id=uuid4(),
+        idempotency_key="clave-idempotente-0002",
+        public_case_code="MP-2026-BBBB2222",
+        first_names="  Ana María ",
+        last_names=" Pérez ",
+        aliases="Anita, La Mona;  ",
+        birth_date=date(1990, 9, 1),
+        approximate_age=None,
+        gender_identity="Mujer",
+        nationality="Colombiana",
+        document_type_encrypted=None,
+        document_number_encrypted=None,
+        height_cm=165,
+        build="delgada",
+        skin_tone="trigueña",
+        hair_description="negro largo",
+        eye_description="cafés",
+        distinctive_marks="tatuaje en el brazo",
+        medical_information_encrypted=None,
+        last_seen_date=date(2026, 8, 11),
+        last_seen_time="18:30",
+        last_seen_latitude=None,
+        last_seen_longitude=None,
+        department="Santander",
+        municipality="Bucaramanga",
+        last_seen_area="Café Madrid",
+        clothing_description="Chaqueta azul",
+        circumstances="Salió y no regresó.",
+        additional_description=None,
+        reporter_name_encrypted=b"x",
+        reporter_relationship="Hermana",
+        reporter_phone_encrypted=None,
+        reporter_email_encrypted=None,
+        official_report_number=None,
+    )
+
+    (
+        display_name,
+        aliases,
+        approximate_age,
+        last_seen_at,
+        physical_description,
+    ) = PostgresDisasterRepository._public_case_projection(report)
+
+    assert display_name == "Ana María Pérez"
+    assert aliases == ["Anita", "La Mona"]
+    # Edad derivada de la fecha de nacimiento (aún no cumple años).
+    assert approximate_age == 35
+    assert last_seen_at.isoformat() == "2026-08-11T18:30:00-05:00"
+    assert physical_description == (
+        "Estatura 165 cm · Contextura: delgada · Piel: trigueña · "
+        "Cabello: negro largo · Ojos: cafés"
+    )

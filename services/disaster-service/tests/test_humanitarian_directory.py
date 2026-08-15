@@ -146,6 +146,50 @@ class FakeDirectoryRepository:
     async def person_is_publishable(self, person_id):
         return person_id in self.publishable_persons
 
+    # CHG-077: novedades visibles de una persona publicada.
+    async def list_person_status_reports(self, person_id, limit):
+        if self.fail:
+            raise asyncpg.PostgresError("fallo simulado")
+        if person_id not in self.publishable_persons:
+            return None
+        rows = [
+            {
+                "id": UUID("77777777-7777-4777-8777-777777777701"),
+                "claimed_outcome": "found",
+                "evidence_description_encrypted": FERNET.encrypt(
+                    b"La vi en el albergue del colegio."
+                ),
+                "location_description_encrypted": FERNET.encrypt(
+                    b"Albergue del colegio central"
+                ),
+                "occurred_at": datetime(
+                    2026, 8, 14, 10, 0, tzinfo=UTC
+                ),
+                "received_at": datetime(
+                    2026, 8, 14, 11, 0, tzinfo=UTC
+                ),
+                "actor_kind": "authenticated",
+                "reporter_health_sector": True,
+                "moderation_status": "under_review",
+            },
+            {
+                "id": UUID("77777777-7777-4777-8777-777777777702"),
+                "claimed_outcome": "found",
+                "evidence_description_encrypted": FERNET.encrypt(
+                    b"Coincide con la persona del punto de encuentro."
+                ),
+                "location_description_encrypted": None,
+                "occurred_at": None,
+                "received_at": datetime(
+                    2026, 8, 14, 9, 30, tzinfo=UTC
+                ),
+                "actor_kind": "anonymous",
+                "reporter_health_sector": False,
+                "moderation_status": "accepted",
+            },
+        ][:limit]
+        return "found", rows
+
     async def aid_location_is_publishable(self, location_id):
         return location_id in self.publishable_locations
 
@@ -774,3 +818,90 @@ def test_rating_aggregate_uses_only_accepted_ratings():
     assert moderation.recompute_rating_aggregate([]) == (None, 0)
     assert moderation.recompute_rating_aggregate([5, 4]) == (4.5, 2)
     assert moderation.recompute_rating_aggregate([5, 4, 4]) == (4.33, 3)
+
+
+# --- CHG-077: verificación comunitaria del estado ---
+
+
+@pytest.mark.anyio
+async def test_status_report_stores_health_sector_flag():
+    repository = FakeDirectoryRepository()
+    app = directory_app(repository=repository)
+    account_id = uuid4()
+
+    response = await request_app(
+        app,
+        "POST",
+        STATUS_PATH,
+        headers={
+            **IDEMPOTENCY,
+            "X-Actor-Kind": "authenticated",
+            "X-Account-Id": str(account_id),
+            "X-Actor-Health": "true",
+        },
+        data={"payload": json.dumps(status_payload())},
+        files=photos_form(1),
+    )
+
+    assert response.status_code == 202
+    assert repository.created_status_report.reporter_health_sector is True
+
+
+@pytest.mark.anyio
+async def test_status_report_health_flag_ignored_for_anonymous():
+    # La bandera solo vale para actores autenticados declarados por el
+    # gateway; un cliente anónimo no puede reclamarla.
+    repository = FakeDirectoryRepository()
+    app = directory_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "POST",
+        STATUS_PATH,
+        headers={**IDEMPOTENCY, "X-Actor-Health": "true"},
+        data={"payload": json.dumps(status_payload())},
+        files=photos_form(1),
+    )
+
+    assert response.status_code == 202
+    assert repository.created_status_report.reporter_health_sector is False
+
+
+@pytest.mark.anyio
+async def test_list_person_status_reports_public_projection():
+    repository = FakeDirectoryRepository()
+    app = directory_app(repository=repository)
+
+    response = await request_app(app, "GET", STATUS_PATH)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["publicStatus"] == "found"
+    assert body["total"] == 2
+    first, second = body["items"]
+    # La evidencia se muestra descifrada; el sector salud se distingue
+    # y jamás viaja identidad del reportante ni fotografías.
+    assert first["reporterKind"] == "health_sector"
+    assert first["evidenceDescription"] == (
+        "La vi en el albergue del colegio."
+    )
+    assert first["locationDescription"] == (
+        "Albergue del colegio central"
+    )
+    assert second["reporterKind"] == "anonymous"
+    assert second["moderationStatus"] == "accepted"
+    assert set(first.keys()) == {
+        "id", "claimedOutcome", "evidenceDescription",
+        "locationDescription", "occurredAt", "receivedAt",
+        "reporterKind", "moderationStatus",
+    }
+
+
+@pytest.mark.anyio
+async def test_list_person_status_reports_unpublishable_is_404():
+    repository = FakeDirectoryRepository(publishable_persons=set())
+    app = directory_app(repository=repository)
+
+    response = await request_app(app, "GET", STATUS_PATH)
+
+    assert response.status_code == 404

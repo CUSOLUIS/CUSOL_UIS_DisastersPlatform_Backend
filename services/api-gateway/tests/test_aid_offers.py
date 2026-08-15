@@ -463,7 +463,7 @@ async def test_missing_report_attaches_account_when_session_is_valid():
                 json={
                     "id": "10000000-0000-4000-8000-000000000009",
                     "publicCaseCode": "MP-2026-XYZ1",
-                    "status": "under_review",
+                    "status": "published",
                     "receivedAt": "2026-08-15T12:00:00Z",
                 },
             )
@@ -506,7 +506,7 @@ async def test_missing_report_stays_anonymous_without_session():
             json={
                 "id": "10000000-0000-4000-8000-000000000009",
                 "publicCaseCode": "MP-2026-XYZ1",
-                "status": "under_review",
+                "status": "published",
                 "receivedAt": "2026-08-15T12:00:00Z",
             },
         )
@@ -544,7 +544,7 @@ async def test_missing_report_ignores_invalid_session_cookie():
             json={
                 "id": "10000000-0000-4000-8000-000000000009",
                 "publicCaseCode": "MP-2026-XYZ1",
-                "status": "under_review",
+                "status": "published",
                 "receivedAt": "2026-08-15T12:00:00Z",
             },
         )
