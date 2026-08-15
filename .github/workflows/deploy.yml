@@ -126,7 +126,15 @@ jobs:
           cd "$COMPOSE_DIR"
           for f in "$DEPLOY_DIR"/infra/postgres/init/*.sql; do
             echo "  -> $f"
-            docker compose exec -T disasters-db sh -c 'psql -v ON_ERROR_STOP=1 -q -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < "$f"
+            # CHG-105: sin esto, una migración que falla no detenía el
+            # bucle ni el job, así que el despliegue se marcaba en verde
+            # con el esquema a medio aplicar y nadie se enteraba. El job
+            # de la Pi ya abortaba (make migrate usa `|| exit 1`); este
+            # no.
+            if ! docker compose exec -T disasters-db sh -c 'psql -v ON_ERROR_STOP=1 -q -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < "$f"; then
+              echo "::error::Falló la migración $f; el esquema quedó a medio aplicar."
+              exit 1
+            fi
           done
 
       - name: Verificación básica por el dominio de producción
