@@ -570,3 +570,111 @@ async def test_missing_report_ignores_invalid_session_cookie():
     # Sesión inválida: el envío sigue siendo anónimo, jamás falla.
     assert response.status_code == 201
     assert seen["actor"] == "anonymous"
+
+
+# CHG-066 — Presencia de visitantes con consentimiento.
+
+
+PRESENCE_PAYLOAD = {
+    "presenceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa9",
+    "latitude": 7.13,
+    "longitude": -73.13,
+    "platform": "web",
+}
+
+PRESENCE_PAGE = {
+    "items": [
+        {
+            "presenceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa9",
+            "latitude": 7.13,
+            "longitude": -73.13,
+            "accuracyMeters": 12.5,
+            "platform": "android",
+            "authenticated": True,
+            "firstSeenAt": "2026-08-15T12:00:00Z",
+            "updatedAt": "2026-08-15T12:05:00Z",
+        }
+    ],
+    "total": 1,
+    "windowMinutes": 30,
+    "generatedAt": "2026-08-15T12:06:00Z",
+}
+
+
+@pytest.mark.anyio
+async def test_presence_rejects_anonymous_visitors():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        return httpx.Response(202, json={"status": "accepted"})
+
+    app = create_app(
+        settings=gateway_settings(),
+        client=upstream_client(handler),
+        identity_client=identity_with_session(),
+    )
+
+    response = await request_gateway(
+        app, "POST", "/api/v1/presence", json=PRESENCE_PAYLOAD
+    )
+
+    # Sin sesión no hay presencia en vivo y el upstream ni se toca.
+    assert response.status_code == 401
+    assert "path" not in seen
+
+
+@pytest.mark.anyio
+async def test_presence_attaches_account_with_valid_session():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["account"] = request.headers.get("x-account-id")
+        seen["cookie"] = request.headers.get("cookie")
+        seen["actor"] = request.headers.get("x-actor-kind")
+        return httpx.Response(202, json={"status": "accepted"})
+
+    app = create_app(
+        settings=gateway_settings(),
+        client=upstream_client(handler),
+        identity_client=identity_with_session(),
+    )
+
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/presence",
+        json=PRESENCE_PAYLOAD,
+        cookies={"cusol_session": "token-valido"},
+    )
+
+    assert response.status_code == 202
+    assert seen["account"] == ACCOUNT_ID
+    assert seen["cookie"] is None
+    assert seen["actor"] == "authenticated"
+
+
+@pytest.mark.anyio
+async def test_admin_presence_requires_super_admin_session():
+    def handler(request: httpx.Request):
+        return httpx.Response(200, json=PRESENCE_PAGE)
+
+    app = create_app(
+        settings=gateway_settings(),
+        client=upstream_client(handler),
+        identity_client=identity_with_session(),
+    )
+
+    without_cookie = await request_gateway(
+        app, "GET", "/api/v1/admin/visitor-presence"
+    )
+    assert without_cookie.status_code == 401
+
+    # La sesión válida del fixture tiene rol `user`: insuficiente.
+    with_user_role = await request_gateway(
+        app,
+        "GET",
+        "/api/v1/admin/visitor-presence",
+        cookies={"cusol_session": "token-valido"},
+    )
+    assert with_user_role.status_code == 403

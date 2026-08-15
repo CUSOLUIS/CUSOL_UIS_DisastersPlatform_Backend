@@ -610,6 +610,32 @@ class AdminAuditPage(ApiModel):
     generated_at: datetime
 
 
+# CHG-066 — Presencia de visitantes (espejo del contrato).
+VisitorPlatform = Literal["web", "android", "ios"]
+
+
+class VisitorPresenceReceipt(ApiModel):
+    status: Literal["accepted"]
+
+
+class AdminVisitorPresence(ApiModel):
+    presence_id: UUID
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    accuracy_meters: float | None = Field(default=None, ge=0)
+    platform: VisitorPlatform
+    authenticated: bool
+    first_seen_at: datetime
+    updated_at: datetime
+
+
+class AdminVisitorPresencePage(ApiModel):
+    items: list[AdminVisitorPresence] = Field(max_length=200)
+    total: int = Field(ge=0)
+    window_minutes: int = Field(ge=1)
+    generated_at: datetime
+
+
 class HealthStatus(BaseModel):
     status: Literal["ok"]
     service: str

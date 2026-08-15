@@ -65,6 +65,10 @@ from .models import (
     UnverifiedBuildingReportInput,
     UnverifiedBuildingReportReceipt,
     VerificationStatus,
+    AdminVisitorPresence,
+    AdminVisitorPresencePage,
+    VisitorPresenceInput,
+    VisitorPresenceReceipt,
 )
 from .photos import (
     MalwareScanner,
@@ -181,6 +185,12 @@ ADMIN_FIELD_SPECS: dict[str, list[tuple]] = {
          "reporter_email_encrypted", "protected", "decrypt", "email"),
         ("officialReportNumber", "Número de denuncia",
          "official_report_number", "private", None, "text"),
+        ("reporterLatitude", "Latitud del reportante",
+         "reporter_snapshot_latitude_encrypted", "protected",
+         "decrypt", "number"),
+        ("reporterLongitude", "Longitud del reportante",
+         "reporter_snapshot_longitude_encrypted", "protected",
+         "decrypt", "number"),
     ],
     "unverified_building_report": [
         ("buildingReference", "Referencia del edificio",
@@ -230,6 +240,12 @@ ADMIN_FIELD_SPECS: dict[str, list[tuple]] = {
         ("officialReportNumber", "Número de reporte oficial",
          "official_report_number_protected", "protected", "decrypt",
          "text"),
+        ("reporterLatitude", "Latitud del reportante",
+         "reporter_snapshot_latitude_protected", "protected",
+         "decrypt", "number"),
+        ("reporterLongitude", "Longitud del reportante",
+         "reporter_snapshot_longitude_protected", "protected",
+         "decrypt", "number"),
     ],
     "person_status_report": [
         ("claimedOutcome", "Resultado alegado", "claimed_outcome",
@@ -1088,6 +1104,16 @@ def create_app(
             reporter_email_encrypted=encrypt(payload.reporter_email),
             official_report_number=payload.official_report_number,
             reporter_account_id=reporter_account_id,
+            reporter_snapshot_latitude_encrypted=(
+                None
+                if payload.reporter_latitude is None
+                else encrypt(repr(payload.reporter_latitude))
+            ),
+            reporter_snapshot_longitude_encrypted=(
+                None
+                if payload.reporter_longitude is None
+                else encrypt(repr(payload.reporter_longitude))
+            ),
         )
 
         try:
@@ -1781,6 +1807,12 @@ def create_app(
             review_acknowledged_at=received_at,
             legal_text_version=BUILDING_REPORT_LEGAL_TEXT_VERSION,
             actor_account_id=account_id,
+            reporter_snapshot_latitude_protected=encrypt_number(
+                payload.reporter_latitude
+            ),
+            reporter_snapshot_longitude_protected=encrypt_number(
+                payload.reporter_longitude
+            ),
         )
 
         try:
@@ -2081,6 +2113,87 @@ def create_app(
                 "No fue posible procesar las expiraciones.",
             )
         return JSONResponse(content={"expired": expired})
+
+    # CHG-066 — Presencia de visitantes con consentimiento explícito.
+    # Solo usuarios REGISTRADOS reportan en vivo; la lectura es
+    # EXCLUSIVA de la consola super_admin.
+
+    @application.post(
+        "/internal/v1/presence",
+        status_code=202,
+        response_model=VisitorPresenceReceipt,
+        response_model_by_alias=True,
+        tags=["Presence"],
+    )
+    async def report_visitor_presence(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        # CHG-066: la ubicación EN VIVO es solo de usuarios registrados;
+        # los anónimos solo dejan la instantánea adjunta a sus reportes.
+        account_id = require_offer_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        try:
+            payload = VisitorPresenceInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        try:
+            await data.upsert_visitor_presence(
+                payload.presence_id,
+                account_id,
+                payload.latitude,
+                payload.longitude,
+                payload.accuracy_meters,
+                payload.platform,
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible registrar la presencia.",
+            )
+        return VisitorPresenceReceipt(status="accepted")
+
+    PRESENCE_WINDOW_MINUTES = 30
+
+    @application.get(
+        "/internal/v1/admin/visitor-presence",
+        response_model=AdminVisitorPresencePage,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_list_visitor_presence(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        limit: Annotated[int, Query(ge=1, le=200)] = 200,
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        rows, total = await data.list_visitor_presence(
+            PRESENCE_WINDOW_MINUTES, limit
+        )
+        return AdminVisitorPresencePage(
+            items=[
+                AdminVisitorPresence(
+                    presence_id=row["presence_id"],
+                    latitude=row["latitude"],
+                    longitude=row["longitude"],
+                    accuracy_meters=row["accuracy_meters"],
+                    platform=row["platform"],
+                    authenticated=row["account_id"] is not None,
+                    first_seen_at=row["first_seen_at"],
+                    updated_at=row["updated_at"],
+                )
+                for row in rows
+            ],
+            total=total,
+            window_minutes=PRESENCE_WINDOW_MINUTES,
+            generated_at=datetime.now(UTC),
+        )
 
     # CHG-036 — Consola de superadministración (rutas internas).
     # El gateway es quien autentica la cookie; aquí se revalida el rol

@@ -35,6 +35,9 @@ class Settings:
     aid_offer_write_rate_limit_per_minute: int = 10
     aid_offer_read_rate_limit_per_minute: int = 60
     max_aid_offer_body_bytes: int = 64 * 1024
+    # CHG-066: reportes de presencia por dispositivo (throttle cliente
+    # ~30 s; el límite cubre abusos).
+    presence_rate_limit_per_minute: int = 10
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -114,5 +117,8 @@ class Settings:
                 os.getenv(
                     "AID_OFFER_READ_RATE_LIMIT_PER_MINUTE", "60"
                 )
+            ),
+            presence_rate_limit_per_minute=int(
+                os.getenv("PRESENCE_RATE_LIMIT_PER_MINUTE", "10")
             ),
         )

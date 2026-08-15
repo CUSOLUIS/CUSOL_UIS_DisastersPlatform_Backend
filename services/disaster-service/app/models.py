@@ -269,6 +269,12 @@ class MissingPersonReportInput(ApiModel):
     reporter_phone: str | None = Field(default=None, max_length=40)
     reporter_email: str | None = Field(default=None, max_length=254)
     official_report_number: str | None = Field(default=None, max_length=100)
+    # CHG-066: instantánea opcional de la ubicación del reportante al
+    # enviar; llega en pareja, se cifra y solo la ve super_admin.
+    reporter_latitude: float | None = Field(default=None, ge=-90, le=90)
+    reporter_longitude: float | None = Field(
+        default=None, ge=-180, le=180
+    )
     truth_confirmed: Literal[True]
     photo_authorization_confirmed: Literal[True]
     review_acknowledged: Literal[True]
@@ -280,6 +286,17 @@ class MissingPersonReportInput(ApiModel):
         if latitude_missing != longitude_missing:
             raise ValueError(
                 "lastSeenLatitude y lastSeenLongitude deben enviarse "
+                "juntas o ambas ausentes"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reporter_snapshot_pair(self):
+        if (self.reporter_latitude is None) != (
+            self.reporter_longitude is None
+        ):
+            raise ValueError(
+                "reporterLatitude y reporterLongitude deben enviarse "
                 "juntas o ambas ausentes"
             )
         return self
@@ -688,6 +705,12 @@ class UnverifiedBuildingReportInput(ApiModel):
     reporter_phone: str | None = Field(default=None, max_length=40)
     reporter_email: str | None = Field(default=None, max_length=254)
     official_report_number: str | None = Field(default=None, max_length=100)
+    # CHG-066: instantánea opcional de la ubicación del reportante al
+    # enviar; llega en pareja, se cifra y solo la ve super_admin.
+    reporter_latitude: float | None = Field(default=None, ge=-90, le=90)
+    reporter_longitude: float | None = Field(
+        default=None, ge=-180, le=180
+    )
     truth_confirmed: Literal[True]
     photo_authorization_confirmed: Literal[True]
     review_acknowledged: Literal[True]
@@ -698,6 +721,17 @@ class UnverifiedBuildingReportInput(ApiModel):
             raise ValueError(
                 "latitude y longitude deben enviarse juntas o ambas "
                 "ausentes"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reporter_snapshot_pair(self):
+        if (self.reporter_latitude is None) != (
+            self.reporter_longitude is None
+        ):
+            raise ValueError(
+                "reporterLatitude y reporterLongitude deben enviarse "
+                "juntas o ambas ausentes"
             )
         return self
 
@@ -883,6 +917,48 @@ class AdminAuditPage(ApiModel):
     total: int = Field(ge=0)
     limit: Literal[10, 25, 50]
     offset: int = Field(ge=0)
+    generated_at: datetime
+
+
+# CHG-066 — Presencia de visitantes (consentimiento explícito; solo
+# lectura por la consola super_admin).
+VisitorPlatform = Literal["web", "android", "ios"]
+
+
+class VisitorPresenceInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    presence_id: UUID
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    accuracy_meters: float | None = Field(default=None, ge=0, le=100_000)
+    platform: VisitorPlatform = "web"
+
+
+class VisitorPresenceReceipt(ApiModel):
+    status: Literal["accepted"]
+
+
+class AdminVisitorPresence(ApiModel):
+    presence_id: UUID
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    accuracy_meters: float | None = Field(default=None, ge=0)
+    platform: VisitorPlatform
+    authenticated: bool
+    first_seen_at: datetime
+    updated_at: datetime
+
+
+class AdminVisitorPresencePage(ApiModel):
+    items: list[AdminVisitorPresence] = Field(max_length=200)
+    total: int = Field(ge=0)
+    window_minutes: int = Field(ge=1)
     generated_at: datetime
 
 

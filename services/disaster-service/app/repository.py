@@ -103,6 +103,9 @@ class StoredReport:
     official_report_number: str | None
     # CHG-054: identidad opaca del reportante con sesión (o None).
     reporter_account_id: UUID | None = None
+    # CHG-066: instantánea cifrada de la ubicación del reportante.
+    reporter_snapshot_latitude_encrypted: bytes | None = None
+    reporter_snapshot_longitude_encrypted: bytes | None = None
 
 
 # CHG-035 — Expediente privado de edificio; lo sensible llega cifrado
@@ -140,6 +143,9 @@ class StoredBuildingReport:
     review_acknowledged_at: datetime
     legal_text_version: str
     actor_account_id: UUID | None
+    # CHG-066: instantánea cifrada de la ubicación del reportante.
+    reporter_snapshot_latitude_protected: bytes | None = None
+    reporter_snapshot_longitude_protected: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -416,6 +422,21 @@ class DisasterRepository(Protocol):
         ],
         int,
     ]: ...
+
+    # CHG-066 — Presencia de visitantes con consentimiento.
+    async def upsert_visitor_presence(
+        self,
+        presence_id: UUID,
+        account_id: UUID | None,
+        latitude: float,
+        longitude: float,
+        accuracy_meters: float | None,
+        platform: str,
+    ) -> None: ...
+
+    async def list_visitor_presence(
+        self, window_minutes: int, limit: int
+    ) -> tuple[list[dict], int]: ...
 
 
 # Tarjeta de persona sin fuente registrada: atribución genérica pública.
@@ -969,12 +990,14 @@ class PostgresDisasterRepository:
                             reporter_email_encrypted,
                             official_report_number,
                             last_seen_latitude, last_seen_longitude,
-                            reporter_account_id
+                            reporter_account_id,
+                            reporter_snapshot_latitude_encrypted,
+                            reporter_snapshot_longitude_encrypted
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                             $11, $12, $13, $14, $15, $16, $17, $18, $19,
                             $20, $21, $22, $23, $24, $25, $26, $27, $28,
-                            $29, $30, $31, $32, $33, $34, $35
+                            $29, $30, $31, $32, $33, $34, $35, $36, $37
                         )
                         RETURNING id, public_case_code, status, received_at
                         """,
@@ -1013,6 +1036,8 @@ class PostgresDisasterRepository:
                         report.last_seen_latitude,
                         report.last_seen_longitude,
                         report.reporter_account_id,
+                        report.reporter_snapshot_latitude_encrypted,
+                        report.reporter_snapshot_longitude_encrypted,
                     )
                     for photo in photos:
                         await connection.execute(
@@ -1670,12 +1695,14 @@ class PostgresDisasterRepository:
                             truth_confirmed_at,
                             photo_authorization_confirmed_at,
                             review_acknowledged_at, legal_text_version,
-                            actor_account_id
+                            actor_account_id,
+                            reporter_snapshot_latitude_protected,
+                            reporter_snapshot_longitude_protected
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                             $11, $12, $13, $14, $15, $16, $17, $18,
                             $19, $20, $21, $22, $23, $24, $25, $26,
-                            $27, $28, $29, $30, $31
+                            $27, $28, $29, $30, $31, $32, $33
                         )
                         RETURNING id, public_tracking_code,
                                   moderation_status, created_at
@@ -1711,6 +1738,8 @@ class PostgresDisasterRepository:
                         report.review_acknowledged_at,
                         report.legal_text_version,
                         report.actor_account_id,
+                        report.reporter_snapshot_latitude_protected,
+                        report.reporter_snapshot_longitude_protected,
                     )
                     for file in files:
                         await connection.execute(
@@ -2428,6 +2457,74 @@ class PostgresDisasterRepository:
                     )
                 )
         return cards, int(total)
+
+    # CHG-066 — Presencia de visitantes con consentimiento.
+
+    async def upsert_visitor_presence(
+        self,
+        presence_id: UUID,
+        account_id: UUID | None,
+        latitude: float,
+        longitude: float,
+        accuracy_meters: float | None,
+        platform: str,
+    ) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO disaster_service.visitor_presence (
+                presence_id, account_id, latitude, longitude,
+                accuracy_meters, platform
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (presence_id) DO UPDATE SET
+                account_id = COALESCE(
+                    EXCLUDED.account_id,
+                    disaster_service.visitor_presence.account_id
+                ),
+                latitude = EXCLUDED.latitude,
+                longitude = EXCLUDED.longitude,
+                accuracy_meters = EXCLUDED.accuracy_meters,
+                platform = EXCLUDED.platform,
+                updated_at = NOW()
+            """,
+            presence_id,
+            account_id,
+            latitude,
+            longitude,
+            accuracy_meters,
+            platform,
+        )
+
+    async def list_visitor_presence(
+        self, window_minutes: int, limit: int
+    ) -> tuple[list[dict], int]:
+        # Retención corta: purga oportunista de filas viejas (>24 h).
+        await self._pool.execute(
+            """
+            DELETE FROM disaster_service.visitor_presence
+            WHERE updated_at < NOW() - INTERVAL '24 hours'
+            """
+        )
+        total = await self._pool.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM disaster_service.visitor_presence
+            WHERE updated_at >= NOW() - ($1 || ' minutes')::interval
+            """,
+            str(window_minutes),
+        )
+        rows = await self._pool.fetch(
+            """
+            SELECT presence_id, account_id, latitude, longitude,
+                   accuracy_meters, platform, first_seen_at, updated_at
+            FROM disaster_service.visitor_presence
+            WHERE updated_at >= NOW() - ($1 || ' minutes')::interval
+            ORDER BY updated_at DESC
+            LIMIT $2
+            """,
+            str(window_minutes),
+            limit,
+        )
+        return [dict(row) for row in rows], int(total)
 
     # CHG-036 — Consola de superadministración (bandeja unificada,
     # mutaciones con versión y auditoría append-only).

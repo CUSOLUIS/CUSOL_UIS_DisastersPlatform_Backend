@@ -20,6 +20,8 @@ from .models import (
     AidOfferOwnerPage,
     AidOfferOwnerSummary,
     AidOfferReceipt,
+    AdminVisitorPresencePage,
+    VisitorPresenceReceipt,
     AdminAccountDetail,
     AdminAccountPage,
     AdminAccountStatus,
@@ -178,6 +180,10 @@ def create_app(
     # CHG-044: límites separados de ofertas comunitarias por cuenta.
     aid_offer_write_limiter = SlidingWindowRateLimiter(
         resolved_settings.aid_offer_write_rate_limit_per_minute
+    )
+    # CHG-066: presencia de visitantes.
+    presence_limiter = SlidingWindowRateLimiter(
+        resolved_settings.presence_rate_limit_per_minute
     )
     aid_offer_read_limiter = SlidingWindowRateLimiter(
         resolved_settings.aid_offer_read_rate_limit_per_minute
@@ -935,6 +941,92 @@ def create_app(
             return problem_response(
                 unavailable_detail, title=unavailable_title
             )
+
+    # CHG-066 — Presencia de visitantes con consentimiento explícito.
+
+    @application.post(
+        "/api/v1/presence",
+        status_code=202,
+        response_model=VisitorPresenceReceipt,
+        response_model_by_alias=True,
+        responses={
+            422: {"description": "Datos inválidos"},
+            429: {"description": "Límite de reportes excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Presence"],
+    )
+    async def report_visitor_presence(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        if not presence_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de reportes de presencia."
+            )
+        # CHG-066: la presencia en vivo exige sesión de usuario
+        # registrado; los visitantes anónimos jamás reportan en vivo.
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        headers = {
+            "content-type": "application/json",
+            "x-actor-kind": "authenticated",
+            "x-account-id": str(account.id),
+        }
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                "/internal/v1/presence", content=body, headers=headers
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=202,
+                content=VisitorPresenceReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible registrar la presencia en este momento.",
+                title="Servicio de presencia no disponible",
+            )
+
+    @application.get(
+        "/api/v1/admin/visitor-presence",
+        response_model=AdminVisitorPresencePage,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_visitor_presence(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+        limit: Annotated[int, Query(ge=1, le=200)] = 200,
+    ):
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        return await admin_forward(
+            upstream,
+            "GET",
+            "/internal/v1/admin/visitor-presence",
+            account,
+            AdminVisitorPresencePage,
+            params={"limit": limit},
+        )
 
     # CHG-036 — Consola de superadministración. Toda ruta /admin exige
     # cookie válida y rol super_admin resuelto contra identity en cada
