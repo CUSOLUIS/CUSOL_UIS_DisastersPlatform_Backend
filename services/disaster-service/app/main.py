@@ -67,8 +67,14 @@ from .models import (
     VerificationStatus,
     AdminVisitorPresence,
     AdminVisitorPresencePage,
+    MyReportNovelty,
+    MyReportsPage,
+    MyReportSummary,
     VisitorPresenceInput,
     VisitorPresenceReceipt,
+    VolunteerAlert,
+    VolunteerAlertInput,
+    VolunteerAlertPage,
 )
 from .photos import (
     MalwareScanner,
@@ -828,6 +834,7 @@ def create_app(
             "building_pending": 0,
             "community_meal": 0,
             "temporary_shelter": 0,
+            "volunteers_needed": 0,
         }
         for item in items:
             by_category[item.category] += 1
@@ -841,6 +848,7 @@ def create_app(
                 building_pending=by_category["building_pending"],
                 community_meal=by_category["community_meal"],
                 temporary_shelter=by_category["temporary_shelter"],
+                volunteers_needed=by_category["volunteers_needed"],
             ),
             items=items,
             generated_at=datetime.now(UTC),
@@ -2194,6 +2202,140 @@ def create_app(
             window_minutes=PRESENCE_WINDOW_MINUTES,
             generated_at=datetime.now(UTC),
         )
+
+    # CHG-069 — "Mi espacio": reportes propios (con novedades que otras
+    # personas aportaron a sus casos) y alertas de voluntariado.
+    # Exclusivo de cuentas autenticadas resueltas por el gateway.
+
+    def volunteer_alert_model(row: dict) -> VolunteerAlert:
+        return VolunteerAlert(
+            id=row["id"],
+            description=row["description"],
+            address=row["address"],
+            latitude=row["latitude"],
+            longitude=row["longitude"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @application.get(
+        "/internal/v1/me/reports",
+        response_model=MyReportsPage,
+        response_model_by_alias=True,
+        tags=["MySpace"],
+    )
+    async def list_my_reports(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = require_offer_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        rows = await data.list_my_reports(account_id)
+        missing_ids = [
+            row["id"]
+            for row in rows
+            if row["kind"] == "missing_person_report"
+        ]
+        novelties = await data.list_report_novelties(
+            account_id, missing_ids
+        )
+        return MyReportsPage(
+            items=[
+                MyReportSummary(
+                    id=row["id"],
+                    kind=row["kind"],
+                    reference_code=row["reference_code"],
+                    title=row["title"],
+                    status=row["status"],
+                    received_at=row["received_at"],
+                    novelties=[
+                        MyReportNovelty(
+                            claimed_outcome=item["claimed_outcome"],
+                            moderation_status=item["moderation_status"],
+                            received_at=item["received_at"],
+                        )
+                        for item in novelties.get(row["id"], [])[:50]
+                    ],
+                )
+                for row in rows
+            ],
+            total=len(rows),
+            generated_at=datetime.now(UTC),
+        )
+
+    @application.post(
+        "/internal/v1/me/volunteer-alerts",
+        status_code=201,
+        response_model=VolunteerAlert,
+        response_model_by_alias=True,
+        tags=["MySpace"],
+    )
+    async def create_volunteer_alert(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = require_offer_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        try:
+            payload = VolunteerAlertInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        row = await data.create_volunteer_alert(
+            account_id,
+            payload.description.strip(),
+            payload.address.strip(),
+            payload.latitude,
+            payload.longitude,
+        )
+        return volunteer_alert_model(row)
+
+    @application.get(
+        "/internal/v1/me/volunteer-alerts",
+        response_model=VolunteerAlertPage,
+        response_model_by_alias=True,
+        tags=["MySpace"],
+    )
+    async def list_my_volunteer_alerts(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = require_offer_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        rows = await data.list_my_volunteer_alerts(account_id)
+        return VolunteerAlertPage(
+            items=[volunteer_alert_model(row) for row in rows[:100]],
+            total=len(rows),
+            generated_at=datetime.now(UTC),
+        )
+
+    @application.post(
+        "/internal/v1/me/volunteer-alerts/{alert_id}/resolve",
+        response_model=VolunteerAlert,
+        response_model_by_alias=True,
+        tags=["MySpace"],
+    )
+    async def resolve_volunteer_alert(
+        alert_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = require_offer_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        row = await data.resolve_volunteer_alert(account_id, alert_id)
+        if row is None:
+            return problem(
+                404,
+                "Alerta no disponible",
+                "La alerta no existe, no es tuya o ya fue resuelta.",
+            )
+        return volunteer_alert_model(row)
 
     # CHG-036 — Consola de superadministración (rutas internas).
     # El gateway es quien autentica la cookie; aquí se revalida el rol

@@ -101,6 +101,8 @@ OperationalMapCategory = Literal[
     "building_pending",
     "community_meal",
     "temporary_shelter",
+    # CHG-069 — alertas ciudadanas de voluntariado.
+    "volunteers_needed",
 ]
 CoordinatePrecision = Literal["exact", "approximate", "municipality"]
 DataClassification = Literal["demonstrative", "operational"]
@@ -184,6 +186,8 @@ class OperationalMapSummary(ApiModel):
     collection_point: int = Field(ge=0, default=0)
     community_meal: int = Field(ge=0, default=0)
     temporary_shelter: int = Field(ge=0, default=0)
+    # CHG-069: alertas de voluntariado activas.
+    volunteers_needed: int = Field(ge=0, default=0)
 
 
 class OperationalMapOverview(ApiModel):
@@ -633,6 +637,62 @@ class AdminVisitorPresencePage(ApiModel):
     items: list[AdminVisitorPresence] = Field(max_length=200)
     total: int = Field(ge=0)
     window_minutes: int = Field(ge=1)
+    generated_at: datetime
+
+
+# CHG-069 — "Mi espacio" (espejo del contrato del disaster-service).
+class VolunteerAlertInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    description: str = Field(min_length=10, max_length=1000)
+    address: str = Field(min_length=5, max_length=300)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+
+
+class VolunteerAlert(ApiModel):
+    id: UUID
+    description: str
+    address: str
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    status: Literal["active", "resolved"]
+    created_at: datetime
+    updated_at: datetime
+
+
+class VolunteerAlertPage(ApiModel):
+    items: list[VolunteerAlert] = Field(max_length=100)
+    total: int = Field(ge=0)
+    generated_at: datetime
+
+
+class MyReportNovelty(ApiModel):
+    claimed_outcome: Literal["found", "deceased"]
+    moderation_status: AdminModerationStatus
+    received_at: datetime
+
+
+class MyReportSummary(ApiModel):
+    id: UUID
+    kind: Literal["missing_person_report", "unverified_building_report"]
+    reference_code: str
+    title: str
+    status: str
+    received_at: datetime
+    novelties: list[MyReportNovelty] = Field(
+        default_factory=list, max_length=50
+    )
+
+
+class MyReportsPage(ApiModel):
+    items: list[MyReportSummary] = Field(max_length=200)
+    total: int = Field(ge=0)
     generated_at: datetime
 
 

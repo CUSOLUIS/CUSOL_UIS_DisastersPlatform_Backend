@@ -2526,6 +2526,172 @@ class PostgresDisasterRepository:
         )
         return [dict(row) for row in rows], int(total)
 
+    # CHG-069 — "Mi espacio": reportes propios con novedades de
+    # terceros y alertas ciudadanas de voluntariado.
+
+    VOLUNTEER_ALERT_SOURCE_ID = UUID(
+        "11111111-1111-4111-8111-111111111108"
+    )
+
+    async def list_my_reports(self, account_id: UUID) -> list[dict]:
+        rows = await self._pool.fetch(
+            """
+            SELECT r.id,
+                   'missing_person_report' AS kind,
+                   r.public_case_code AS reference_code,
+                   (r.first_names || ' ' || r.last_names) AS title,
+                   r.status::text AS status,
+                   r.received_at
+            FROM disaster_service.missing_person_reports r
+            WHERE r.reporter_account_id = $1
+            UNION ALL
+            SELECT b.id,
+                   'unverified_building_report' AS kind,
+                   b.public_tracking_code AS reference_code,
+                   b.building_reference AS title,
+                   b.moderation_status::text AS status,
+                   b.created_at AS received_at
+            FROM disaster_service.unverified_building_reports b
+            WHERE b.actor_account_id = $1
+            ORDER BY received_at DESC
+            LIMIT 200
+            """,
+            account_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def list_report_novelties(
+        self, account_id: UUID, report_ids: list[UUID]
+    ) -> dict[UUID, list[dict]]:
+        """Novedades de estado que OTRAS personas aportaron sobre los
+        casos originados en reportes de esta cuenta."""
+        if not report_ids:
+            return {}
+        rows = await self._pool.fetch(
+            """
+            SELECT r.id AS report_id,
+                   psr.claimed_outcome::text AS claimed_outcome,
+                   psr.moderation_status::text AS moderation_status,
+                   psr.received_at
+            FROM disaster_service.missing_person_reports r
+            INNER JOIN disaster_service.missing_person_cases c
+                ON c.public_case_code = r.public_case_code
+            INNER JOIN disaster_service.person_status_reports psr
+                ON psr.person_id = c.id
+            WHERE r.id = ANY($2::uuid[])
+              AND r.reporter_account_id = $1
+              AND psr.account_id IS DISTINCT FROM $1
+            ORDER BY psr.received_at DESC
+            """,
+            account_id,
+            report_ids,
+        )
+        novelties: dict[UUID, list[dict]] = {}
+        for row in rows:
+            novelties.setdefault(row["report_id"], []).append(dict(row))
+        return novelties
+
+    async def create_volunteer_alert(
+        self,
+        account_id: UUID,
+        description: str,
+        address: str,
+        latitude: float,
+        longitude: float,
+    ) -> dict:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                map_point_id = await connection.fetchval(
+                    """
+                    INSERT INTO disaster_service.operational_map_points (
+                        category, title, description, location_label,
+                        location, coordinate_precision,
+                        verification_status, source_id,
+                        data_classification, updated_at
+                    ) VALUES (
+                        'volunteers_needed', 'Se necesitan voluntarios',
+                        $1, $2,
+                        ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
+                        'exact', 'unverified', $5, 'operational', NOW()
+                    )
+                    RETURNING id
+                    """,
+                    description,
+                    address,
+                    longitude,
+                    latitude,
+                    self.VOLUNTEER_ALERT_SOURCE_ID,
+                )
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO disaster_service.volunteer_alerts (
+                        account_id, description, address,
+                        latitude, longitude, map_point_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6)
+                    RETURNING id, description, address, latitude,
+                              longitude, status, created_at, updated_at
+                    """,
+                    account_id,
+                    description,
+                    address,
+                    latitude,
+                    longitude,
+                    map_point_id,
+                )
+        return dict(row)
+
+    async def list_my_volunteer_alerts(
+        self, account_id: UUID
+    ) -> list[dict]:
+        rows = await self._pool.fetch(
+            """
+            SELECT id, description, address, latitude, longitude,
+                   status, created_at, updated_at
+            FROM disaster_service.volunteer_alerts
+            WHERE account_id = $1
+            ORDER BY created_at DESC
+            LIMIT 100
+            """,
+            account_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def resolve_volunteer_alert(
+        self, account_id: UUID, alert_id: UUID
+    ) -> dict | None:
+        """Marca resuelta una alerta PROPIA y retira su marcador; el
+        expediente no se borra (nunca borramos)."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    UPDATE disaster_service.volunteer_alerts
+                    SET status = 'resolved', updated_at = NOW()
+                    WHERE id = $2 AND account_id = $1
+                      AND status = 'active'
+                    RETURNING id, description, address, latitude,
+                              longitude, status, created_at, updated_at,
+                              map_point_id
+                    """,
+                    account_id,
+                    alert_id,
+                )
+                if row is None:
+                    return None
+                if row["map_point_id"] is not None:
+                    await connection.execute(
+                        """
+                        DELETE FROM
+                            disaster_service.operational_map_points
+                        WHERE id = $1
+                          AND category = 'volunteers_needed'
+                        """,
+                        row["map_point_id"],
+                    )
+        result = dict(row)
+        result.pop("map_point_id", None)
+        return result
+
     # CHG-036 — Consola de superadministración (bandeja unificada,
     # mutaciones con versión y auditoría append-only).
 

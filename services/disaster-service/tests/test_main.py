@@ -274,6 +274,7 @@ async def test_operational_map_contract_summary_and_order():
         "collectionPoint": 0,
         "communityMeal": 0,
         "temporaryShelter": 0,
+        "volunteersNeeded": 0,
     }
     assert body["dataClassification"] == "demonstrative"
     assert "generatedAt" in body
@@ -307,6 +308,7 @@ async def test_operational_map_empty_set_is_valid():
         "collectionPoint": 0,
         "communityMeal": 0,
         "temporaryShelter": 0,
+        "volunteersNeeded": 0,
     }
     assert body["dataClassification"] == "demonstrative"
 
@@ -342,6 +344,7 @@ async def test_operational_map_limit_bounds():
         "collectionPoint": 0,
         "communityMeal": 0,
         "temporaryShelter": 0,
+        "volunteersNeeded": 0,
     }
     assert maximum.status_code == 200
     assert below.status_code == 422

@@ -678,3 +678,123 @@ async def test_admin_presence_requires_super_admin_session():
         cookies={"cusol_session": "token-valido"},
     )
     assert with_user_role.status_code == 403
+
+
+# CHG-069 — "Mi espacio": reportes propios y alertas de voluntariado.
+
+
+MY_REPORTS_PAGE = {
+    "items": [
+        {
+            "id": "cccccccc-cccc-4ccc-8ccc-ccccccccccc1",
+            "kind": "missing_person_report",
+            "referenceCode": "MP-2026-ABCD1234",
+            "title": "Persona De Prueba",
+            "status": "under_review",
+            "receivedAt": "2026-08-15T12:00:00Z",
+            "novelties": [
+                {
+                    "claimedOutcome": "found",
+                    "moderationStatus": "under_review",
+                    "receivedAt": "2026-08-15T12:30:00Z",
+                }
+            ],
+        }
+    ],
+    "total": 1,
+    "generatedAt": "2026-08-15T13:00:00Z",
+}
+
+VOLUNTEER_ALERT = {
+    "id": "dddddddd-dddd-4ddd-8ddd-ddddddddddd1",
+    "description": "Se necesita gente para remover escombros.",
+    "address": "Calle 45 #27-08, Bucaramanga",
+    "latitude": 7.1193,
+    "longitude": -73.1227,
+    "status": "active",
+    "createdAt": "2026-08-15T12:00:00Z",
+    "updatedAt": "2026-08-15T12:00:00Z",
+}
+
+
+@pytest.mark.anyio
+async def test_my_space_routes_require_session():
+    def handler(request: httpx.Request):
+        return httpx.Response(200, json=MY_REPORTS_PAGE)
+
+    app = create_app(
+        settings=gateway_settings(),
+        client=upstream_client(handler),
+        identity_client=identity_with_session(),
+    )
+
+    for method, path in [
+        ("GET", "/api/v1/me/reports"),
+        ("GET", "/api/v1/me/volunteer-alerts"),
+        ("POST", "/api/v1/me/volunteer-alerts"),
+    ]:
+        response = await request_gateway(app, method, path)
+        assert response.status_code == 401, path
+
+
+@pytest.mark.anyio
+async def test_my_reports_forward_with_account():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["account"] = request.headers.get("x-account-id")
+        return httpx.Response(200, json=MY_REPORTS_PAGE)
+
+    app = create_app(
+        settings=gateway_settings(),
+        client=upstream_client(handler),
+        identity_client=identity_with_session(),
+    )
+
+    response = await request_gateway(
+        app,
+        "GET",
+        "/api/v1/me/reports",
+        cookies={"cusol_session": "token-valido"},
+    )
+
+    assert response.status_code == 200
+    assert seen["path"] == "/internal/v1/me/reports"
+    assert seen["account"] == ACCOUNT_ID
+    body = response.json()
+    assert body["items"][0]["novelties"][0]["claimedOutcome"] == "found"
+
+
+@pytest.mark.anyio
+async def test_volunteer_alert_created_through_gateway():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["account"] = request.headers.get("x-account-id")
+        return httpx.Response(201, json=VOLUNTEER_ALERT)
+
+    app = create_app(
+        settings=gateway_settings(),
+        client=upstream_client(handler),
+        identity_client=identity_with_session(),
+    )
+
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/me/volunteer-alerts",
+        cookies={"cusol_session": "token-valido"},
+        json={
+            "description": "Se necesita gente para remover escombros.",
+            "address": "Calle 45 #27-08, Bucaramanga",
+            "latitude": 7.1193,
+            "longitude": -73.1227,
+        },
+    )
+
+    assert response.status_code == 201
+    assert seen["path"] == "/internal/v1/me/volunteer-alerts"
+    assert seen["account"] == ACCOUNT_ID
+    assert response.json()["status"] == "active"

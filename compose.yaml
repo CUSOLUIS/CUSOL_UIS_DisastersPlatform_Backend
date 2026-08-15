@@ -249,6 +249,8 @@ services:
       EXPO_PUBLIC_MISSING_PERSON_DATA_MODE: ${MISSING_PERSON_DATA_MODE:-api}
       # CHG-036: sesión real con bandeja demo hasta que se implementen /api/v1/admin.
       EXPO_PUBLIC_ADMIN_DATA_MODE: ${ADMIN_DATA_MODE:-demo}
+      # CHG-069: "Mi espacio" contra la API real; `demo` solo sin backend.
+      EXPO_PUBLIC_MY_SPACE_DATA_MODE: ${MY_SPACE_DATA_MODE:-api}
     volumes:
       - ../CUSOL_UIS_DisastersPlatform_Frontend:/app
       - frontend-node-modules:/app/node_modules

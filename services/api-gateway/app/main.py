@@ -21,6 +21,9 @@ from .models import (
     AidOfferOwnerSummary,
     AidOfferReceipt,
     AdminVisitorPresencePage,
+    MyReportsPage,
+    VolunteerAlert,
+    VolunteerAlertPage,
     VisitorPresenceReceipt,
     AdminAccountDetail,
     AdminAccountPage,
@@ -1026,6 +1029,177 @@ def create_app(
             account,
             AdminVisitorPresencePage,
             params={"limit": limit},
+        )
+
+    # CHG-069 — "Mi espacio": reportes propios y alertas de
+    # voluntariado. Siempre autenticado; reutiliza el reenviador de
+    # rutas /me (encabezados de actor escritos SOLO por el gateway).
+
+    @application.get(
+        "/api/v1/me/reports",
+        response_model=MyReportsPage,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["MySpace"],
+    )
+    async def list_my_reports(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not aid_offer_read_limiter.allow(f"my-space:{account.id}"):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        return await forward_aid_offer(
+            upstream,
+            "GET",
+            "/internal/v1/me/reports",
+            account.id,
+            MyReportsPage,
+        )
+
+    @application.post(
+        "/api/v1/me/volunteer-alerts",
+        status_code=201,
+        response_model=VolunteerAlert,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Origen no permitido"},
+            422: {"description": "Alerta inválida"},
+            429: {"description": "Límite de alertas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["MySpace"],
+    )
+    async def create_volunteer_alert(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not aid_offer_write_limiter.allow(
+            f"my-space:{account.id}"
+        ):
+            return rate_limited_response(
+                "Se superó el límite de alertas por minuto."
+            )
+        content_type = request.headers.get("content-type", "")
+        if not content_type.strip().lower().startswith(
+            "application/json"
+        ):
+            return problem_response(
+                "El cuerpo debe ser application/json.",
+                title="Tipo de contenido no permitido",
+                status_code=415,
+                problem_type="unsupported-media-type",
+            )
+        body = await request.body()
+        if len(body) > resolved_settings.max_aid_offer_body_bytes:
+            return problem_response(
+                "El envío supera el máximo permitido.",
+                title="Carga demasiado grande",
+                status_code=413,
+                problem_type="payload-too-large",
+            )
+        return await forward_aid_offer(
+            upstream,
+            "POST",
+            "/internal/v1/me/volunteer-alerts",
+            account.id,
+            VolunteerAlert,
+            body=body,
+            success_status=201,
+        )
+
+    @application.get(
+        "/api/v1/me/volunteer-alerts",
+        response_model=VolunteerAlertPage,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["MySpace"],
+    )
+    async def list_my_volunteer_alerts(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not aid_offer_read_limiter.allow(f"my-space:{account.id}"):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        return await forward_aid_offer(
+            upstream,
+            "GET",
+            "/internal/v1/me/volunteer-alerts",
+            account.id,
+            VolunteerAlertPage,
+        )
+
+    @application.post(
+        "/api/v1/me/volunteer-alerts/{alert_id}/resolve",
+        response_model=VolunteerAlert,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            404: {"description": "Alerta inexistente o ajena"},
+            429: {"description": "Límite de alertas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["MySpace"],
+    )
+    async def resolve_volunteer_alert(
+        alert_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not aid_offer_write_limiter.allow(
+            f"my-space:{account.id}"
+        ):
+            return rate_limited_response(
+                "Se superó el límite de alertas por minuto."
+            )
+        return await forward_aid_offer(
+            upstream,
+            "POST",
+            f"/internal/v1/me/volunteer-alerts/{alert_id}/resolve",
+            account.id,
+            VolunteerAlert,
         )
 
     # CHG-036 — Consola de superadministración. Toda ruta /admin exige
