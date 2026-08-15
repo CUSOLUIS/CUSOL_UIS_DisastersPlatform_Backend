@@ -17,6 +17,10 @@ concurrency:
 
 env:
   DEPLOY_DIR: /home/dev/DesatreNaturalColombia/CUSOL_UIS_DisastersPlatform_Backend
+  # CHG-052: los runners de backend y frontend comparten el mismo
+  # proyecto Compose en la Pi; el lock serializa sus despliegues para
+  # que dos `up` simultáneos no dejen contenedores huérfanos.
+  DEPLOY_LOCK: /home/dev/.cusol-deploy.lock
 
 jobs:
   deploy:
@@ -33,16 +37,16 @@ jobs:
           git reset --hard ${{ github.sha }}
 
       - name: Validar composición
-        run: cd "$DEPLOY_DIR" && make config
+        run: cd "$DEPLOY_DIR" && flock -w 900 "$DEPLOY_LOCK" make config
 
       - name: Reconstruir y levantar servicios
-        run: cd "$DEPLOY_DIR" && make up
+        run: cd "$DEPLOY_DIR" && flock -w 900 "$DEPLOY_LOCK" make up
 
       - name: Aplicar migraciones idempotentes
-        run: cd "$DEPLOY_DIR" && make migrate
+        run: cd "$DEPLOY_DIR" && flock -w 900 "$DEPLOY_LOCK" make migrate
 
       - name: Smoke de la plataforma
-        run: cd "$DEPLOY_DIR" && make smoke
+        run: cd "$DEPLOY_DIR" && flock -w 900 "$DEPLOY_LOCK" make smoke
 
   # Despliegue al VPS de producción real (cusoldisasterplatform.com). Job
   # independiente del de arriba (que sigue apuntando a la Raspberry Pi de
