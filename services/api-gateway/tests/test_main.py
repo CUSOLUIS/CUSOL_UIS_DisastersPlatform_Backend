@@ -1181,3 +1181,51 @@ async def test_email_verification_passes_through_invalid_token():
 
     assert response.status_code == 400
     assert "set-cookie" not in response.headers
+
+
+# --- CHG-082: señal de cambios para el refresco en vivo ---
+
+
+@pytest.mark.anyio
+async def test_change_signal_is_forwarded_and_typed():
+    def handler(request: httpx.Request):
+        assert request.url.path == "/internal/v1/platform/change-signal"
+        return httpx.Response(
+            200,
+            json={
+                "signal": "abc123",
+                "generatedAt": "2026-08-15T18:00:00Z",
+            },
+        )
+
+    upstream = mock_client(handler)
+    app = create_app(SETTINGS, upstream)
+
+    response = await get(app, "/api/v1/platform/change-signal")
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    assert response.json()["signal"] == "abc123"
+
+
+@pytest.mark.anyio
+async def test_change_signal_rate_limit():
+    upstream = mock_client(
+        lambda _: httpx.Response(
+            200,
+            json={
+                "signal": "abc123",
+                "generatedAt": "2026-08-15T18:00:00Z",
+            },
+        )
+    )
+    app = create_app(
+        custom_settings(change_signal_rate_limit_per_minute=1), upstream
+    )
+
+    first = await get(app, "/api/v1/platform/change-signal")
+    second = await get(app, "/api/v1/platform/change-signal")
+    await upstream.aclose()
+
+    assert first.status_code == 200
+    assert second.status_code == 429

@@ -41,6 +41,7 @@ from .models import (
     AdminVersionedReasonInput,
     AidLocationAvailability,
     AidLocationRatingInput,
+    ChangeSignal,
     CommunityContributionReceipt,
     DisasterEventList,
     HealthStatus,
@@ -809,6 +810,29 @@ def create_app(
             next_cursor=next_cursor,
             generated_at=datetime.now(UTC),
             data_classification=classification,
+        )
+
+    # CHG-082 — Huella de cambios para el refresco en vivo de la
+    # portada: barata de consultar, sin datos sensibles.
+    @application.get(
+        "/internal/v1/platform/change-signal",
+        response_model=ChangeSignal,
+        response_model_by_alias=True,
+        tags=["Platform"],
+    )
+    async def platform_change_signal(
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        try:
+            signal = await data.platform_change_signal()
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Señal no disponible",
+                "No fue posible calcular la señal de cambios.",
+            )
+        return ChangeSignal(
+            signal=signal, generated_at=datetime.now(UTC)
         )
 
     @application.get(

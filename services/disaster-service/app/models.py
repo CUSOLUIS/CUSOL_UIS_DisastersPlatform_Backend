@@ -1090,6 +1090,12 @@ class MyReportsPage(ApiModel):
     generated_at: datetime
 
 
+# CHG-082 — Huella de cambios de la portada para el refresco en vivo.
+class ChangeSignal(ApiModel):
+    signal: str = Field(min_length=1, max_length=64)
+    generated_at: datetime
+
+
 class HealthStatus(BaseModel):
     status: Literal["ok"]
     service: str

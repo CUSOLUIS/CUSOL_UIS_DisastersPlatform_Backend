@@ -38,6 +38,7 @@ from .models import (
     AdminSubmissionPage,
     AidLocationAvailability,
     AuthenticatedAccount,
+    ChangeSignal,
     CommunityContributionReceipt,
     PersonStatusReportsPage,
     DisasterEventList,
@@ -163,6 +164,9 @@ def create_app(
     # CHG-034: límites separados por búsqueda, aporte anónimo y cuenta.
     directory_search_limiter = SlidingWindowRateLimiter(
         resolved_settings.directory_search_rate_limit_per_minute
+    )
+    change_signal_limiter = SlidingWindowRateLimiter(
+        resolved_settings.change_signal_rate_limit_per_minute
     )
     anonymous_contribution_limiter = SlidingWindowRateLimiter(
         resolved_settings.anonymous_contribution_rate_limit_per_minute
@@ -1928,6 +1932,40 @@ def create_app(
                 "No fue posible recibir el reporte en este momento; "
                 "ningún dato quedó registrado.",
                 title="Servicio de reportes no disponible",
+            )
+
+    # CHG-082 — Señal de cambios para el refresco en vivo de la
+    # portada.
+    @application.get(
+        "/api/v1/platform/change-signal",
+        response_model=ChangeSignal,
+        response_model_by_alias=True,
+        responses={
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Señal no disponible"},
+        },
+        tags=["Platform"],
+    )
+    async def platform_change_signal(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        if not change_signal_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        try:
+            response = await upstream.get(
+                "/internal/v1/platform/change-signal"
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return ChangeSignal.model_validate(response.json())
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar la señal de cambios.",
+                title="Señal no disponible",
             )
 
     @application.get(

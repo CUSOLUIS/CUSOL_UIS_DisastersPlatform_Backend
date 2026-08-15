@@ -786,3 +786,28 @@ def test_public_case_projection_composes_public_fields():
         "Estatura 165 cm · Contextura: delgada · Piel: trigueña · "
         "Cabello: negro largo · Ojos: cafés"
     )
+
+
+# --- CHG-082: señal de cambios para el refresco en vivo ---
+
+
+@pytest.mark.anyio
+async def test_platform_change_signal_shape():
+    repository = FakeMissingPersonRepository()
+    repository.platform_change_signal = (  # type: ignore[attr-defined]
+        lambda: _async_signal()
+    )
+    app = report_app(repository=repository)
+
+    response = await request_app(
+        app, "GET", "/internal/v1/platform/change-signal"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {"signal", "generatedAt"}
+    assert body["signal"] == "abc123"
+
+
+async def _async_signal() -> str:
+    return "abc123"

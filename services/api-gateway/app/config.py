@@ -22,6 +22,9 @@ class Settings:
     # CHG-034: límites separados por búsqueda de directorio, aporte
     # anónimo (por origen) y aporte con cuenta (por cuenta).
     directory_search_rate_limit_per_minute: int = 60
+    # CHG-082: sonda de la señal de cambios (una consulta cada ~10 s
+    # por pestaña abierta).
+    change_signal_rate_limit_per_minute: int = 30
     anonymous_contribution_rate_limit_per_minute: int = 5
     account_contribution_rate_limit_per_minute: int = 10
     # CHG-035: límite separado para el ingreso anónimo de reportes de

@@ -294,6 +294,8 @@ class DisasterRepository(Protocol):
         limit: int,
     ) -> tuple[list[OperationalMapPoint], DataClassification]: ...
 
+    async def platform_change_signal(self) -> str: ...
+
     async def human_map_overview(
         self,
         west: float,
@@ -702,6 +704,35 @@ class PostgresDisasterRepository:
             for row in rows
         ]
         return records, int(total)
+
+    # CHG-082 — Huella barata de cambios de la portada: cambia cuando
+    # entra o se modifica cualquier registro visible en dashboards o
+    # mapa; la web la sondea para refrescar al instante.
+    async def platform_change_signal(self) -> str:
+        return await self._pool.fetchval(
+            """
+            SELECT md5(concat_ws('|',
+                (SELECT COUNT(*)
+                 FROM disaster_service.operational_map_points),
+                (SELECT COALESCE(MAX(updated_at)::text, '')
+                 FROM disaster_service.operational_map_points),
+                (SELECT COUNT(*)
+                 FROM disaster_service.missing_person_cases),
+                (SELECT COALESCE(MAX(updated_at)::text, '')
+                 FROM disaster_service.missing_person_cases),
+                (SELECT COUNT(*)
+                 FROM disaster_service.person_status_reports),
+                (SELECT COALESCE(MAX(received_at)::text, '')
+                 FROM disaster_service.person_status_reports),
+                (SELECT COUNT(*) FROM disaster_service.people),
+                (SELECT COALESCE(MAX(created_at)::text, '')
+                 FROM disaster_service.people),
+                (SELECT COUNT(*) FROM disaster_service.aid_locations),
+                (SELECT COALESCE(MAX(updated_at)::text, '')
+                 FROM disaster_service.aid_locations)
+            ))
+            """
+        )
 
     async def operational_map_overview(
         self,
