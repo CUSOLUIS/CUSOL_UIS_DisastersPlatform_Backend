@@ -197,6 +197,37 @@ ADMIN_FIELD_SPECS: dict[str, list[tuple]] = {
          "reporter_email_encrypted", "protected", "decrypt", "email"),
         ("officialReportNumber", "Número de denuncia",
          "official_report_number", "private", None, "text"),
+        ("officialAuthorityName", "Autoridad de la denuncia",
+         "official_authority_name", "private", None, "text"),
+        ("tattooDescription", "Tatuajes", "tattoo_description",
+         "private", None, "multiline"),
+        ("scarsDescription", "Cicatrices", "scars_description",
+         "private", None, "multiline"),
+        ("prostheticsDescription", "Prótesis u órtesis",
+         "prosthetics_description", "private", None, "multiline"),
+        ("piercingsAndMoles", "Perforaciones y lunares",
+         "piercings_and_moles", "private", None, "multiline"),
+        ("mentalHealthCondition", "Condición cognitiva o de salud mental",
+         "mental_health_condition_encrypted", "protected", "decrypt",
+         "multiline"),
+        ("vitalMedication", "Medicación de dependencia vital",
+         "vital_medication_encrypted", "protected", "decrypt",
+         "multiline"),
+        ("severeAllergies", "Alergias graves",
+         "severe_allergies_encrypted", "protected", "decrypt",
+         "multiline"),
+        ("belongingsDescription", "Pertenencias",
+         "belongings_description", "private", None, "multiline"),
+        ("transportMode", "Medio de transporte", "transport_mode",
+         "private", None, "text"),
+        ("vehicleDetails", "Datos del vehículo",
+         "vehicle_details_encrypted", "protected", "decrypt", "text"),
+        ("companionsDescription", "Acompañantes",
+         "companions_description", "private", None, "multiline"),
+        ("reporterPhonePublic", "Autoriza compartir su teléfono",
+         "reporter_phone_public", "private", None, "text"),
+        ("reporterEmailPublic", "Autoriza compartir su correo",
+         "reporter_email_public", "private", None, "text"),
         ("reporterLatitude", "Latitud del reportante",
          "reporter_snapshot_latitude_encrypted", "protected",
          "decrypt", "number"),
@@ -1142,6 +1173,18 @@ def create_app(
                 )
             prepared.append((index, content, sniffed))
 
+        # CHG-094: si se declaran categorías deben ser una por foto;
+        # una lista desalineada asignaría la etiqueta equivocada.
+        if payload.photo_categories and len(
+            payload.photo_categories
+        ) != len(prepared):
+            return problem(
+                422,
+                "Datos inválidos",
+                "photoCategories debe declarar una categoría por "
+                "fotografía enviada.",
+            )
+
         received_at = datetime.now(UTC)
         report_id = uuid4()
         saved_keys: list[str] = []
@@ -1175,6 +1218,14 @@ def create_app(
                         sha256=hashlib.sha256(content).hexdigest(),
                         exif_removed=True,
                         malware_scan="clean",
+                        # CHG-094: categoría alineada por posición con
+                        # las partes `photos`. `index` es 1-based
+                        # (enumerate start=1), el arreglo es 0-based.
+                        category=(
+                            payload.photo_categories[index - 1]
+                            if 0 < index <= len(payload.photo_categories)
+                            else None
+                        ),
                     )
                 )
         except PhotoProcessingError:
@@ -1215,6 +1266,21 @@ def create_app(
             medical_information_encrypted=encrypt(
                 payload.medical_information
             ),
+            # CHG-094: identificación física en claro; salud y placa
+            # cifradas.
+            tattoo_description=payload.tattoo_description,
+            scars_description=payload.scars_description,
+            prosthetics_description=payload.prosthetics_description,
+            piercings_and_moles=payload.piercings_and_moles,
+            mental_health_condition_encrypted=encrypt(
+                payload.mental_health_condition
+            ),
+            vital_medication_encrypted=encrypt(payload.vital_medication),
+            severe_allergies_encrypted=encrypt(payload.severe_allergies),
+            belongings_description=payload.belongings_description,
+            transport_mode=payload.transport_mode,
+            vehicle_details_encrypted=encrypt(payload.vehicle_details),
+            companions_description=payload.companions_description,
             last_seen_date=payload.last_seen_date,
             last_seen_time=payload.last_seen_time,
             last_seen_latitude=payload.last_seen_latitude,
@@ -1230,6 +1296,9 @@ def create_app(
             reporter_phone_encrypted=encrypt(payload.reporter_phone),
             reporter_email_encrypted=encrypt(payload.reporter_email),
             official_report_number=payload.official_report_number,
+            official_authority_name=payload.official_authority_name,
+            reporter_phone_public=payload.is_reporter_phone_public,
+            reporter_email_public=payload.is_reporter_email_public,
             reporter_account_id=reporter_account_id,
             reporter_snapshot_latitude_encrypted=(
                 None
@@ -1395,6 +1464,7 @@ def create_app(
         prefix: str,
         prepared: list[tuple[int, bytes, str]],
         saved_keys: list[str],
+        categories: list[str] | None = None,
     ) -> list[StoredPhoto]:
         """Guarda original y derivado sin metadatos con claves opacas.
 
@@ -1424,6 +1494,14 @@ def create_app(
                     sha256=hashlib.sha256(content).hexdigest(),
                     exif_removed=True,
                     malware_scan="clean",
+                    # CHG-094: la categoría llega alineada por posición
+                    # con las partes `photos`. `index` es 1-based.
+                    category=(
+                        categories[index - 1]
+                        if categories is not None
+                        and 0 < index <= len(categories)
+                        else None
+                    ),
                 )
             )
         return stored

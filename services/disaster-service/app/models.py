@@ -244,6 +244,22 @@ class MissingPersonSearchResponse(ApiModel):
     query: str
 
 
+# CHG-094 — Contexto del desplazamiento y categoría de fotografías.
+PersonTransportMode = Literal[
+    "on_foot",
+    "bicycle",
+    "public_transport",
+    "private_vehicle",
+    "other",
+]
+PersonPhotoCategory = Literal[
+    "recent_face",
+    "full_body",
+    "distinctive_mark",
+    "other",
+]
+
+
 class MissingPersonReportInput(ApiModel):
     """Payload privado del reporte; nunca se serializa en respuestas."""
 
@@ -270,6 +286,28 @@ class MissingPersonReportInput(ApiModel):
     eye_description: str | None = Field(default=None, max_length=120)
     distinctive_marks: str | None = Field(default=None, max_length=1000)
     medical_information: str | None = Field(default=None, max_length=1000)
+    # CHG-094 — Identificación física detallada.
+    tattoo_description: str | None = Field(default=None, max_length=1000)
+    scars_description: str | None = Field(default=None, max_length=1000)
+    prosthetics_description: str | None = Field(
+        default=None, max_length=1000
+    )
+    piercings_and_moles: str | None = Field(default=None, max_length=1000)
+    # CHG-094 — Alertas médicas (se guardan cifradas).
+    mental_health_condition: str | None = Field(
+        default=None, max_length=1000
+    )
+    vital_medication: str | None = Field(default=None, max_length=1000)
+    severe_allergies: str | None = Field(default=None, max_length=1000)
+    # CHG-094 — Contexto del desplazamiento.
+    belongings_description: str | None = Field(
+        default=None, max_length=1000
+    )
+    transport_mode: PersonTransportMode | None = None
+    vehicle_details: str | None = Field(default=None, max_length=300)
+    companions_description: str | None = Field(
+        default=None, max_length=1000
+    )
     last_seen_date: date
     last_seen_time: str | None = Field(
         default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$"
@@ -292,6 +330,20 @@ class MissingPersonReportInput(ApiModel):
     reporter_phone: str | None = Field(default=None, max_length=40)
     reporter_email: str | None = Field(default=None, max_length=254)
     official_report_number: str | None = Field(default=None, max_length=100)
+    # CHG-094 — Entidad donde se interpuso la denuncia.
+    official_authority_name: str | None = Field(
+        default=None, max_length=160
+    )
+    # CHG-094 — Consentimiento del reportante para compartir su
+    # contacto. El dato sigue cifrado; esto registra la autorización y
+    # la ve el equipo de revisión. NO publica nada por sí solo.
+    is_reporter_phone_public: bool = False
+    is_reporter_email_public: bool = False
+    # CHG-094 — Categoría por fotografía, alineada por posición con las
+    # partes `photos` del multipart.
+    photo_categories: list[PersonPhotoCategory] = Field(
+        default_factory=list, max_length=3
+    )
     # CHG-066: instantánea opcional de la ubicación del reportante al
     # enviar; llega en pareja, se cifra y solo la ve super_admin.
     reporter_latitude: float | None = Field(default=None, ge=-90, le=90)
@@ -304,6 +356,21 @@ class MissingPersonReportInput(ApiModel):
     # una revisión previa; se acepta el campo por compatibilidad con
     # clientes antiguos y se ignora su valor.
     review_acknowledged: bool = True
+
+    # CHG-094: la categoría de fotografía se alinea por posición con
+    # las partes `photos`; el conteo real se valida al leer el
+    # multipart (aquí solo el tope del modelo).
+    @model_validator(mode="after")
+    def _vehicle_needs_transport(self):
+        if (self.vehicle_details or "").strip() and self.transport_mode not in {
+            "private_vehicle",
+            "other",
+        }:
+            raise ValueError(
+                "vehicleDetails solo aplica con transportMode "
+                "'private_vehicle' u 'other'"
+            )
+        return self
 
     # CHG-073: listas cerradas y fecha de nacimiento plausible; el
     # mismo criterio vive en el frontend y en la base (migración 020).

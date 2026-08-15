@@ -209,6 +209,22 @@ def photos_form(count: int, photo: bytes | None = None):
     ]
 
 
+# CHG-094: atajo para los envíos de reporte de persona.
+async def post_report(app, payload=None, photos=1):
+    return await request_app(
+        app,
+        "POST",
+        "/internal/v1/missing-person-reports",
+        data={
+            "payload": json.dumps(
+                payload if payload is not None else valid_payload()
+            )
+        },
+        files=photos_form(photos),
+        headers=IDEMPOTENCY,
+    )
+
+
 # --- Búsqueda pública ---
 
 
@@ -914,3 +930,130 @@ async def test_platform_change_signal_shape():
 
 async def _async_signal() -> str:
     return "abc123"
+
+
+# --- CHG-094: campos ampliados del reporte de persona ---
+
+
+@pytest.mark.anyio
+async def test_extended_fields_are_stored_with_health_data_encrypted():
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    response = await post_report(
+        app,
+        payload=valid_payload(
+            tattooDescription="Tatuaje de ancla en antebrazo izquierdo",
+            scarsDescription="Cicatriz de 4 cm en la rodilla derecha",
+            prostheticsDescription="Prótesis auditiva en oído derecho",
+            piercingsAndMoles="Lunar visible en la mejilla izquierda",
+            mentalHealthCondition="Diagnóstico de Alzheimer inicial",
+            vitalMedication="Insulina cada 8 horas",
+            severeAllergies="Alergia grave a la penicilina",
+            belongingsDescription="Mochila azul con computador portátil",
+            transportMode="private_vehicle",
+            vehicleDetails="Placa ABC123, Renault Logan gris",
+            companionsDescription="Salió con un vecino del barrio",
+            officialAuthorityName="Fiscalía General de la Nación",
+            isReporterPhonePublic=True,
+            isReporterEmailPublic=False,
+        ),
+    )
+
+    assert response.status_code == 201
+    stored = repository.created_report
+    # Identificación física: en claro, sirve para reconocer.
+    assert stored.tattoo_description == (
+        "Tatuaje de ancla en antebrazo izquierdo"
+    )
+    assert stored.piercings_and_moles.startswith("Lunar visible")
+    assert stored.belongings_description.startswith("Mochila azul")
+    assert stored.transport_mode == "private_vehicle"
+    assert stored.companions_description.startswith("Salió con")
+    assert stored.official_authority_name == (
+        "Fiscalía General de la Nación"
+    )
+    # Salud y placa: cifradas, nunca en claro.
+    for encrypted, leak in (
+        (stored.mental_health_condition_encrypted, b"Alzheimer"),
+        (stored.vital_medication_encrypted, b"Insulina"),
+        (stored.severe_allergies_encrypted, b"penicilina"),
+        (stored.vehicle_details_encrypted, b"ABC123"),
+    ):
+        assert encrypted is not None
+        assert leak not in encrypted
+    # Consentimiento explícito del reportante.
+    assert stored.reporter_phone_public is True
+    assert stored.reporter_email_public is False
+
+
+@pytest.mark.anyio
+async def test_photo_categories_must_match_photo_count():
+    app = report_app()
+
+    response = await post_report(
+        app,
+        payload=valid_payload(
+            photoCategories=["recent_face", "full_body"],
+        ),
+        photos=1,
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_photo_categories_are_stored_per_photo():
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    response = await post_report(
+        app,
+        payload=valid_payload(
+            photoCategories=["recent_face", "distinctive_mark"],
+        ),
+        photos=2,
+    )
+
+    assert response.status_code == 201
+    categories = [photo.category for photo in repository.created_photos]
+    assert categories == ["recent_face", "distinctive_mark"]
+
+
+@pytest.mark.anyio
+async def test_unknown_transport_mode_is_rejected():
+    app = report_app()
+
+    response = await post_report(
+        app, payload=valid_payload(transportMode="teleport")
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_vehicle_details_require_a_vehicle_transport_mode():
+    app = report_app()
+
+    response = await post_report(
+        app,
+        payload=valid_payload(
+            transportMode="on_foot",
+            vehicleDetails="Placa ABC123",
+        ),
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_report_without_new_fields_still_works():
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    response = await post_report(app)
+
+    assert response.status_code == 201
+    stored = repository.created_report
+    assert stored.tattoo_description is None
+    assert stored.reporter_phone_public is False

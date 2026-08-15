@@ -114,6 +114,23 @@ class StoredReport:
     # CHG-066: instantánea cifrada de la ubicación del reportante.
     reporter_snapshot_latitude_encrypted: bytes | None = None
     reporter_snapshot_longitude_encrypted: bytes | None = None
+    # CHG-094: identificación física detallada (en claro), alertas
+    # médicas y placa (cifradas), contexto del desplazamiento y
+    # consentimiento del reportante. Todos opcionales.
+    tattoo_description: str | None = None
+    scars_description: str | None = None
+    prosthetics_description: str | None = None
+    piercings_and_moles: str | None = None
+    mental_health_condition_encrypted: bytes | None = None
+    vital_medication_encrypted: bytes | None = None
+    severe_allergies_encrypted: bytes | None = None
+    belongings_description: str | None = None
+    transport_mode: str | None = None
+    vehicle_details_encrypted: bytes | None = None
+    companions_description: str | None = None
+    official_authority_name: str | None = None
+    reporter_phone_public: bool = False
+    reporter_email_public: bool = False
 
 
 # CHG-035 — Expediente privado de edificio; lo sensible llega cifrado
@@ -267,6 +284,8 @@ class StoredPhoto:
     sha256: str
     exif_removed: bool
     malware_scan: str
+    # CHG-094: categoría declarada por quien reporta (o None).
+    category: str | None = None
 
 
 class DisasterRepository(Protocol):
@@ -1140,12 +1159,24 @@ class PostgresDisasterRepository:
                             last_seen_latitude, last_seen_longitude,
                             reporter_account_id,
                             reporter_snapshot_latitude_encrypted,
-                            reporter_snapshot_longitude_encrypted
+                            reporter_snapshot_longitude_encrypted,
+                            tattoo_description, scars_description,
+                            prosthetics_description, piercings_and_moles,
+                            mental_health_condition_encrypted,
+                            vital_medication_encrypted,
+                            severe_allergies_encrypted,
+                            belongings_description, transport_mode,
+                            vehicle_details_encrypted,
+                            companions_description,
+                            official_authority_name,
+                            reporter_phone_public, reporter_email_public
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                             $11, $12, $13, $14, $15, $16, $17, $18, $19,
                             $20, $21, $22, $23, $24, $25, $26, $27, $28,
-                            $29, $30, $31, $32, $33, $34, $35, $36, $37
+                            $29, $30, $31, $32, $33, $34, $35, $36, $37,
+                            $38, $39, $40, $41, $42, $43, $44, $45, $46,
+                            $47, $48, $49, $50, $51
                         )
                         RETURNING id, public_case_code, status, received_at
                         """,
@@ -1186,6 +1217,20 @@ class PostgresDisasterRepository:
                         report.reporter_account_id,
                         report.reporter_snapshot_latitude_encrypted,
                         report.reporter_snapshot_longitude_encrypted,
+                        report.tattoo_description,
+                        report.scars_description,
+                        report.prosthetics_description,
+                        report.piercings_and_moles,
+                        report.mental_health_condition_encrypted,
+                        report.vital_medication_encrypted,
+                        report.severe_allergies_encrypted,
+                        report.belongings_description,
+                        report.transport_mode,
+                        report.vehicle_details_encrypted,
+                        report.companions_description,
+                        report.official_authority_name,
+                        report.reporter_phone_public,
+                        report.reporter_email_public,
                     )
                     for photo in photos:
                         await connection.execute(
@@ -1195,9 +1240,10 @@ class PostgresDisasterRepository:
                                 id, report_id, position, storage_key,
                                 derived_storage_key, content_type,
                                 size_bytes, sha256, exif_removed,
-                                malware_scan
+                                malware_scan, category
                             ) VALUES (
-                                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                                $11
                             )
                             """,
                             photo.id,
@@ -1210,6 +1256,7 @@ class PostgresDisasterRepository:
                             photo.sha256,
                             photo.exif_removed,
                             photo.malware_scan,
+                            photo.category,
                         )
                     # CHG-075: publicación inmediata — la proyección
                     # pública se crea en la misma transacción.
