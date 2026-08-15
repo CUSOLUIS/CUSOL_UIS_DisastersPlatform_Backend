@@ -92,7 +92,8 @@ class StoredReport:
     medical_information_encrypted: bytes | None
     last_seen_date: date
     last_seen_time: str | None
-    # CHG-015: coordenadas privadas; nunca se publican automáticamente.
+    # CHG-015: coordenadas del último avistamiento. Desde CHG-081
+    # proyectan el punto del caso en el mapa operativo al publicarse.
     last_seen_latitude: float | None
     last_seen_longitude: float | None
     department: str
@@ -1149,6 +1150,42 @@ class PostgresDisasterRepository:
                         last_seen_at,
                         physical_description,
                     ) = self._public_case_projection(report)
+                    # CHG-081: con coordenadas del último avistamiento
+                    # el caso también se proyecta al mapa operativo
+                    # (igual que edificios y alertas de voluntariado).
+                    map_point_id = None
+                    if (
+                        report.last_seen_latitude is not None
+                        and report.last_seen_longitude is not None
+                    ):
+                        map_point_id = await connection.fetchval(
+                            """
+                            INSERT INTO
+                                disaster_service.operational_map_points (
+                                category, title, description,
+                                location_label, location,
+                                coordinate_precision,
+                                verification_status, source_id,
+                                data_classification, updated_at
+                            ) VALUES (
+                                'missing_person', $1, $2, $3,
+                                ST_SetSRID(
+                                    ST_MakePoint($4, $5), 4326
+                                )::geography,
+                                'exact', 'unverified', $6,
+                                'operational', NOW()
+                            )
+                            RETURNING id
+                            """,
+                            display_name,
+                            "Vista por última vez en "
+                            + report.last_seen_area,
+                            f"{report.municipality}, "
+                            f"{report.department}",
+                            report.last_seen_longitude,
+                            report.last_seen_latitude,
+                            self.MISSING_PERSON_SOURCE_ID,
+                        )
                     await connection.execute(
                         """
                         INSERT INTO
@@ -1158,10 +1195,11 @@ class PostgresDisasterRepository:
                             last_seen_area, municipality, department,
                             clothing_description,
                             physical_description, distinctive_marks,
+                            map_point_id,
                             publication_status, data_classification
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                            $11, 'published', 'operational'
+                            $11, $12, 'published', 'operational'
                         )
                         """,
                         report.public_case_code,
@@ -1175,6 +1213,7 @@ class PostgresDisasterRepository:
                         report.clothing_description,
                         physical_description,
                         report.distinctive_marks,
+                        map_point_id,
                     )
                     await connection.execute(
                         """
@@ -2687,6 +2726,12 @@ class PostgresDisasterRepository:
         "11111111-1111-4111-8111-111111111108"
     )
 
+    # CHG-081 — Fuente fija de los puntos de persona desaparecida
+    # (provisionada en la migración 022).
+    MISSING_PERSON_SOURCE_ID = UUID(
+        "11111111-1111-4111-8111-111111111109"
+    )
+
     async def list_my_reports(self, account_id: UUID) -> list[dict]:
         rows = await self._pool.fetch(
             """
@@ -3188,6 +3233,25 @@ class PostgresDisasterRepository:
                             submission_id,
                             _CASE_PUBLICATION_BY_ACTION[action],
                         )
+                        # CHG-081: el punto del mapa acompaña la
+                        # publicación del caso.
+                        if action in ("reject", "archive"):
+                            await connection.execute(
+                                _PERSON_MAP_POINT_HIDE_SQL,
+                                submission_id,
+                            )
+                        else:  # accept / restore
+                            point_id = await connection.fetchval(
+                                _PERSON_MAP_POINT_RESTORE_SQL,
+                                submission_id,
+                                self.MISSING_PERSON_SOURCE_ID,
+                            )
+                            if point_id is not None:
+                                await connection.execute(
+                                    _PERSON_MAP_POINT_LINK_SQL,
+                                    submission_id,
+                                    point_id,
+                                )
                 # unverified_building_report aceptado NO proyecta el
                 # mapa: DEC-012–DEC-014 pendientes (ver CHG-035).
                 # CHG-044: rechazar o archivar una oferta oculta su
@@ -3612,6 +3676,64 @@ _CASE_PUBLICATION_BY_ACTION = {
     "reject": "rejected",
     "archive": "withdrawn",
 }
+
+# CHG-081 — Retirar el caso también retira su punto del mapa: se
+# desvincula y se borra en la misma sentencia (el chequeo de la FK
+# ocurre al cierre de la sentencia).
+_PERSON_MAP_POINT_HIDE_SQL = """
+    WITH target AS (
+        SELECT mc.id AS case_id, mc.map_point_id AS point_id
+        FROM disaster_service.missing_person_cases mc
+        INNER JOIN disaster_service.missing_person_reports r
+            ON mc.public_case_code = r.public_case_code
+        WHERE r.id = $1
+          AND mc.map_point_id IS NOT NULL
+    ), unlink AS (
+        UPDATE disaster_service.missing_person_cases mc
+        SET map_point_id = NULL, updated_at = NOW()
+        FROM target
+        WHERE mc.id = target.case_id
+    )
+    DELETE FROM disaster_service.operational_map_points p
+    USING target
+    WHERE p.id = target.point_id
+"""
+
+# CHG-081 — Republicar el caso recrea su punto si el reporte tiene
+# coordenadas y el caso quedó sin punto (devuelve el id creado o None).
+_PERSON_MAP_POINT_RESTORE_SQL = """
+    INSERT INTO disaster_service.operational_map_points (
+        category, title, description, location_label, location,
+        coordinate_precision, verification_status, source_id,
+        data_classification, updated_at
+    )
+    SELECT 'missing_person', mc.display_name,
+           'Vista por última vez en ' || mc.last_seen_area,
+           mc.municipality || ', ' || mc.department,
+           ST_SetSRID(
+               ST_MakePoint(
+                   r.last_seen_longitude, r.last_seen_latitude
+               ),
+               4326
+           )::geography,
+           'exact', 'unverified', $2, 'operational', NOW()
+    FROM disaster_service.missing_person_cases mc
+    INNER JOIN disaster_service.missing_person_reports r
+        ON mc.public_case_code = r.public_case_code
+    WHERE r.id = $1
+      AND mc.map_point_id IS NULL
+      AND r.last_seen_latitude IS NOT NULL
+      AND r.last_seen_longitude IS NOT NULL
+    RETURNING id
+"""
+
+_PERSON_MAP_POINT_LINK_SQL = """
+    UPDATE disaster_service.missing_person_cases mc
+    SET map_point_id = $2, updated_at = NOW()
+    FROM disaster_service.missing_person_reports r
+    WHERE r.id = $1
+      AND mc.public_case_code = r.public_case_code
+"""
 
 # Metadatos por tipo: tabla, columna de estado, valores de decisión,
 # tabla de evidencia y consulta de detalle.

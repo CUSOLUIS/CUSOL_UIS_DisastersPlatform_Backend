@@ -258,8 +258,9 @@ class MissingPersonReportInput(ApiModel):
     last_seen_time: str | None = Field(
         default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$"
     )
-    # CHG-015: coordenadas privadas del último avistamiento; llegan en
-    # pareja o no llegan. Nunca se publican automáticamente.
+    # CHG-015: coordenadas del último avistamiento; llegan en pareja o
+    # no llegan. Desde CHG-081 proyectan el punto del caso en el mapa
+    # operativo al publicarse.
     last_seen_latitude: float | None = Field(default=None, ge=-90, le=90)
     last_seen_longitude: float | None = Field(
         default=None, ge=-180, le=180
