@@ -865,11 +865,19 @@ def create_app(
             if cells and all(cell.all_operational for cell in cells)
             else "demonstrative"
         )
+        unmapped_counts = HumanMapStatusCounts(
+            missing=unmapped.get("missing", 0),
+            reported_deceased=unmapped.get("reported_deceased", 0),
+            confirmed_alive=unmapped.get("confirmed_alive", 0),
+            confirmed_deceased=unmapped.get("confirmed_deceased", 0),
+        )
+        unmapped_total = sum(unmapped.values())
         return HumanMapOverview(
             features=page,
-            total_matched=total_mapped + unmapped,
+            total_matched=total_mapped + unmapped_total,
             total_mapped=total_mapped,
-            unmapped_count=unmapped,
+            unmapped_count=unmapped_total,
+            unmapped_status_counts=unmapped_counts,
             returned_features=len(page),
             next_cursor=next_cursor,
             generated_at=datetime.now(UTC),

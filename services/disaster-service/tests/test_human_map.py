@@ -62,9 +62,16 @@ def make_rows(count: int = 2000) -> list[dict]:
 class FakeHumanMapRepository:
     """Réplica en Python de la agregación por celda del repositorio SQL."""
 
-    def __init__(self, rows=None, unmapped: int = 0):
+    def __init__(self, rows=None, unmapped: int | dict[str, int] = 0):
         self.rows = rows if rows is not None else []
-        self.unmapped = unmapped
+        # CHG-099: el repositorio devuelve el desglose por estado; un
+        # entero suelto se toma como 'missing' para no reescribir los
+        # casos que solo miden el total.
+        self.unmapped = (
+            unmapped
+            if isinstance(unmapped, dict)
+            else ({"missing": unmapped} if unmapped else {})
+        )
 
     async def ping(self) -> bool:
         return True
@@ -434,3 +441,35 @@ async def test_invalid_parameters_return_422():
         missing_bbox,
     ):
         assert response.status_code == 422
+
+
+# --- CHG-099: la capa debe poder mostrar el total por estado ---
+
+
+@pytest.mark.anyio
+async def test_unmapped_people_are_broken_down_by_status():
+    # Una persona dibujable y otra sin ubicación: la capa necesita el
+    # desglose para sumar el total y coincidir con las cifras.
+    repository = FakeHumanMapRepository(
+        make_rows(1),
+        unmapped={"confirmed_alive": 1},
+    )
+    app = create_app(repository=repository)
+
+    response = await get(
+        app,
+        "/internal/v1/people/map-overview"
+        "?west=-80&south=-4&east=-66&north=13&zoom=5",
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["unmappedCount"] == 1
+    assert body["unmappedStatusCounts"] == {
+        "missing": 0,
+        "reportedDeceased": 0,
+        "confirmedAlive": 1,
+        "confirmedDeceased": 0,
+    }
+    # El total sigue cuadrando: dibujados + no dibujados.
+    assert body["totalMatched"] == body["totalMapped"] + 1

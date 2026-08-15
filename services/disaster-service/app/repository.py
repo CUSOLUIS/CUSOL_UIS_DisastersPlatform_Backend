@@ -327,7 +327,7 @@ class DisasterRepository(Protocol):
         north: float,
         cell_size: float,
         statuses: list[str] | None,
-    ) -> tuple[list[HumanMapCell], int]: ...
+    ) -> tuple[list[HumanMapCell], dict[str, int]]: ...
 
     async def search_missing_persons(
         self,
@@ -860,7 +860,7 @@ class PostgresDisasterRepository:
         north: float,
         cell_size: float,
         statuses: list[str] | None,
-    ) -> tuple[list[HumanMapCell], int]:
+    ) -> tuple[list[HumanMapCell], dict[str, int]]:
         # Una sola consulta agregada por celda de grilla (sin N+1); el
         # filtro espacial usa && sobre geography para aprovechar el GIST.
         rows = await self._pool.fetch(
@@ -966,9 +966,12 @@ class PostgresDisasterRepository:
             )
             for row in rows
         ]
-        unmapped = await self._pool.fetchval(
+        # CHG-099: el desglose por estado de quienes no se pueden
+        # dibujar permite que la capa muestre el total real y no solo
+        # lo mapeado, que era lo que contradecía a las cifras.
+        unmapped_rows = await self._pool.fetch(
             """
-            SELECT COUNT(*)
+            SELECT p.status::text AS status, COUNT(*)::int AS count
             FROM disaster_service.people p
             WHERE (
                 $1::text[] IS NULL
@@ -980,10 +983,14 @@ class PostgresDisasterRepository:
                 WHERE pr.person_id = p.id
                   AND pr.visibility = 'published'
             )
+            GROUP BY p.status
             """,
             statuses,
         )
-        return cells, int(unmapped)
+        unmapped = {
+            row["status"]: int(row["count"]) for row in unmapped_rows
+        }
+        return cells, unmapped
 
     async def search_missing_persons(
         self,

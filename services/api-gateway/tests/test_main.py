@@ -326,6 +326,13 @@ HUMAN_MAP_OVERVIEW = {
     "totalMatched": 2012,
     "totalMapped": 2000,
     "unmappedCount": 12,
+    # CHG-099: desglose por estado de quienes no se pueden dibujar.
+    "unmappedStatusCounts": {
+        "missing": 12,
+        "reportedDeceased": 0,
+        "confirmedAlive": 0,
+        "confirmedDeceased": 0,
+    },
     "returnedFeatures": 2,
     "nextCursor": None,
     "generatedAt": "2026-08-13T12:00:00Z",

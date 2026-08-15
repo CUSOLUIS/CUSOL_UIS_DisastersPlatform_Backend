@@ -153,6 +153,8 @@ class HumanMapOverview(ApiModel):
     total_matched: int = Field(ge=0)
     total_mapped: int = Field(ge=0)
     unmapped_count: int = Field(ge=0)
+    # CHG-099: desglose por estado de quienes no se pueden dibujar.
+    unmapped_status_counts: HumanMapStatusCounts
     returned_features: int = Field(ge=0)
     next_cursor: str | None = None
     generated_at: datetime
