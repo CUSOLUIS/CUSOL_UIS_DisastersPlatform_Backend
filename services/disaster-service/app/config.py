@@ -9,7 +9,9 @@ class Settings:
     database_pool_max_size: int
     upload_dir: str = "/data/uploads"
     report_encryption_key: str = "dev-local-only-report-key"
-    max_photos: int = 5
+    # CHG-071: máximo 3 fotografías por reporte (el frontend comprime
+    # antes de enviar si la suma supera el presupuesto total).
+    max_photos: int = 3
     max_photo_bytes: int = 10 * 1024 * 1024
     max_total_photo_bytes: int = 50 * 1024 * 1024
     # CHG-036: vigencia del acceso temporal a evidencia (tope 300 s).

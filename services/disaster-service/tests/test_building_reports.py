@@ -326,16 +326,17 @@ async def test_report_requires_all_consents():
 
 
 @pytest.mark.anyio
-async def test_report_requires_one_to_five_photos():
+async def test_report_requires_one_to_three_photos():
+    # CHG-071: el máximo bajó a 3 fotografías por reporte.
     app = building_app()
 
     without_photos = await post_report(app, files=[])
-    too_many = await post_report(app, files=photos_form(6))
-    five = await post_report(app, files=photos_form(5))
+    too_many = await post_report(app, files=photos_form(4))
+    three = await post_report(app, files=photos_form(3))
 
     assert without_photos.status_code == 422
     assert too_many.status_code == 422
-    assert five.status_code == 201
+    assert three.status_code == 201
 
 
 @pytest.mark.anyio

@@ -980,7 +980,7 @@ def create_app(
             return problem(
                 422,
                 "Cantidad de fotografías inválida",
-                "El reporte requiere entre una y cinco fotografías.",
+                "El reporte requiere entre una y tres fotografías.",
             )
 
         prepared: list[tuple[int, bytes, str]] = []
@@ -1485,7 +1485,7 @@ def create_app(
             form,
             1,
             resolved_settings.max_photos,
-            "La novedad requiere entre una y cinco fotografías.",
+            "La novedad requiere entre una y tres fotografías.",
         )
         if isinstance(prepared, JSONResponse):
             return prepared
@@ -1730,7 +1730,7 @@ def create_app(
             form,
             1,
             resolved_settings.max_photos,
-            "El reporte requiere entre una y cinco fotografías.",
+            "El reporte requiere entre una y tres fotografías.",
         )
         if isinstance(prepared, JSONResponse):
             return prepared

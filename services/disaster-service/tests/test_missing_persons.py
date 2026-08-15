@@ -286,16 +286,17 @@ async def test_report_with_one_photo_creates_under_review_receipt():
 
 
 @pytest.mark.anyio
-async def test_report_accepts_five_photos_and_rejects_zero_and_six():
+async def test_report_accepts_three_photos_and_rejects_zero_and_four():
+    # CHG-071: el máximo bajó a 3 fotografías por reporte.
     storage = FakeStorage()
     app = report_app(storage=storage)
 
-    five = await request_app(
+    three = await request_app(
         app,
         "POST",
         "/internal/v1/missing-person-reports",
         data={"payload": json.dumps(valid_payload())},
-        files=photos_form(5),
+        files=photos_form(3),
         headers=IDEMPOTENCY,
     )
     zero = await request_app(
@@ -305,19 +306,19 @@ async def test_report_accepts_five_photos_and_rejects_zero_and_six():
         data={"payload": json.dumps(valid_payload())},
         headers=IDEMPOTENCY,
     )
-    six = await request_app(
+    four = await request_app(
         app,
         "POST",
         "/internal/v1/missing-person-reports",
         data={"payload": json.dumps(valid_payload())},
-        files=photos_form(6),
+        files=photos_form(4),
         headers=IDEMPOTENCY,
     )
 
-    assert five.status_code == 201
-    assert len(storage.objects) == 10
+    assert three.status_code == 201
+    assert len(storage.objects) == 6
     assert zero.status_code == 422
-    assert six.status_code == 422
+    assert four.status_code == 422
 
 
 @pytest.mark.anyio
