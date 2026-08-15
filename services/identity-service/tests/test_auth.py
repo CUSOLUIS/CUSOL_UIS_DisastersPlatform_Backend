@@ -134,6 +134,11 @@ class FakeIdentityRepository:
                         assigned_role="user",
                         status="active",
                         password_hash=account.password_hash,
+                        # CHG-077: misma regla que el SQL real.
+                        is_health_sector=bool(
+                            account.health_profession
+                            and account.health_license_number
+                        ),
                     ),
                     session_expires_at=session["expires_at"],
                 )
@@ -578,8 +583,10 @@ async def test_me_valid_expired_and_revoked_sessions():
     assert valid.json()["email"] == "ana.rojas@example.com"
     assert set(valid.json().keys()) == {
         "id", "displayName", "email", "assignedRole", "status",
-        "sessionExpiresAt",
+        "sessionExpiresAt", "isHealthSector",
     }
+    # CHG-077: sin datos de salud declarados, la bandera es falsa.
+    assert valid.json()["isHealthSector"] is False
 
     # Vencida
     repository.sessions[hash_token(token)]["expires_at"] = (
@@ -682,3 +689,89 @@ async def test_report_status_notification_unknown_account_is_404():
 
     assert response.status_code == 404
     assert all("tracking_code" not in item for item in mailer.sent)
+
+
+# --- CHG-077: cuentas del sector salud ---
+
+
+@pytest.mark.anyio
+async def test_registration_stores_health_sector_fields():
+    repository = FakeIdentityRepository()
+    mailer = CaptureMailer()
+    app = build_app(repository, mailer)
+
+    response = await request(
+        app,
+        "POST",
+        "/internal/v1/auth/registrations",
+        json=registration_payload(
+            healthProfession="Médica general",
+            healthLicenseNumber="RM-12345",
+            healthInstitution="Hospital Universitario de Santander",
+        ),
+    )
+
+    assert response.status_code == 202
+    stored = repository.accounts["ana.rojas@example.com"]
+    assert stored.health_profession == "Médica general"
+    assert stored.health_license_number == "RM-12345"
+    assert stored.health_institution == (
+        "Hospital Universitario de Santander"
+    )
+
+
+@pytest.mark.anyio
+async def test_registration_requires_health_pair():
+    repository = FakeIdentityRepository()
+    mailer = CaptureMailer()
+    app = build_app(repository, mailer)
+
+    missing_license = await request(
+        app,
+        "POST",
+        "/internal/v1/auth/registrations",
+        json=registration_payload(healthProfession="Enfermero"),
+    )
+    orphan_institution = await request(
+        app,
+        "POST",
+        "/internal/v1/auth/registrations",
+        json=registration_payload(healthInstitution="Clínica Norte"),
+    )
+
+    assert missing_license.status_code == 422
+    assert orphan_institution.status_code == 422
+    assert repository.accounts == {}
+
+
+@pytest.mark.anyio
+async def test_me_exposes_health_sector_flag():
+    repository = FakeIdentityRepository()
+    mailer = CaptureMailer()
+    app = build_app(repository, mailer)
+    await register_and_activate(
+        app,
+        repository,
+        mailer,
+        healthProfession="Médica general",
+        healthLicenseNumber="RM-12345",
+    )
+    login = await request(
+        app,
+        "POST",
+        "/internal/v1/auth/sessions",
+        json={
+            "email": "ana.rojas@example.com",
+            "password": "ClaveSegura#2026",
+        },
+    )
+
+    me = await request(
+        app,
+        "GET",
+        "/internal/v1/auth/me",
+        headers={"X-Session-Token": login.json()["sessionToken"]},
+    )
+
+    assert me.status_code == 200
+    assert me.json()["isHealthSector"] is True

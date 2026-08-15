@@ -48,6 +48,11 @@ class AccountRegistrationInput(ApiModel):
     requested_account_type: RequestedAccountType
     organization_name: str | None = Field(default=None, max_length=160)
     organization_role: str | None = Field(default=None, max_length=120)
+    # CHG-077: datos opcionales del sector salud declarados al crear
+    # las credenciales; la bandera efectiva exige profesión + registro.
+    health_profession: str | None = Field(default=None, max_length=120)
+    health_license_number: str | None = Field(default=None, max_length=80)
+    health_institution: str | None = Field(default=None, max_length=160)
     password: str = Field(min_length=1, max_length=128)
     terms_accepted: Literal[True]
     privacy_accepted: Literal[True]
@@ -62,6 +67,25 @@ class AccountRegistrationInput(ApiModel):
                     "organizationName es obligatorio para "
                     "organization_representative"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _health_sector_pair(self):
+        profession = (self.health_profession or "").strip()
+        license_number = (self.health_license_number or "").strip()
+        institution = (self.health_institution or "").strip()
+        if (profession and not license_number) or (
+            license_number and not profession
+        ):
+            raise ValueError(
+                "healthProfession y healthLicenseNumber deben "
+                "enviarse juntos"
+            )
+        if institution and not profession:
+            raise ValueError(
+                "healthInstitution requiere healthProfession y "
+                "healthLicenseNumber"
+            )
         return self
 
 
@@ -124,6 +148,9 @@ class AuthenticatedAccount(ApiModel):
     assigned_role: AccountRole
     status: Literal["active"]
     session_expires_at: datetime
+    # CHG-077: bandera del sector salud (profesión + registro
+    # declarados al crear las credenciales).
+    is_health_sector: bool = False
 
 
 class SessionEnvelope(ApiModel):

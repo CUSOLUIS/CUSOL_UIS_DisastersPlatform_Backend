@@ -104,6 +104,9 @@ def authenticated_account(
         assigned_role=account.assigned_role,
         status=account.status,
         session_expires_at=session_expires_at,
+        # CHG-077: la bandera del sector salud viaja en la sesión para
+        # que el gateway la declare al registrar novedades.
+        is_health_sector=getattr(account, "is_health_sector", False),
     )
 
 
@@ -246,6 +249,25 @@ def create_app(
                     else None
                 ),
                 password_hash=password_hash,
+                # CHG-077: datos del sector salud; vacíos → null.
+                health_profession=(
+                    payload.health_profession.strip()
+                    if payload.health_profession
+                    and payload.health_profession.strip()
+                    else None
+                ),
+                health_license_number=(
+                    payload.health_license_number.strip()
+                    if payload.health_license_number
+                    and payload.health_license_number.strip()
+                    else None
+                ),
+                health_institution=(
+                    payload.health_institution.strip()
+                    if payload.health_institution
+                    and payload.health_institution.strip()
+                    else None
+                ),
             )
         )
         if created:

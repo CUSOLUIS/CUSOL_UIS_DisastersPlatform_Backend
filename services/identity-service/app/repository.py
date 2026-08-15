@@ -15,6 +15,8 @@ class AccountRecord:
     assigned_role: str
     status: str
     password_hash: str
+    # CHG-077: bandera efectiva del sector salud (profesión + registro).
+    is_health_sector: bool = False
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,10 @@ class NewAccount:
     organization_name: str | None
     organization_role: str | None
     password_hash: str
+    # CHG-077: datos opcionales del sector salud.
+    health_profession: str | None = None
+    health_license_number: str | None = None
+    health_institution: str | None = None
 
 
 class IdentityRepository(Protocol):
@@ -92,10 +98,13 @@ class PostgresIdentityRepository:
             INSERT INTO identity_service.accounts (
                 id, email, first_names, last_names, phone,
                 department, municipality, requested_account_type,
-                organization_name, organization_role, password_hash
+                organization_name, organization_role, password_hash,
+                health_profession, health_license_number,
+                health_institution
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7,
-                $8::identity_service.requested_account_type, $9, $10, $11
+                $8::identity_service.requested_account_type, $9, $10, $11,
+                $12, $13, $14
             )
             ON CONFLICT (email) DO NOTHING
             RETURNING id
@@ -111,6 +120,9 @@ class PostgresIdentityRepository:
             account.organization_name,
             account.organization_role,
             account.password_hash,
+            account.health_profession,
+            account.health_license_number,
+            account.health_institution,
         )
         return row is not None
 
@@ -240,6 +252,9 @@ class PostgresIdentityRepository:
             """
             SELECT a.id, a.email, a.first_names, a.last_names,
                    a.assigned_role, a.status, a.password_hash,
+                   (a.health_profession IS NOT NULL
+                    AND a.health_license_number IS NOT NULL)
+                       AS is_health_sector,
                    s.expires_at
             FROM identity_service.sessions s
             INNER JOIN identity_service.accounts a
@@ -263,6 +278,7 @@ class PostgresIdentityRepository:
                 assigned_role=row["assigned_role"],
                 status=row["status"],
                 password_hash=row["password_hash"],
+                is_health_sector=row["is_health_sector"],
             ),
             session_expires_at=row["expires_at"],
         )
