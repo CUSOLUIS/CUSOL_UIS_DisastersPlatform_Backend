@@ -9,10 +9,9 @@ class Settings:
     database_pool_max_size: int = 5
     verification_ttl_hours: int = 24
     session_ttl_hours: int = 24
-    smtp_host: str = "mailpit"
-    smtp_port: int = 1025
-    mail_from: str = "no-reply@cusol.local"
-    public_base_url: str = "http://localhost:3100"
+    # CHG-043: la entrega SMTP vive en el mail-service.
+    mail_service_url: str = "http://mail-service:8003"
+    mail_timeout_seconds: float = 10.0
     # Parámetros Argon2id configurables (ADR-004).
     argon2_time_cost: int = 3
     argon2_memory_cost: int = 65536
@@ -38,12 +37,12 @@ class Settings:
                 os.getenv("VERIFICATION_TTL_HOURS", "24")
             ),
             session_ttl_hours=int(os.getenv("SESSION_TTL_HOURS", "24")),
-            smtp_host=os.getenv("SMTP_HOST", "mailpit"),
-            smtp_port=int(os.getenv("SMTP_PORT", "1025")),
-            mail_from=os.getenv("MAIL_FROM", "no-reply@cusol.local"),
-            public_base_url=os.getenv(
-                "PUBLIC_BASE_URL", "http://localhost:3100"
+            mail_service_url=os.getenv(
+                "MAIL_SERVICE_URL", "http://mail-service:8003"
             ).rstrip("/"),
+            mail_timeout_seconds=float(
+                os.getenv("MAIL_TIMEOUT_SECONDS", "10")
+            ),
             argon2_time_cost=int(os.getenv("ARGON2_TIME_COST", "3")),
             argon2_memory_cost=int(
                 os.getenv("ARGON2_MEMORY_COST", "65536")

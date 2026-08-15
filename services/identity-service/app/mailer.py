@@ -1,14 +1,14 @@
-"""Correo de verificación (ADR-004).
+"""Correo de verificación (ADR-004, CHG-043).
 
-En desarrollo se entrega a Mailpit por SMTP. El token viaja únicamente en
-el cuerpo del correo: jamás en respuestas HTTP ni en logs.
+La entrega real es responsabilidad exclusiva del mail-service (dueño de
+las credenciales SMTP y de la plantilla); aquí solo se delega por HTTP
+interno. El token viaja únicamente hacia el mail-service y dentro del
+correo resultante: jamás en respuestas HTTP públicas ni en logs.
 """
 
-import smtplib
-from email.message import EmailMessage
 from typing import Protocol
 
-import anyio
+import httpx
 
 
 class Mailer(Protocol):
@@ -17,43 +17,45 @@ class Mailer(Protocol):
     ) -> None: ...
 
 
-class SmtpMailer:
+class MailDeliveryUnavailable(Exception):
+    """El mail-service no aceptó el correo de verificación."""
+
+
+class HttpMailer:
     def __init__(
         self,
-        host: str,
-        port: int,
-        sender: str,
-        public_base_url: str,
+        mail_service_url: str,
+        timeout_seconds: float,
+        transport: httpx.AsyncBaseTransport | None = None,
     ):
-        self._host = host
-        self._port = port
-        self._sender = sender
-        self._public_base_url = public_base_url
+        self._endpoint = (
+            f"{mail_service_url.rstrip('/')}"
+            "/internal/v1/verification-emails"
+        )
+        self._timeout_seconds = timeout_seconds
+        self._transport = transport
 
     async def send_verification(
         self, recipient: str, token: str, expires_hours: int
     ) -> None:
-        message = EmailMessage()
-        message["From"] = self._sender
-        message["To"] = recipient
-        message["Subject"] = (
-            "Verifica tu correo — Plataforma CUSOL Desastres"
-        )
-        link = (
-            f"{self._public_base_url}/verificar-correo?token={token}"
-        )
-        message.set_content(
-            "Hola:\n\n"
-            "Recibimos una solicitud de registro con este correo.\n"
-            f"Para activar la cuenta abre el enlace (vence en "
-            f"{expires_hours} horas):\n\n{link}\n\n"
-            f"Si el enlace no funciona, usa este código de "
-            f"verificación:\n{token}\n\n"
-            "Si no solicitaste la cuenta, ignora este mensaje.\n"
-        )
-
-        def _send() -> None:
-            with smtplib.SMTP(self._host, self._port, timeout=10) as smtp:
-                smtp.send_message(message)
-
-        await anyio.to_thread.run_sync(_send)
+        async with httpx.AsyncClient(
+            timeout=self._timeout_seconds,
+            transport=self._transport,
+        ) as client:
+            try:
+                response = await client.post(
+                    self._endpoint,
+                    json={
+                        "recipient": recipient,
+                        "token": token,
+                        "expiresHours": expires_hours,
+                    },
+                )
+            except httpx.HTTPError as error:
+                raise MailDeliveryUnavailable(
+                    f"mail-service inalcanzable: {type(error).__name__}"
+                ) from error
+        if response.status_code != 202:
+            raise MailDeliveryUnavailable(
+                f"mail-service respondió {response.status_code}"
+            )

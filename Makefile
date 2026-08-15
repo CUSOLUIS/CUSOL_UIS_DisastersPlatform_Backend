@@ -35,6 +35,8 @@ test:
 	docker run --rm cusol-disaster-service-test
 	docker build --quiet --target test -t cusol-identity-service-test services/identity-service
 	docker run --rm cusol-identity-service-test
+	docker build --quiet --target test -t cusol-mail-service-test services/mail-service
+	docker run --rm cusol-mail-service-test
 
 migrate:
 	@echo "Aplicando esquema (infra/postgres/init) a la base local existente"

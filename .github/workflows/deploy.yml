@@ -72,8 +72,8 @@ jobs:
       - name: Reconstruir y levantar servicios de backend
         run: |
           cd "$COMPOSE_DIR"
-          docker compose build disasters-db disaster-service identity-service admin-bootstrap api-gateway
-          docker compose up -d --wait disasters-db disaster-service identity-service admin-bootstrap api-gateway
+          docker compose build disasters-db disaster-service identity-service mail-service admin-bootstrap api-gateway
+          docker compose up -d --wait disasters-db disaster-service identity-service mail-service admin-bootstrap api-gateway
 
       - name: Aplicar migraciones idempotentes
         run: |

@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 
 from .config import Settings
-from .mailer import Mailer, SmtpMailer
+from .mailer import HttpMailer, Mailer
 from .models import (
     AccountRegistrationInput,
     AccountRegistrationReceipt,
@@ -121,11 +121,9 @@ def create_app(
     dummy_password_hash = password_hasher.hash(
         "cusol-dummy-timing-equalizer"
     )
-    outbound_mailer = mailer or SmtpMailer(
-        resolved_settings.smtp_host,
-        resolved_settings.smtp_port,
-        resolved_settings.mail_from,
-        resolved_settings.public_base_url,
+    outbound_mailer = mailer or HttpMailer(
+        resolved_settings.mail_service_url,
+        resolved_settings.mail_timeout_seconds,
     )
 
     @asynccontextmanager
