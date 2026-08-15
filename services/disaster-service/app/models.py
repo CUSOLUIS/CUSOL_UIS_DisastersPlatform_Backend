@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .person_options import DOCUMENT_TYPES, NATIONALITIES, SEXES
+
 
 VerificationStatus = Literal[
     "unverified", "under_review", "verified", "rejected"
@@ -282,6 +284,38 @@ class MissingPersonReportInput(ApiModel):
     truth_confirmed: Literal[True]
     photo_authorization_confirmed: Literal[True]
     review_acknowledged: Literal[True]
+
+    # CHG-073: listas cerradas y fecha de nacimiento plausible; el
+    # mismo criterio vive en el frontend y en la base (migración 020).
+    @model_validator(mode="after")
+    def _person_field_options(self):
+        if (
+            self.gender_identity is not None
+            and self.gender_identity not in SEXES
+        ):
+            raise ValueError("genderIdentity debe ser Hombre o Mujer")
+        if (
+            self.document_type is not None
+            and self.document_type not in DOCUMENT_TYPES
+        ):
+            raise ValueError(
+                "documentType debe ser uno de los tipos permitidos"
+            )
+        if (
+            self.nationality is not None
+            and self.nationality not in NATIONALITIES
+        ):
+            raise ValueError(
+                "nationality debe elegirse de la lista de nacionalidades"
+            )
+        if self.birth_date is not None:
+            if self.birth_date < date(1900, 1, 1):
+                raise ValueError(
+                    "birthDate no puede ser anterior a 1900"
+                )
+            if self.birth_date > date.today():
+                raise ValueError("birthDate no puede estar en el futuro")
+        return self
 
     @model_validator(mode="after")
     def _last_seen_coordinates_pair(self):

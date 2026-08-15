@@ -655,3 +655,48 @@ async def test_report_without_coordinates_still_accepted():
     assert response.status_code == 201
     assert repository.created_report.last_seen_latitude is None
     assert repository.created_report.last_seen_longitude is None
+
+
+# CHG-073 — Listas cerradas y fecha de nacimiento plausible.
+
+
+@pytest.mark.anyio
+async def test_report_validates_person_field_options():
+    app = report_app()
+
+    async def post(payload):
+        return await request_app(
+            app,
+            "POST",
+            "/internal/v1/missing-person-reports",
+            data={"payload": json.dumps(payload)},
+            files=photos_form(1),
+            headers=IDEMPOTENCY,
+        )
+
+    valid = await post(
+        valid_payload(
+            genderIdentity="Mujer",
+            nationality="Colombiana",
+            documentType="Cédula de ciudadanía",
+            birthDate="1990-05-20",
+        )
+    )
+    assert valid.status_code == 201
+
+    bad_sex = await post(valid_payload(genderIdentity="No binaria"))
+    assert bad_sex.status_code == 422
+
+    bad_nationality = await post(valid_payload(nationality="Marciana"))
+    assert bad_nationality.status_code == 422
+
+    bad_document = await post(
+        valid_payload(documentType="Licencia de conducción")
+    )
+    assert bad_document.status_code == 422
+
+    future_birth = await post(valid_payload(birthDate="2100-01-01"))
+    assert future_birth.status_code == 422
+
+    ancient_birth = await post(valid_payload(birthDate="1850-01-01"))
+    assert ancient_birth.status_code == 422
