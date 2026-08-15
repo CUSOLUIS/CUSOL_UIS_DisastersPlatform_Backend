@@ -252,8 +252,13 @@ class SessionEnvelope(ApiModel):
 
 
 # CHG-034 — Directorio humanitario y aportes (espejo del contrato).
+# CHG-044 amplía el directorio con ofertas comunitarias.
 HumanitarianDirectoryKind = Literal[
-    "missing_person", "collection_center", "collection_point"
+    "missing_person",
+    "collection_center",
+    "collection_point",
+    "community_meal",
+    "temporary_shelter",
 ]
 PublicPersonStatus = Literal["missing", "found", "deceased"]
 AidLocationAvailability = Literal["active", "inactive", "unknown"]
@@ -297,10 +302,103 @@ class AidLocationDirectoryCard(ApiModel):
     data_classification: DataClassification
 
 
+# CHG-044 — Ofertas comunitarias (espejo del contrato).
+AidOfferKind = Literal["community_meal", "temporary_shelter"]
+AidOfferAvailability = Literal[
+    "scheduled", "active", "paused", "fulfilled", "withdrawn", "expired"
+]
+AidOfferModerationStatus = Literal[
+    "under_review", "needs_information", "accepted", "rejected", "archived"
+]
+AidOfferCapacityUnit = Literal["servings", "spaces"]
+MealDistributionMode = Literal["pickup", "delivery", "both"]
+
+
+class AidOfferReceipt(ApiModel):
+    id: UUID
+    tracking_code: str = Field(min_length=1, max_length=40)
+    kind: AidOfferKind
+    moderation_status: Literal["under_review"]
+    availability_status: Literal["scheduled"]
+    received_at: datetime
+    version: int = Field(ge=1)
+
+
+class AidOfferOwnerSummary(ApiModel):
+    id: UUID
+    tracking_code: str = Field(min_length=1, max_length=40)
+    kind: AidOfferKind
+    title: str = Field(min_length=1, max_length=160)
+    moderation_status: AidOfferModerationStatus
+    availability_status: AidOfferAvailability
+    available_units: int = Field(ge=0, le=100_000)
+    capacity_unit: AidOfferCapacityUnit
+    available_from: datetime
+    available_until: datetime
+    received_at: datetime
+    updated_at: datetime
+    version: int = Field(ge=1)
+
+
+class AidOfferOwnerPage(ApiModel):
+    items: list[AidOfferOwnerSummary] = Field(max_length=50)
+    total: int = Field(ge=0)
+    limit: Literal[10, 25, 50]
+    offset: int = Field(ge=0)
+    generated_at: datetime
+
+
+class CommunityMealOfferDirectoryCard(ApiModel):
+    kind: Literal["community_meal"] = "community_meal"
+    id: UUID
+    public_offer_code: str = Field(min_length=1, max_length=40)
+    title: str = Field(min_length=3, max_length=160)
+    description: str = Field(min_length=1, max_length=1200)
+    area_reference: str = Field(min_length=1, max_length=300)
+    municipality: str = Field(min_length=1, max_length=100)
+    department: str = Field(min_length=1, max_length=100)
+    availability_status: Literal["active"]
+    available_from: datetime
+    available_until: datetime
+    servings_available: int = Field(ge=1, le=100_000)
+    distribution_mode: MealDistributionMode
+    meal_description: str = Field(min_length=1, max_length=500)
+    allergen_information: str | None = Field(default=None, max_length=500)
+    verification_status: Literal["verified"]
+    source: SourceReference
+    updated_at: datetime
+    data_classification: DataClassification
+
+
+class TemporaryShelterOfferDirectoryCard(ApiModel):
+    kind: Literal["temporary_shelter"] = "temporary_shelter"
+    id: UUID
+    public_offer_code: str = Field(min_length=1, max_length=40)
+    title: str = Field(min_length=3, max_length=160)
+    description: str = Field(min_length=1, max_length=1200)
+    area_reference: str = Field(min_length=1, max_length=300)
+    municipality: str = Field(min_length=1, max_length=100)
+    department: str = Field(min_length=1, max_length=100)
+    availability_status: Literal["active"]
+    available_from: datetime
+    available_until: datetime
+    spaces_available: int = Field(ge=1, le=1_000)
+    shared_space: bool
+    accepts_pets: bool | None = None
+    accessibility_notes: str | None = Field(default=None, max_length=500)
+    verification_status: Literal["verified"]
+    source: SourceReference
+    updated_at: datetime
+    data_classification: DataClassification
+
+
 class HumanitarianDirectorySearchResponse(ApiModel):
-    items: list[MissingPersonDirectoryCard | AidLocationDirectoryCard] = (
-        Field(max_length=20)
-    )
+    items: list[
+        MissingPersonDirectoryCard
+        | AidLocationDirectoryCard
+        | CommunityMealOfferDirectoryCard
+        | TemporaryShelterOfferDirectoryCard
+    ] = Field(max_length=20)
     total: int = Field(ge=0)
     limit: int = Field(ge=1, le=20)
     offset: int = Field(ge=0)
@@ -336,6 +434,9 @@ AdminSubmissionKind = Literal[
     "aid_location_rating",
     "collection_center_registration",
     "collection_point_registration",
+    # CHG-044 — ofertas comunitarias.
+    "community_meal_offer",
+    "temporary_shelter_offer",
 ]
 AdminModerationStatus = Literal[
     "under_review", "needs_information", "accepted", "rejected", "archived"
@@ -367,7 +468,8 @@ class AdminOverview(ApiModel):
     active_accounts: int = Field(ge=0)
     suspended_accounts: int = Field(ge=0)
     oldest_pending_at: datetime | None = None
-    by_kind: list[AdminCountByKind] = Field(max_length=6)
+    # CHG-044: de 6 a 8 con las dos ofertas comunitarias.
+    by_kind: list[AdminCountByKind] = Field(max_length=8)
     recent_activity: list[AdminActivitySummary] = Field(max_length=10)
     generated_at: datetime
 

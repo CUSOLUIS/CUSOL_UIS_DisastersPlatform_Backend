@@ -30,6 +30,11 @@ class Settings:
     # CHG-036: límites administrativos por cuenta autenticada.
     admin_rate_limit_per_minute: int = 240
     admin_evidence_rate_limit_per_minute: int = 30
+    # CHG-044: límites separados de ofertas comunitarias por cuenta y
+    # tope del cuerpo JSON (sin fotos, muy por debajo del multipart).
+    aid_offer_write_rate_limit_per_minute: int = 10
+    aid_offer_read_rate_limit_per_minute: int = 60
+    max_aid_offer_body_bytes: int = 64 * 1024
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -98,6 +103,16 @@ class Settings:
             admin_evidence_rate_limit_per_minute=int(
                 os.getenv(
                     "ADMIN_EVIDENCE_RATE_LIMIT_PER_MINUTE", "30"
+                )
+            ),
+            aid_offer_write_rate_limit_per_minute=int(
+                os.getenv(
+                    "AID_OFFER_WRITE_RATE_LIMIT_PER_MINUTE", "10"
+                )
+            ),
+            aid_offer_read_rate_limit_per_minute=int(
+                os.getenv(
+                    "AID_OFFER_READ_RATE_LIMIT_PER_MINUTE", "60"
                 )
             ),
         )

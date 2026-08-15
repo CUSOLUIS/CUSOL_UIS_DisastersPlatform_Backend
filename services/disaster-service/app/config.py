@@ -14,6 +14,11 @@ class Settings:
     max_total_photo_bytes: int = 50 * 1024 * 1024
     # CHG-036: vigencia del acceso temporal a evidencia (tope 300 s).
     evidence_grant_ttl_seconds: int = 300
+    # CHG-044: clave EXCLUSIVA de ofertas comunitarias, montada como
+    # secreto de Docker; aquí solo vive la ruta, jamás la clave.
+    aid_offer_encryption_key_file: str = (
+        "/run/secrets/cusol/aid_offer_key"
+    )
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -35,5 +40,9 @@ class Settings:
             evidence_grant_ttl_seconds=min(
                 300,
                 int(os.getenv("EVIDENCE_GRANT_TTL_SECONDS", "300")),
+            ),
+            aid_offer_encryption_key_file=os.getenv(
+                "AID_OFFER_ENCRYPTION_KEY_FILE",
+                "/run/secrets/cusol/aid_offer_key",
             ),
         )

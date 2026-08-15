@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Protocol
 from uuid import UUID
 
@@ -8,7 +8,10 @@ import asyncpg
 from .models import (
     AidLocationAvailability,
     AidLocationDirectoryCard,
+    AidOfferOwnerSummary,
+    AidOfferReceipt,
     CommunityContributionReceipt,
+    CommunityMealOfferDirectoryCard,
     ContributionActorKind,
     DataClassification,
     DisasterEvent,
@@ -20,10 +23,11 @@ from .models import (
     PersonRecord,
     PublicPersonStatus,
     SourceReference,
+    TemporaryShelterOfferDirectoryCard,
     UnverifiedBuildingReportReceipt,
     VerificationStatus,
 )
-from . import moderation
+from . import moderation, offers
 
 
 @dataclass(frozen=True)
@@ -183,6 +187,54 @@ class StoredRating:
     account_id: UUID | None
 
 
+# CHG-044 — Oferta comunitaria privada; lo sensible llega cifrado con
+# la clave EXCLUSIVA de ofertas y la llave idempotente solo hasheada.
+@dataclass(frozen=True)
+class StoredAidOffer:
+    id: UUID
+    tracking_code: str
+    kind: str
+    account_id: UUID
+    idempotency_key_hash: str
+    request_fingerprint: str
+    related_disaster_id: UUID | None
+    title_encrypted: bytes
+    description_encrypted: bytes
+    area_reference_encrypted: bytes
+    exact_address_encrypted: bytes | None
+    latitude_encrypted: bytes | None
+    longitude_encrypted: bytes | None
+    contact_name_encrypted: bytes
+    contact_phone_encrypted: bytes | None
+    contact_email_encrypted: bytes | None
+    department: str
+    municipality: str
+    available_from: datetime
+    available_until: datetime
+    consent_recorded_at: datetime
+    legal_text_version: str
+
+
+@dataclass(frozen=True)
+class StoredMealOfferDetails:
+    servings_available: int
+    distribution_mode: str
+    meal_description_encrypted: bytes
+    allergen_information_encrypted: bytes | None
+
+
+@dataclass(frozen=True)
+class StoredShelterOfferDetails:
+    spaces_available: int
+    shared_space: bool
+    accepts_pets: bool | None
+    accessibility_notes_encrypted: bytes | None
+
+
+class AidOfferIdempotencyConflictError(Exception):
+    """Misma llave idempotente con un cuerpo distinto (409)."""
+
+
 @dataclass(frozen=True)
 class StoredPhoto:
     id: UUID
@@ -317,6 +369,51 @@ class DisasterRepository(Protocol):
         moderation_reason_encrypted: bytes | None = None,
         projection: BuildingProjection | None = None,
     ) -> bool: ...
+
+    # CHG-044 — Ofertas comunitarias de comida y alojamiento.
+    async def create_aid_offer(
+        self,
+        offer: StoredAidOffer,
+        meal: StoredMealOfferDetails | None,
+        shelter: StoredShelterOfferDetails | None,
+    ) -> tuple[AidOfferReceipt, bool]: ...
+
+    async def list_owner_aid_offers(
+        self,
+        account_id: UUID,
+        kind: str | None,
+        moderation_status: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict], int]: ...
+
+    async def update_owner_aid_offer(
+        self,
+        account_id: UUID,
+        offer_id: UUID,
+        expected_version: int,
+        availability_status: str | None,
+        available_units: int | None,
+        available_from: datetime | None,
+        available_until: datetime | None,
+    ) -> tuple[str, dict | None]: ...
+
+    async def expire_aid_offers(self, batch_size: int) -> int: ...
+
+    async def search_directory_aid_offers(
+        self,
+        kind: str,
+        query: str,
+        department: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[
+        list[
+            CommunityMealOfferDirectoryCard
+            | TemporaryShelterOfferDirectoryCard
+        ],
+        int,
+    ]: ...
 
 
 # Tarjeta de persona sin fuente registrada: atribución genérica pública.
@@ -1805,6 +1902,529 @@ class PostgresDisasterRepository:
         return True
 
 
+    # CHG-044 — Ofertas comunitarias de comida y alojamiento.
+
+    async def create_aid_offer(
+        self,
+        offer: StoredAidOffer,
+        meal: StoredMealOfferDetails | None,
+        shelter: StoredShelterOfferDetails | None,
+    ) -> tuple[AidOfferReceipt, bool]:
+        async with self._pool.acquire() as connection:
+            try:
+                async with connection.transaction():
+                    # Expediente + detalle + auditoría: todo o nada.
+                    # Crear una oferta JAMÁS escribe la proyección.
+                    row = await connection.fetchrow(
+                        """
+                        INSERT INTO disaster_service.aid_offers (
+                            id, tracking_code, kind, account_id,
+                            idempotency_key, request_fingerprint,
+                            related_disaster_id, title_encrypted,
+                            description_encrypted,
+                            area_reference_encrypted,
+                            exact_address_encrypted, latitude_encrypted,
+                            longitude_encrypted, contact_name_encrypted,
+                            contact_phone_encrypted,
+                            contact_email_encrypted, department,
+                            municipality, available_from,
+                            available_until, truth_confirmed,
+                            contact_consent, review_acknowledged,
+                            public_summary_consent, consent_recorded_at,
+                            legal_text_version
+                        ) VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                            $11, $12, $13, $14, $15, $16, $17, $18,
+                            $19, $20, TRUE, TRUE, TRUE, TRUE, $21, $22
+                        )
+                        RETURNING id, tracking_code, kind,
+                                  moderation_status,
+                                  availability_status, received_at,
+                                  version
+                        """,
+                        offer.id,
+                        offer.tracking_code,
+                        offer.kind,
+                        offer.account_id,
+                        offer.idempotency_key_hash,
+                        offer.request_fingerprint,
+                        offer.related_disaster_id,
+                        offer.title_encrypted,
+                        offer.description_encrypted,
+                        offer.area_reference_encrypted,
+                        offer.exact_address_encrypted,
+                        offer.latitude_encrypted,
+                        offer.longitude_encrypted,
+                        offer.contact_name_encrypted,
+                        offer.contact_phone_encrypted,
+                        offer.contact_email_encrypted,
+                        offer.department,
+                        offer.municipality,
+                        offer.available_from,
+                        offer.available_until,
+                        offer.consent_recorded_at,
+                        offer.legal_text_version,
+                    )
+                    if meal is not None:
+                        await connection.execute(
+                            """
+                            INSERT INTO disaster_service
+                                .community_meal_offer_details (
+                                offer_id, servings_available,
+                                distribution_mode,
+                                meal_description_encrypted,
+                                allergen_information_encrypted,
+                                food_safety_confirmed
+                            ) VALUES ($1, $2, $3, $4, $5, TRUE)
+                            """,
+                            offer.id,
+                            meal.servings_available,
+                            meal.distribution_mode,
+                            meal.meal_description_encrypted,
+                            meal.allergen_information_encrypted,
+                        )
+                    if shelter is not None:
+                        await connection.execute(
+                            """
+                            INSERT INTO disaster_service
+                                .temporary_shelter_offer_details (
+                                offer_id, spaces_available, shared_space,
+                                accepts_pets,
+                                accessibility_notes_encrypted,
+                                shelter_safety_confirmed
+                            ) VALUES ($1, $2, $3, $4, $5, TRUE)
+                            """,
+                            offer.id,
+                            shelter.spaces_available,
+                            shelter.shared_space,
+                            shelter.accepts_pets,
+                            shelter.accessibility_notes_encrypted,
+                        )
+                    await connection.execute(
+                        """
+                        INSERT INTO
+                            disaster_service.community_contribution_audit (
+                            event_type, contribution_kind,
+                            contribution_id, detail
+                        ) VALUES ($1, $2, $3, $4)
+                        """,
+                        "aid_offer_received",
+                        _offer_admin_kind(offer.kind),
+                        offer.id,
+                        "actor=authenticated",
+                    )
+            except asyncpg.ForeignKeyViolationError:
+                raise
+            except asyncpg.UniqueViolationError:
+                existing = await connection.fetchrow(
+                    """
+                    SELECT id, tracking_code, kind, moderation_status,
+                           availability_status, received_at, version,
+                           request_fingerprint
+                    FROM disaster_service.aid_offers
+                    WHERE account_id = $1 AND idempotency_key = $2
+                    """,
+                    offer.account_id,
+                    offer.idempotency_key_hash,
+                )
+                if existing is None:
+                    raise
+                if not offers.same_fingerprint(
+                    existing["request_fingerprint"],
+                    offer.request_fingerprint,
+                ):
+                    raise AidOfferIdempotencyConflictError()
+                return _aid_offer_receipt(existing), False
+        return _aid_offer_receipt(row), True
+
+    async def list_owner_aid_offers(
+        self,
+        account_id: UUID,
+        kind: str | None,
+        moderation_status: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict], int]:
+        clauses = ["o.account_id = $1"]
+        values: list[object] = [account_id]
+        if kind is not None:
+            values.append(kind)
+            clauses.append(f"o.kind::text = ${len(values)}")
+        if moderation_status is not None:
+            values.append(moderation_status)
+            clauses.append(
+                f"({_OFFER_MODERATION_EXPR}) = ${len(values)}"
+            )
+        where_clause = "WHERE " + " AND ".join(clauses)
+        total = await self._pool.fetchval(
+            f"""
+            SELECT COUNT(*)
+            FROM disaster_service.aid_offers o
+            {where_clause}
+            """,
+            *values,
+        )
+        limit_parameter = len(values) + 1
+        offset_parameter = len(values) + 2
+        rows = await self._pool.fetch(
+            f"""
+            SELECT {_OFFER_OWNER_COLUMNS}
+            FROM disaster_service.aid_offers o
+            LEFT JOIN disaster_service.community_meal_offer_details m
+                ON m.offer_id = o.id
+            LEFT JOIN disaster_service.temporary_shelter_offer_details t
+                ON t.offer_id = o.id
+            {where_clause}
+            ORDER BY o.updated_at DESC, o.id DESC
+            LIMIT ${limit_parameter} OFFSET ${offset_parameter}
+            """,
+            *values,
+            limit,
+            offset,
+        )
+        return [dict(row) for row in rows], int(total)
+
+    async def update_owner_aid_offer(
+        self,
+        account_id: UUID,
+        offer_id: UUID,
+        expected_version: int,
+        availability_status: str | None,
+        available_units: int | None,
+        available_from: datetime | None,
+        available_until: datetime | None,
+    ) -> tuple[str, dict | None]:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                current = await connection.fetchrow(
+                    """
+                    SELECT o.id, o.kind::text AS kind, o.version,
+                           o.availability_status::text
+                               AS availability_status,
+                           o.available_from, o.available_until,
+                           o.archived_at
+                    FROM disaster_service.aid_offers o
+                    WHERE o.id = $1 AND o.account_id = $2
+                    FOR UPDATE
+                    """,
+                    offer_id,
+                    account_id,
+                )
+                # Oferta ajena o inexistente: indistinguibles (404).
+                if current is None:
+                    return "not_found", None
+                if current["archived_at"] is not None:
+                    raise offers.OwnerTransitionError(
+                        "La oferta está archivada y no admite cambios."
+                    )
+                if current["version"] != expected_version:
+                    return "version_conflict", None
+                resolved_availability, resolved_units = (
+                    offers.resolve_owner_update(
+                        current["kind"],
+                        current["availability_status"],
+                        availability_status,
+                        available_units,
+                    )
+                )
+                new_from = available_from or current["available_from"]
+                new_until = available_until or current["available_until"]
+                if new_until <= new_from:
+                    raise offers.OwnerUpdateInvalidError(
+                        "availableUntil debe ser posterior a "
+                        "availableFrom."
+                    )
+                if (
+                    available_until is not None
+                    and new_until <= datetime.now(UTC)
+                ):
+                    raise offers.OwnerUpdateInvalidError(
+                        "availableUntil debe estar en el futuro."
+                    )
+                final_availability = (
+                    resolved_availability
+                    or current["availability_status"]
+                )
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.aid_offers
+                    SET availability_status = $2,
+                        available_from = $3,
+                        available_until = $4,
+                        version = version + 1,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    offer_id,
+                    final_availability,
+                    new_from,
+                    new_until,
+                )
+                if resolved_units is not None:
+                    detail_table = (
+                        "disaster_service.community_meal_offer_details"
+                        if current["kind"] == "community_meal"
+                        else "disaster_service"
+                        ".temporary_shelter_offer_details"
+                    )
+                    units_column = (
+                        "servings_available"
+                        if current["kind"] == "community_meal"
+                        else "spaces_available"
+                    )
+                    await connection.execute(
+                        f"""
+                        UPDATE {detail_table}
+                        SET {units_column} = $2
+                        WHERE offer_id = $1
+                        """,
+                        offer_id,
+                        resolved_units,
+                    )
+                # La proyección pública (si existe) se sincroniza en la
+                # MISMA transacción: pausar/completar/retirar/vencer la
+                # oculta porque el directorio solo lista `active`.
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.aid_offer_publications
+                    SET availability_status = $2,
+                        available_from = $3,
+                        available_until = $4,
+                        available_units = COALESCE($5, available_units),
+                        updated_at = NOW()
+                    WHERE offer_id = $1
+                    """,
+                    offer_id,
+                    final_availability,
+                    new_from,
+                    new_until,
+                    resolved_units,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.community_contribution_audit (
+                        event_type, contribution_kind, contribution_id,
+                        detail
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    "aid_offer_owner_updated",
+                    _offer_admin_kind(current["kind"]),
+                    offer_id,
+                    f"estado={final_availability}",
+                )
+                updated = await connection.fetchrow(
+                    f"""
+                    SELECT {_OFFER_OWNER_COLUMNS}
+                    FROM disaster_service.aid_offers o
+                    LEFT JOIN
+                        disaster_service.community_meal_offer_details m
+                        ON m.offer_id = o.id
+                    LEFT JOIN
+                        disaster_service.temporary_shelter_offer_details t
+                        ON t.offer_id = o.id
+                    WHERE o.id = $1
+                    """,
+                    offer_id,
+                )
+        return "ok", dict(updated)
+
+    async def expire_aid_offers(self, batch_size: int) -> int:
+        expired_total = 0
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                rows = await connection.fetch(
+                    """
+                    SELECT id, kind::text AS kind
+                    FROM disaster_service.aid_offers
+                    WHERE availability_status IN
+                          ('scheduled', 'active', 'paused')
+                      AND available_until <= NOW()
+                    ORDER BY available_until
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    batch_size,
+                )
+                if not rows:
+                    return 0
+                identifiers = [row["id"] for row in rows]
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.aid_offers
+                    SET availability_status = 'expired',
+                        version = version + 1,
+                        updated_at = NOW()
+                    WHERE id = ANY($1::uuid[])
+                    """,
+                    identifiers,
+                )
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.aid_offer_publications
+                    SET availability_status = 'expired',
+                        updated_at = NOW()
+                    WHERE offer_id = ANY($1::uuid[])
+                    """,
+                    identifiers,
+                )
+                for row in rows:
+                    await connection.execute(
+                        """
+                        INSERT INTO
+                            disaster_service.community_contribution_audit (
+                            event_type, contribution_kind,
+                            contribution_id, detail
+                        ) VALUES ($1, $2, $3, $4)
+                        """,
+                        "aid_offer_expired",
+                        _offer_admin_kind(row["kind"]),
+                        row["id"],
+                        "estado=expired",
+                    )
+                expired_total = len(rows)
+        return expired_total
+
+    async def search_directory_aid_offers(
+        self,
+        kind: str,
+        query: str,
+        department: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[
+        list[
+            CommunityMealOfferDirectoryCard
+            | TemporaryShelterOfferDirectoryCard
+        ],
+        int,
+    ]:
+        # Solo la proyección pública activa, vigente y con capacidad;
+        # jamás se une con columnas privadas del expediente.
+        clauses = [
+            "p.publication_status = 'published'",
+            "p.availability_status = 'active'",
+            "p.available_from <= NOW()",
+            "p.available_until >= NOW()",
+            "p.available_units > 0",
+            "p.kind::text = $1",
+        ]
+        values: list[object] = [kind, query.strip()]
+        clauses.append(
+            """(
+            lower(unaccent(p.title)) LIKE
+                '%' || lower(unaccent($2)) || '%'
+            OR lower(unaccent(p.description)) LIKE
+                '%' || lower(unaccent($2)) || '%'
+            OR lower(unaccent(p.area_reference)) LIKE
+                '%' || lower(unaccent($2)) || '%'
+            OR lower(unaccent(p.municipality)) LIKE
+                '%' || lower(unaccent($2)) || '%'
+            OR lower(unaccent(p.department)) LIKE
+                '%' || lower(unaccent($2)) || '%'
+            )"""
+        )
+        if department is not None:
+            values.append(department.strip())
+            clauses.append(
+                f"lower(unaccent(p.department)) = "
+                f"lower(unaccent(${len(values)}))"
+            )
+        where_clause = "WHERE " + " AND ".join(clauses)
+        total = await self._pool.fetchval(
+            f"""
+            SELECT COUNT(*)
+            FROM disaster_service.aid_offer_publications p
+            {where_clause}
+            """,
+            *values,
+        )
+        limit_parameter = len(values) + 1
+        offset_parameter = len(values) + 2
+        rows = await self._pool.fetch(
+            f"""
+            SELECT
+                p.id, p.public_offer_code, p.kind::text AS kind,
+                p.title, p.description, p.area_reference,
+                p.municipality, p.department,
+                p.availability_status::text AS availability_status,
+                p.available_from, p.available_until, p.available_units,
+                p.distribution_mode::text AS distribution_mode,
+                p.meal_description, p.allergen_information,
+                p.shared_space, p.accepts_pets, p.accessibility_notes,
+                p.verification_status::text AS verification_status,
+                p.data_classification, p.updated_at,
+                s.name AS source_name,
+                s.source_type,
+                s.url AS source_url
+            FROM disaster_service.aid_offer_publications p
+            INNER JOIN disaster_service.sources s ON s.id = p.source_id
+            {where_clause}
+            ORDER BY p.updated_at DESC, p.id DESC
+            LIMIT ${limit_parameter} OFFSET ${offset_parameter}
+            """,
+            *values,
+            limit,
+            offset,
+        )
+        cards: list[
+            CommunityMealOfferDirectoryCard
+            | TemporaryShelterOfferDirectoryCard
+        ] = []
+        for row in rows:
+            source = SourceReference(
+                name=row["source_name"],
+                source_type=row["source_type"],
+                url=row["source_url"],
+            )
+            if row["kind"] == "community_meal":
+                cards.append(
+                    CommunityMealOfferDirectoryCard(
+                        id=row["id"],
+                        public_offer_code=row["public_offer_code"],
+                        title=row["title"],
+                        description=row["description"],
+                        area_reference=row["area_reference"],
+                        municipality=row["municipality"],
+                        department=row["department"],
+                        availability_status=row["availability_status"],
+                        available_from=row["available_from"],
+                        available_until=row["available_until"],
+                        servings_available=row["available_units"],
+                        distribution_mode=row["distribution_mode"],
+                        meal_description=row["meal_description"],
+                        allergen_information=row["allergen_information"],
+                        verification_status=row["verification_status"],
+                        source=source,
+                        updated_at=row["updated_at"],
+                        data_classification=row["data_classification"],
+                    )
+                )
+            else:
+                cards.append(
+                    TemporaryShelterOfferDirectoryCard(
+                        id=row["id"],
+                        public_offer_code=row["public_offer_code"],
+                        title=row["title"],
+                        description=row["description"],
+                        area_reference=row["area_reference"],
+                        municipality=row["municipality"],
+                        department=row["department"],
+                        availability_status=row["availability_status"],
+                        available_from=row["available_from"],
+                        available_until=row["available_until"],
+                        spaces_available=row["available_units"],
+                        shared_space=row["shared_space"],
+                        accepts_pets=row["accepts_pets"],
+                        accessibility_notes=row["accessibility_notes"],
+                        verification_status=row["verification_status"],
+                        source=source,
+                        updated_at=row["updated_at"],
+                        data_classification=row["data_classification"],
+                    )
+                )
+        return cards, int(total)
+
     # CHG-036 — Consola de superadministración (bandeja unificada,
     # mutaciones con versión y auditoría append-only).
 
@@ -1936,6 +2556,9 @@ class PostgresDisasterRepository:
             )
             if row is None:
                 continue
+            if meta["photo_table"] is None:
+                # CHG-044: las ofertas no llevan evidencia adjunta.
+                return kind, dict(row), []
             evidence = await self._pool.fetch(
                 f"""
                 SELECT id, content_type, size_bytes, malware_scan,
@@ -2126,6 +2749,17 @@ class PostgresDisasterRepository:
                     )
                 # unverified_building_report aceptado NO proyecta el
                 # mapa: DEC-012–DEC-014 pendientes (ver CHG-035).
+                # CHG-044: rechazar o archivar una oferta oculta su
+                # proyección en la misma transacción; la aceptación
+                # está bloqueada aguas arriba (DEC-020/DEC-021).
+                if action in ("reject", "archive") and kind in (
+                    "community_meal_offer",
+                    "temporary_shelter_offer",
+                ):
+                    await connection.execute(
+                        _OFFER_PUBLICATION_HIDE_SQL,
+                        submission_id,
+                    )
 
                 audit_event_id = await self._admin_audit(
                     connection,
@@ -2146,6 +2780,8 @@ class PostgresDisasterRepository:
         self, submission_id: UUID, evidence_id: UUID
     ) -> dict | None:
         for kind, meta in _ADMIN_TABLES.items():
+            if meta["photo_table"] is None:
+                continue
             row = await self._pool.fetchrow(
                 f"""
                 SELECT id, content_type, size_bytes, malware_scan,
@@ -2214,6 +2850,68 @@ class PostgresDisasterRepository:
             offset,
         )
         return [dict(row) for row in rows], int(total)
+
+
+# CHG-044 — Helpers de ofertas comunitarias.
+
+# Estado de moderación proyectado hacia el propietario y la consola:
+# archivo lógico y solicitud de información se superponen al dominio.
+_OFFER_MODERATION_EXPR = """
+    CASE
+        WHEN o.archived_at IS NOT NULL THEN 'archived'
+        WHEN o.needs_information THEN 'needs_information'
+        ELSE o.moderation_status::text
+    END
+"""
+
+# Columnas del resumen de propietario; el título viaja cifrado y lo
+# descifra la capa HTTP con la clave exclusiva de ofertas.
+_OFFER_OWNER_COLUMNS = f"""
+    o.id, o.tracking_code, o.kind::text AS kind,
+    o.title_encrypted,
+    ({_OFFER_MODERATION_EXPR}) AS moderation_status,
+    o.availability_status::text AS availability_status,
+    COALESCE(m.servings_available, t.spaces_available, 0)
+        AS available_units,
+    CASE o.kind::text
+        WHEN 'community_meal' THEN 'servings'
+        ELSE 'spaces'
+    END AS capacity_unit,
+    o.available_from, o.available_until, o.received_at,
+    o.updated_at, o.version
+"""
+
+
+def _offer_admin_kind(kind: str) -> str:
+    return (
+        "community_meal_offer"
+        if kind == "community_meal"
+        else "temporary_shelter_offer"
+    )
+
+
+def _aid_offer_receipt(row) -> AidOfferReceipt:
+    # Constancia estable al reintento: siempre informa la recepción
+    # original en revisión, aunque la moderación ya haya decidido.
+    return AidOfferReceipt(
+        id=row["id"],
+        tracking_code=row["tracking_code"],
+        kind=row["kind"],
+        moderation_status="under_review",
+        availability_status="scheduled",
+        received_at=row["received_at"],
+        version=row["version"],
+    )
+
+
+# Rechazar o archivar una oferta oculta su proyección pública en la
+# MISMA transacción (si existiera; la aceptación sigue bloqueada).
+_OFFER_PUBLICATION_HIDE_SQL = """
+    UPDATE disaster_service.aid_offer_publications
+    SET publication_status = 'withdrawn',
+        updated_at = NOW()
+    WHERE offer_id = $1
+"""
 
 
 # CHG-036 — Bandeja unificada: una fila por expediente, sin PII en el
@@ -2301,6 +2999,28 @@ _ADMIN_UNIFIED_CTE = """
     FROM disaster_service.aid_location_ratings t
     INNER JOIN disaster_service.aid_locations al
         ON al.id = t.location_id
+    UNION ALL
+    SELECT
+        o.id,
+        CASE o.kind::text
+            WHEN 'community_meal' THEN 'community_meal_offer'
+            ELSE 'temporary_shelter_offer'
+        END,
+        o.tracking_code,
+        CASE o.kind::text
+            WHEN 'community_meal' THEN 'Oferta de comida comunitaria'
+            ELSE 'Oferta de alojamiento temporal'
+        END,
+        o.municipality || ', ' || o.department,
+        'Oferta con cuenta',
+        o.moderation_status::text,
+        o.needs_information,
+        o.archived_at,
+        o.received_at,
+        o.updated_at,
+        o.version,
+        0
+    FROM disaster_service.aid_offers o
 """
 
 # Proyección del estado del dominio al estado administrativo unificado
@@ -2367,7 +3087,7 @@ _RATING_AGGREGATE_RECOMPUTE_SQL = """
 
 # Metadatos por tipo: tabla, columna de estado, valores de decisión,
 # tabla de evidencia y consulta de detalle.
-_ADMIN_TABLES: dict[str, dict[str, str]] = {
+_ADMIN_TABLES: dict[str, dict[str, str | None]] = {
     "missing_person_report": {
         "table": "disaster_service.missing_person_reports",
         "status_column": "status",
@@ -2436,6 +3156,47 @@ _ADMIN_TABLES: dict[str, dict[str, str]] = {
             "FROM disaster_service.aid_location_ratings t "
             "INNER JOIN disaster_service.aid_locations al "
             "ON al.id = t.location_id WHERE t.id = $1"
+        ),
+    },
+    # CHG-044 — Las ofertas no tienen evidencia fotográfica; ambas
+    # comparten tabla y se distinguen por `kind` en el detalle.
+    "community_meal_offer": {
+        "table": "disaster_service.aid_offers",
+        "status_column": "moderation_status",
+        "accepted_value": "accepted",
+        "rejected_value": "rejected",
+        "decided_columns": "decided_at = NOW()",
+        "photo_table": None,
+        "photo_fk": None,
+        "derived_column": None,
+        "detail_sql": (
+            "SELECT o.*, d.servings_available, d.distribution_mode, "
+            "d.meal_description_encrypted, "
+            "d.allergen_information_encrypted, d.food_safety_confirmed "
+            "FROM disaster_service.aid_offers o "
+            "INNER JOIN disaster_service.community_meal_offer_details d "
+            "ON d.offer_id = o.id "
+            "WHERE o.id = $1 AND o.kind = 'community_meal'"
+        ),
+    },
+    "temporary_shelter_offer": {
+        "table": "disaster_service.aid_offers",
+        "status_column": "moderation_status",
+        "accepted_value": "accepted",
+        "rejected_value": "rejected",
+        "decided_columns": "decided_at = NOW()",
+        "photo_table": None,
+        "photo_fk": None,
+        "derived_column": None,
+        "detail_sql": (
+            "SELECT o.*, d.spaces_available, d.shared_space, "
+            "d.accepts_pets, d.accessibility_notes_encrypted, "
+            "d.shelter_safety_confirmed "
+            "FROM disaster_service.aid_offers o "
+            "INNER JOIN "
+            "disaster_service.temporary_shelter_offer_details d "
+            "ON d.offer_id = o.id "
+            "WHERE o.id = $1 AND o.kind = 'temporary_shelter'"
         ),
     },
 }

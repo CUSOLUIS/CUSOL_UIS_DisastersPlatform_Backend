@@ -10,11 +10,20 @@ import asyncpg
 from cryptography.fernet import Fernet
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
+from pydantic import Field, TypeAdapter, ValidationError
 
 from . import admin as admin_rules
+from . import offers as offer_rules
 from .config import Settings
 from .models import (
+    AidOfferKind,
+    AidOfferModerationStatus,
+    AidOfferOwnerPage,
+    AidOfferOwnerSummary,
+    AidOfferOwnerUpdateInput,
+    AidOfferReceipt,
+    CommunityMealOfferInput,
+    TemporaryShelterOfferInput,
     AdminAuditEvent,
     AdminAuditPage,
     AdminDecisionInput,
@@ -65,13 +74,17 @@ from .photos import (
 )
 from .models import SourceReference
 from .repository import (
+    AidOfferIdempotencyConflictError,
     DisasterRepository,
     HumanMapCell,
     PostgresDisasterRepository,
+    StoredAidOffer,
     StoredBuildingReport,
+    StoredMealOfferDetails,
     StoredPhoto,
     StoredRating,
     StoredReport,
+    StoredShelterOfferDetails,
     StoredStatusReport,
 )
 from .storage import (
@@ -241,7 +254,111 @@ ADMIN_FIELD_SPECS: dict[str, list[tuple]] = {
         ("actorKind", "Tipo de aporte", "actor_kind", "private", None,
          "text"),
     ],
+    # CHG-044 — Ofertas comunitarias. Los campos sensibles se descifran
+    # con la clave EXCLUSIVA de ofertas (`decrypt_aid`), solo para la
+    # consola autorizada.
+    "community_meal_offer": [
+        ("trackingCode", "Código de seguimiento", "tracking_code",
+         "public", None, "text"),
+        ("title", "Título propuesto", "title_encrypted", "protected",
+         "decrypt_aid", "text"),
+        ("description", "Descripción propuesta",
+         "description_encrypted", "protected", "decrypt_aid",
+         "multiline"),
+        ("department", "Departamento", "department", "public", None,
+         "text"),
+        ("municipality", "Municipio", "municipality", "public", None,
+         "text"),
+        ("areaReference", "Referencia de zona",
+         "area_reference_encrypted", "protected", "decrypt_aid",
+         "text"),
+        ("exactAddress", "Dirección exacta",
+         "exact_address_encrypted", "protected", "decrypt_aid", "text"),
+        ("latitude", "Latitud privada", "latitude_encrypted",
+         "protected", "decrypt_aid", "number"),
+        ("longitude", "Longitud privada", "longitude_encrypted",
+         "protected", "decrypt_aid", "number"),
+        ("availableFrom", "Inicio de disponibilidad", "available_from",
+         "private", None, "date"),
+        ("availableUntil", "Fin de disponibilidad", "available_until",
+         "private", None, "date"),
+        ("availabilityStatus", "Disponibilidad",
+         "availability_status", "public", None, "text"),
+        ("servingsAvailable", "Raciones disponibles",
+         "servings_available", "public", None, "number"),
+        ("distributionMode", "Modalidad de entrega",
+         "distribution_mode", "public", None, "text"),
+        ("mealDescription", "Descripción de la comida",
+         "meal_description_encrypted", "protected", "decrypt_aid",
+         "multiline"),
+        ("allergenInformation", "Alérgenos",
+         "allergen_information_encrypted", "protected", "decrypt_aid",
+         "multiline"),
+        ("foodSafetyConfirmed", "Manipulación segura declarada",
+         "food_safety_confirmed", "public", None, "text"),
+        ("contactName", "Contacto", "contact_name_encrypted",
+         "protected", "decrypt_aid", "text"),
+        ("contactPhone", "Teléfono de contacto",
+         "contact_phone_encrypted", "protected", "decrypt_aid", "text"),
+        ("contactEmail", "Correo de contacto",
+         "contact_email_encrypted", "protected", "decrypt_aid",
+         "email"),
+    ],
+    "temporary_shelter_offer": [
+        ("trackingCode", "Código de seguimiento", "tracking_code",
+         "public", None, "text"),
+        ("title", "Título propuesto", "title_encrypted", "protected",
+         "decrypt_aid", "text"),
+        ("description", "Descripción propuesta",
+         "description_encrypted", "protected", "decrypt_aid",
+         "multiline"),
+        ("department", "Departamento", "department", "public", None,
+         "text"),
+        ("municipality", "Municipio", "municipality", "public", None,
+         "text"),
+        ("areaReference", "Referencia de zona",
+         "area_reference_encrypted", "protected", "decrypt_aid",
+         "text"),
+        ("exactAddress", "Dirección exacta",
+         "exact_address_encrypted", "protected", "decrypt_aid", "text"),
+        ("latitude", "Latitud privada", "latitude_encrypted",
+         "protected", "decrypt_aid", "number"),
+        ("longitude", "Longitud privada", "longitude_encrypted",
+         "protected", "decrypt_aid", "number"),
+        ("availableFrom", "Inicio de disponibilidad", "available_from",
+         "private", None, "date"),
+        ("availableUntil", "Fin de disponibilidad", "available_until",
+         "private", None, "date"),
+        ("availabilityStatus", "Disponibilidad",
+         "availability_status", "public", None, "text"),
+        ("spacesAvailable", "Espacios disponibles", "spaces_available",
+         "public", None, "number"),
+        ("sharedSpace", "Espacio compartido", "shared_space", "public",
+         None, "text"),
+        ("acceptsPets", "Acepta mascotas", "accepts_pets", "public",
+         None, "text"),
+        ("accessibilityNotes", "Notas de accesibilidad",
+         "accessibility_notes_encrypted", "protected", "decrypt_aid",
+         "multiline"),
+        ("shelterSafetyConfirmed", "Seguridad básica declarada",
+         "shelter_safety_confirmed", "public", None, "text"),
+        ("contactName", "Contacto", "contact_name_encrypted",
+         "protected", "decrypt_aid", "text"),
+        ("contactPhone", "Teléfono de contacto",
+         "contact_phone_encrypted", "protected", "decrypt_aid", "text"),
+        ("contactEmail", "Correo de contacto",
+         "contact_email_encrypted", "protected", "decrypt_aid",
+         "email"),
+    ],
 }
+
+# Unión discriminada del contrato para el ingreso de ofertas (CHG-044).
+AID_OFFER_INPUT_ADAPTER: TypeAdapter = TypeAdapter(
+    Annotated[
+        CommunityMealOfferInput | TemporaryShelterOfferInput,
+        Field(discriminator="kind"),
+    ]
+)
 
 
 def protect_missing_person(
@@ -396,6 +513,37 @@ def create_app(
             return None
         return fernet.encrypt(value.encode())
 
+    # CHG-044: clave EXCLUSIVA de ofertas desde un secreto montado. Si
+    # falta o es insegura, readiness cae y toda escritura de ofertas se
+    # rechaza con 503; el resto del servicio no la usa jamás.
+    aid_offer_fernet: Fernet | None = None
+    aid_offer_key_error: str | None = None
+    try:
+        aid_offer_fernet = build_fernet(
+            offer_rules.load_aid_offer_key(
+                resolved_settings.aid_offer_encryption_key_file
+            )
+        )
+    except offer_rules.AidOfferKeyError as error:
+        aid_offer_key_error = str(error)
+
+    def encrypt_aid(value: str | None) -> bytes | None:
+        if value is None or value == "":
+            return None
+        if aid_offer_fernet is None:
+            raise offer_rules.AidOfferKeyError(
+                aid_offer_key_error or "Clave de ofertas no disponible."
+            )
+        return aid_offer_fernet.encrypt(value.encode())
+
+    def aid_offer_key_unavailable() -> JSONResponse:
+        return problem(
+            503,
+            "Cifrado de ofertas no disponible",
+            "La clave de cifrado de ofertas no está disponible; "
+            "ningún dato quedó registrado.",
+        )
+
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         if repository is not None:
@@ -446,7 +594,8 @@ def create_app(
         except (asyncpg.PostgresError, TimeoutError):
             ready = False
 
-        if not ready:
+        # CHG-044: sin la clave de ofertas el servicio no está listo.
+        if not ready or aid_offer_fernet is None:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -1163,6 +1312,23 @@ def create_app(
                 limit,
                 offset,
             )
+        elif kind in ("community_meal", "temporary_shelter"):
+            # CHG-044: solo la proyección pública activa y vigente;
+            # los filtros de personas y lugares no aplican aquí.
+            if aid_filters or person_status is not None:
+                return problem(
+                    422,
+                    "Filtros inválidos",
+                    "Los filtros de personas o lugares no aplican a "
+                    "ofertas comunitarias.",
+                )
+            items, total = await data.search_directory_aid_offers(
+                kind,
+                q,
+                department,
+                limit,
+                offset,
+            )
         else:
             if person_status is not None:
                 return problem(
@@ -1624,6 +1790,279 @@ def create_app(
             cleanup()
         return receipt
 
+    # CHG-044 — Ofertas comunitarias de comida y alojamiento. El
+    # gateway resuelve la cuenta y la declara por encabezados internos;
+    # aquí se revalida como defensa en profundidad y jamás se acepta un
+    # accountId del cliente en ruta, query ni JSON.
+
+    def require_offer_account(
+        request: Request,
+    ) -> UUID | JSONResponse:
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401,
+                "Sesión requerida",
+                "Las ofertas exigen una cuenta autenticada resuelta "
+                "por el gateway.",
+            )
+        return account_id
+
+    def owner_summary_model(row: dict) -> AidOfferOwnerSummary:
+        title = decrypt_aid_text(row["title_encrypted"]) or ""
+        return AidOfferOwnerSummary(
+            id=row["id"],
+            tracking_code=row["tracking_code"],
+            kind=row["kind"],
+            title=(title.strip() or "Oferta comunitaria")[:160],
+            moderation_status=row["moderation_status"],
+            availability_status=row["availability_status"],
+            available_units=row["available_units"],
+            capacity_unit=row["capacity_unit"],
+            available_from=row["available_from"],
+            available_until=row["available_until"],
+            received_at=row["received_at"],
+            updated_at=row["updated_at"],
+            version=row["version"],
+        )
+
+    @application.post(
+        "/internal/v1/aid-offers",
+        status_code=202,
+        response_model=AidOfferReceipt,
+        response_model_by_alias=True,
+        tags=["AidOffers"],
+    )
+    async def create_aid_offer(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        account_id = require_offer_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        if aid_offer_fernet is None:
+            return aid_offer_key_unavailable()
+
+        body = await request.body()
+        try:
+            payload = AID_OFFER_INPUT_ADAPTER.validate_json(body)
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+
+        received_at = datetime.now(UTC)
+        if payload.available_until <= received_at:
+            return problem(
+                422,
+                "Vigencia inválida",
+                "availableUntil debe estar en el futuro.",
+            )
+
+        def encrypt_aid_number(value: float | None) -> bytes | None:
+            return None if value is None else encrypt_aid(repr(value))
+
+        offer = StoredAidOffer(
+            id=uuid4(),
+            tracking_code=offer_rules.generate_tracking_code(
+                received_at
+            ),
+            kind=payload.kind,
+            account_id=account_id,
+            # La llave jamás se persiste ni registra en claro.
+            idempotency_key_hash=offer_rules.idempotency_key_hash(
+                idempotency_key
+            ),
+            request_fingerprint=offer_rules.request_fingerprint(body),
+            related_disaster_id=payload.related_disaster_id,
+            title_encrypted=encrypt_aid(payload.title),
+            description_encrypted=encrypt_aid(payload.description),
+            area_reference_encrypted=encrypt_aid(
+                payload.area_reference
+            ),
+            exact_address_encrypted=encrypt_aid(payload.exact_address),
+            latitude_encrypted=encrypt_aid_number(payload.latitude),
+            longitude_encrypted=encrypt_aid_number(payload.longitude),
+            contact_name_encrypted=encrypt_aid(payload.contact_name),
+            contact_phone_encrypted=encrypt_aid(payload.contact_phone),
+            contact_email_encrypted=encrypt_aid(payload.contact_email),
+            department=payload.department,
+            municipality=payload.municipality,
+            available_from=payload.available_from,
+            available_until=payload.available_until,
+            consent_recorded_at=received_at,
+            legal_text_version=(
+                offer_rules.AID_OFFER_LEGAL_TEXT_VERSION
+            ),
+        )
+        meal: StoredMealOfferDetails | None = None
+        shelter: StoredShelterOfferDetails | None = None
+        if payload.kind == "community_meal":
+            meal = StoredMealOfferDetails(
+                servings_available=payload.servings_available,
+                distribution_mode=payload.distribution_mode,
+                meal_description_encrypted=encrypt_aid(
+                    payload.meal_description
+                ),
+                allergen_information_encrypted=encrypt_aid(
+                    payload.allergen_information
+                ),
+            )
+        else:
+            shelter = StoredShelterOfferDetails(
+                spaces_available=payload.spaces_available,
+                shared_space=payload.shared_space,
+                accepts_pets=payload.accepts_pets,
+                accessibility_notes_encrypted=encrypt_aid(
+                    payload.accessibility_notes
+                ),
+            )
+
+        try:
+            receipt, _created = await data.create_aid_offer(
+                offer, meal, shelter
+            )
+        except AidOfferIdempotencyConflictError:
+            return problem(
+                409,
+                "Idempotencia incompatible",
+                "La Idempotency-Key ya se usó con un contenido "
+                "distinto.",
+            )
+        except asyncpg.ForeignKeyViolationError:
+            return problem(
+                422,
+                "Datos inválidos",
+                "Revisa los campos: relatedDisasterId.",
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible registrar la oferta; ningún dato "
+                "quedó guardado.",
+            )
+        return receipt
+
+    @application.get(
+        "/internal/v1/aid-offers",
+        response_model=AidOfferOwnerPage,
+        response_model_by_alias=True,
+        tags=["AidOffers"],
+    )
+    async def list_owner_aid_offers(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        kind: Annotated[AidOfferKind | None, Query()] = None,
+        moderation_status: Annotated[
+            AidOfferModerationStatus | None,
+            Query(alias="moderationStatus"),
+        ] = None,
+        limit: Annotated[int, Query(ge=1, le=50)] = 10,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        account_id = require_offer_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        if limit not in (10, 25, 50):
+            return problem(
+                422,
+                "Paginación inválida",
+                "El tamaño de página debe ser 10, 25 o 50.",
+            )
+        rows, total = await data.list_owner_aid_offers(
+            account_id, kind, moderation_status, limit, offset
+        )
+        return AidOfferOwnerPage(
+            items=[owner_summary_model(row) for row in rows],
+            total=total,
+            limit=limit,
+            offset=offset,
+            generated_at=datetime.now(UTC),
+        )
+
+    @application.patch(
+        "/internal/v1/aid-offers/{offer_id}",
+        response_model=AidOfferOwnerSummary,
+        response_model_by_alias=True,
+        tags=["AidOffers"],
+    )
+    async def update_owner_aid_offer(
+        offer_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = require_offer_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        try:
+            payload = AidOfferOwnerUpdateInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        try:
+            outcome, row = await data.update_owner_aid_offer(
+                account_id,
+                offer_id,
+                payload.version,
+                payload.availability_status,
+                payload.available_units,
+                payload.available_from,
+                payload.available_until,
+            )
+        except offer_rules.OwnerTransitionError as error:
+            return problem(409, "Transición inválida", str(error))
+        except offer_rules.OwnerUpdateInvalidError as error:
+            return problem(422, "Actualización inválida", str(error))
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible actualizar la oferta.",
+            )
+        if outcome == "not_found":
+            # Oferta ajena e inexistente son indistinguibles.
+            return problem(
+                404,
+                "Oferta no disponible",
+                "La oferta no existe o no pertenece a la cuenta.",
+            )
+        if outcome == "version_conflict":
+            return problem(
+                409,
+                "Conflicto de versión",
+                "La oferta cambió; recarga y reintenta con la versión "
+                "vigente.",
+            )
+        return owner_summary_model(row)
+
+    @application.post(
+        "/internal/v1/aid-offers/expirations",
+        tags=["AidOffers"],
+    )
+    async def expire_aid_offers(
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        batch_size: Annotated[
+            int, Query(alias="batchSize", ge=1, le=500)
+        ] = 100,
+    ):
+        # Proceso idempotente por lotes (FOR UPDATE SKIP LOCKED): una
+        # segunda ejecución no duplica auditoría ni versión.
+        try:
+            expired = await data.expire_aid_offers(batch_size)
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible procesar las expiraciones.",
+            )
+        return JSONResponse(content={"expired": expired})
+
     # CHG-036 — Consola de superadministración (rutas internas).
     # El gateway es quien autentica la cookie; aquí se revalida el rol
     # recibido por encabezados internos como defensa en profundidad.
@@ -1636,6 +2075,17 @@ def create_app(
         except Exception:
             # Ciframiento ilegible (p. ej. datos semilla): jamás romper
             # el detalle ni filtrar bytes crudos.
+            return "[contenido protegido no legible]"
+
+    def decrypt_aid_text(value) -> str | None:
+        # CHG-044: clave exclusiva de ofertas, solo para la consola.
+        if value is None:
+            return None
+        if aid_offer_fernet is None:
+            return "[clave de ofertas no disponible]"
+        try:
+            return aid_offer_fernet.decrypt(bytes(value)).decode()
+        except Exception:
             return "[contenido protegido no legible]"
 
     def admin_actor(
@@ -1689,6 +2139,8 @@ def create_app(
             value = row.get(column)
             if transform == "decrypt":
                 value = decrypt_text(value)
+            elif transform == "decrypt_aid":
+                value = decrypt_aid_text(value)
             elif transform == "list" and value is not None:
                 value = ", ".join(value)
             display = "" if value is None else str(value)
@@ -1925,6 +2377,18 @@ def create_app(
                 409,
                 "Transición inválida",
                 "Un expediente archivado no se edita; restáuralo antes.",
+            )
+        # CHG-044: aceptar (y por tanto publicar) una oferta permanece
+        # BLOQUEADO hasta resolver DEC-020 y DEC-021.
+        if action == "accept" and summary_row["kind"] in (
+            "community_meal_offer",
+            "temporary_shelter_offer",
+        ):
+            return problem(
+                409,
+                "Aceptación bloqueada",
+                "La aceptación de ofertas comunitarias está bloqueada "
+                "hasta resolver DEC-020 y DEC-021.",
             )
         outcome, audit_event_id, new_version = (
             await data.admin_mutate_submission(

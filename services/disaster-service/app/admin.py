@@ -23,6 +23,9 @@ AdminSubmissionKind = Literal[
     "aid_location_rating",
     "collection_center_registration",
     "collection_point_registration",
+    # CHG-044 — ofertas comunitarias.
+    "community_meal_offer",
+    "temporary_shelter_offer",
 ]
 AdminModerationStatus = Literal[
     "under_review", "needs_information", "accepted", "rejected", "archived"
@@ -38,6 +41,8 @@ ACTIVE_KINDS: tuple[str, ...] = (
     "unverified_building_report",
     "person_status_report",
     "aid_location_rating",
+    "community_meal_offer",
+    "temporary_shelter_offer",
 )
 
 
@@ -120,6 +125,10 @@ EDITABLE_FIELDS: dict[str, dict[str, EditableField]] = {
     },
     "person_status_report": {},
     "aid_location_rating": {},
+    # CHG-044: la declaración del oferente no se edita jamás; solo se
+    # decide sobre ella (y la aceptación sigue bloqueada).
+    "community_meal_offer": {},
+    "temporary_shelter_offer": {},
 }
 
 

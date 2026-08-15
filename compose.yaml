@@ -36,9 +36,13 @@ services:
       WATCHFILES_FORCE_POLLING: "true"
       UPLOAD_DIR: /data/uploads
       REPORT_ENCRYPTION_KEY: ${REPORT_ENCRYPTION_KEY:-dev-local-only-report-key}
+      # CHG-044: clave EXCLUSIVA de ofertas montada como secreto; aquí
+      # solo viaja la ruta. Sin el archivo, readiness cae a propósito.
+      AID_OFFER_ENCRYPTION_KEY_FILE: /run/secrets/cusol/aid_offer_key
     volumes:
       - ./services/disaster-service/app:/app/app:ro
       - report-uploads:/data/uploads
+      - ${HOME}/.cusol-secrets:/run/secrets/cusol:ro
     depends_on:
       disasters-db:
         condition: service_healthy

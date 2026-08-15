@@ -15,6 +15,11 @@ from .config import Settings
 from .models import (
     AccountRegistrationReceipt,
     AccountRole,
+    AidOfferKind,
+    AidOfferModerationStatus,
+    AidOfferOwnerPage,
+    AidOfferOwnerSummary,
+    AidOfferReceipt,
     AdminAccountDetail,
     AdminAccountPage,
     AdminAccountStatus,
@@ -128,7 +133,8 @@ def create_app(
         CORSMiddleware,
         allow_origins=list(resolved_settings.allowed_origins),
         allow_credentials=True,
-        allow_methods=["GET", "POST", "DELETE"],
+        # CHG-044: PATCH para la gestión de ofertas del propietario.
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["Content-Type", "Idempotency-Key"],
     )
 
@@ -167,6 +173,13 @@ def create_app(
     )
     admin_evidence_limiter = SlidingWindowRateLimiter(
         resolved_settings.admin_evidence_rate_limit_per_minute
+    )
+    # CHG-044: límites separados de ofertas comunitarias por cuenta.
+    aid_offer_write_limiter = SlidingWindowRateLimiter(
+        resolved_settings.aid_offer_write_rate_limit_per_minute
+    )
+    aid_offer_read_limiter = SlidingWindowRateLimiter(
+        resolved_settings.aid_offer_read_rate_limit_per_minute
     )
 
     def get_client(request: Request) -> httpx.AsyncClient:
@@ -1648,6 +1661,238 @@ def create_app(
                 "No fue posible consultar el directorio en este momento.",
                 title="Directorio no disponible",
             )
+
+    # CHG-044 — Ofertas comunitarias de comida y alojamiento. Siempre
+    # autenticadas: el gateway resuelve la cuenta y la declara por
+    # encabezados internos; el cuerpo del cliente jamás elige cuenta.
+
+    async def forward_aid_offer(
+        upstream: httpx.AsyncClient,
+        method: str,
+        path: str,
+        account_id: UUID,
+        model,
+        params=None,
+        body: bytes | None = None,
+        extra_headers: dict[str, str] | None = None,
+        success_status: int = 200,
+    ):
+        headers = {
+            "x-actor-kind": "authenticated",
+            "x-account-id": str(account_id),
+            **(extra_headers or {}),
+        }
+        if body is not None:
+            headers["content-type"] = "application/json"
+        try:
+            response = await upstream.request(
+                method,
+                path,
+                params=params,
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=success_status,
+                content=model.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible procesar la oferta en este momento; "
+                "ningún dato quedó registrado.",
+                title="Servicio de ofertas no disponible",
+            )
+
+    @application.post(
+        "/api/v1/me/aid-offers",
+        status_code=202,
+        response_model=AidOfferReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Origen no permitido"},
+            409: {"description": "Idempotency-Key con otro contenido"},
+            413: {"description": "Cuerpo demasiado grande"},
+            415: {"description": "Tipo de contenido no permitido"},
+            422: {"description": "Oferta inválida"},
+            429: {"description": "Límite de ofertas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_authenticated_aid_offer(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not aid_offer_write_limiter.allow(
+            f"aid-offer:{account.id}"
+        ):
+            return rate_limited_response(
+                "Se superó el límite de ofertas por minuto."
+            )
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        content_type = request.headers.get("content-type", "")
+        if not content_type.strip().lower().startswith(
+            "application/json"
+        ):
+            return problem_response(
+                "El cuerpo debe ser application/json.",
+                title="Tipo de contenido no permitido",
+                status_code=415,
+                problem_type="unsupported-media-type",
+            )
+        declared = request.headers.get("content-length")
+        if declared is not None and declared.isdigit():
+            if int(declared) > resolved_settings.max_aid_offer_body_bytes:
+                return problem_response(
+                    "El envío supera el máximo permitido.",
+                    title="Carga demasiado grande",
+                    status_code=413,
+                    problem_type="payload-too-large",
+                )
+        body = await request.body()
+        if len(body) > resolved_settings.max_aid_offer_body_bytes:
+            return problem_response(
+                "El envío supera el máximo permitido.",
+                title="Carga demasiado grande",
+                status_code=413,
+                problem_type="payload-too-large",
+            )
+        return await forward_aid_offer(
+            upstream,
+            "POST",
+            "/internal/v1/aid-offers",
+            account.id,
+            AidOfferReceipt,
+            body=body,
+            extra_headers={"idempotency-key": idempotency_key},
+            success_status=202,
+        )
+
+    @application.get(
+        "/api/v1/me/aid-offers",
+        response_model=AidOfferOwnerPage,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            422: {"description": "Filtros o paginación inválidos"},
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_my_aid_offers(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+        kind: Annotated[AidOfferKind | None, Query()] = None,
+        moderation_status: Annotated[
+            AidOfferModerationStatus | None,
+            Query(alias="moderationStatus"),
+        ] = None,
+        limit: Annotated[int, Query(ge=1, le=50)] = 10,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not aid_offer_read_limiter.allow(f"aid-offer:{account.id}"):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        if limit not in (10, 25, 50):
+            return problem_response(
+                "El tamaño de página debe ser 10, 25 o 50.",
+                title="Paginación inválida",
+                status_code=422,
+                problem_type="invalid-parameters",
+            )
+        params: list[tuple[str, str]] = [
+            ("limit", str(limit)),
+            ("offset", str(offset)),
+        ]
+        if kind is not None:
+            params.append(("kind", kind))
+        if moderation_status is not None:
+            params.append(("moderationStatus", moderation_status))
+        return await forward_aid_offer(
+            upstream,
+            "GET",
+            "/internal/v1/aid-offers",
+            account.id,
+            AidOfferOwnerPage,
+            params=params,
+        )
+
+    @application.patch(
+        "/api/v1/me/aid-offers/{offer_id}",
+        response_model=AidOfferOwnerSummary,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Origen no permitido"},
+            404: {"description": "Oferta inexistente o ajena"},
+            409: {"description": "Versión o transición inválidas"},
+            422: {"description": "Actualización inválida"},
+            429: {"description": "Límite de actualizaciones excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def update_my_aid_offer(
+        offer_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not aid_offer_write_limiter.allow(
+            f"aid-offer:{account.id}"
+        ):
+            return rate_limited_response(
+                "Se superó el límite de actualizaciones por minuto."
+            )
+        body = await request.body()
+        return await forward_aid_offer(
+            upstream,
+            "PATCH",
+            f"/internal/v1/aid-offers/{offer_id}",
+            account.id,
+            AidOfferOwnerSummary,
+            body=body,
+        )
 
     @application.post(
         "/api/v1/public/missing-persons/{person_id}/status-reports",
