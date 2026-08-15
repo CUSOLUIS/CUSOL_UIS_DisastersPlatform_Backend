@@ -1217,7 +1217,7 @@ class PostgresDisasterRepository:
                             report.last_seen_latitude,
                             self.MISSING_PERSON_SOURCE_ID,
                         )
-                    await connection.execute(
+                    case_id = await connection.fetchval(
                         """
                         INSERT INTO
                             disaster_service.missing_person_cases (
@@ -1232,6 +1232,7 @@ class PostgresDisasterRepository:
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                             $11, $12, 'published', 'operational'
                         )
+                        RETURNING id
                         """,
                         report.public_case_code,
                         display_name,
@@ -1246,6 +1247,39 @@ class PostgresDisasterRepository:
                         report.distinctive_marks,
                         map_point_id,
                     )
+                    # CHG-084: el caso publicado también alimenta la
+                    # "situación humana" — fila en people (cifras y
+                    # tabla del dashboard) y, con coordenadas, la
+                    # proyección humana del mapa (approximate).
+                    person_row_id = await connection.fetchval(
+                        """
+                        INSERT INTO disaster_service.people (
+                            source_id, display_name, status, location,
+                            related_event, latitude, longitude,
+                            missing_person_case_id
+                        ) VALUES (
+                            $1, $2, 'missing', $3, $4, $5, $6, $7
+                        )
+                        RETURNING id
+                        """,
+                        self.MISSING_PERSON_SOURCE_ID,
+                        display_name,
+                        f"{report.municipality}, {report.department}",
+                        "Reporte ciudadano de persona desaparecida",
+                        report.last_seen_latitude,
+                        report.last_seen_longitude,
+                        case_id,
+                    )
+                    if (
+                        report.last_seen_latitude is not None
+                        and report.last_seen_longitude is not None
+                    ):
+                        await connection.execute(
+                            _PEOPLE_PROJECTION_INSERT_SQL,
+                            person_row_id,
+                            report.last_seen_longitude,
+                            report.last_seen_latitude,
+                        )
                     await connection.execute(
                         """
                         INSERT INTO disaster_service.missing_person_audit (
@@ -1620,6 +1654,11 @@ class PostgresDisasterRepository:
                         _PERSON_PUBLIC_STATUS_BY_PERSON_SQL,
                         report.person_id,
                     )
+                    # CHG-084: el estado humano acompaña al caso.
+                    await connection.execute(
+                        _PEOPLE_STATUS_BY_PERSON_SQL,
+                        report.person_id,
+                    )
                     for photo in photos:
                         await connection.execute(
                             """
@@ -1796,6 +1835,11 @@ class PostgresDisasterRepository:
                 # (admin > sector salud > umbral comunitario).
                 await connection.execute(
                     _PERSON_PUBLIC_STATUS_BY_PERSON_SQL,
+                    current["person_id"],
+                )
+                # CHG-084: el estado humano acompaña al caso.
+                await connection.execute(
+                    _PEOPLE_STATUS_BY_PERSON_SQL,
                     current["person_id"],
                 )
                 await connection.execute(
@@ -3242,6 +3286,11 @@ class PostgresDisasterRepository:
                         _PERSON_PROJECTION_RECOMPUTE_SQL,
                         submission_id,
                     )
+                    # CHG-084: el estado humano acompaña al caso.
+                    await connection.execute(
+                        _PEOPLE_STATUS_BY_NOVELTY_SQL,
+                        submission_id,
+                    )
                 if action in ("accept", "reject") and kind == (
                     "aid_location_rating"
                 ):
@@ -3271,6 +3320,12 @@ class PostgresDisasterRepository:
                                 _PERSON_MAP_POINT_HIDE_SQL,
                                 submission_id,
                             )
+                            # CHG-084: la fila humana también se
+                            # retira (la proyección cae en cascada).
+                            await connection.execute(
+                                _PEOPLE_HIDE_SQL,
+                                submission_id,
+                            )
                         else:  # accept / restore
                             point_id = await connection.fetchval(
                                 _PERSON_MAP_POINT_RESTORE_SQL,
@@ -3282,6 +3337,24 @@ class PostgresDisasterRepository:
                                     _PERSON_MAP_POINT_LINK_SQL,
                                     submission_id,
                                     point_id,
+                                )
+                            # CHG-084: recrear la fila humana y su
+                            # proyección si quedó sin ellas.
+                            restored = await connection.fetchrow(
+                                _PEOPLE_RESTORE_SQL,
+                                submission_id,
+                                self.MISSING_PERSON_SOURCE_ID,
+                            )
+                            if (
+                                restored is not None
+                                and restored["latitude"] is not None
+                                and restored["longitude"] is not None
+                            ):
+                                await connection.execute(
+                                    _PEOPLE_PROJECTION_INSERT_SQL,
+                                    restored["id"],
+                                    restored["longitude"],
+                                    restored["latitude"],
                                 )
                 # unverified_building_report aceptado NO proyecta el
                 # mapa: DEC-012–DEC-014 pendientes (ver CHG-035).
@@ -3707,6 +3780,85 @@ _CASE_PUBLICATION_BY_ACTION = {
     "reject": "rejected",
     "archive": "withdrawn",
 }
+
+# CHG-084 — Proyección humana del caso: fila en people (cifras y
+# tabla) y punto 'approximate' en people_map_projection (DEC-007
+# prohíbe 'exact').
+_PEOPLE_PROJECTION_INSERT_SQL = """
+    INSERT INTO disaster_service.people_map_projection (
+        person_id, location, coordinate_precision,
+        verification_status, visibility, data_classification,
+        updated_at
+    ) VALUES (
+        $1,
+        ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography,
+        'approximate', 'unverified', 'published', 'operational', NOW()
+    )
+    ON CONFLICT (person_id) DO NOTHING
+"""
+
+# CHG-084 — El estado público del caso (missing/found/deceased) se
+# refleja en people.status: found→confirmed_alive (la comunidad o el
+# equipo la dieron por encontrada) y deceased→reported_deceased (la
+# plataforma no certifica fallecimientos oficialmente).
+_PEOPLE_STATUS_CASE_EXPRESSION = """
+    (CASE mc.public_status::text
+        WHEN 'found' THEN 'confirmed_alive'
+        WHEN 'deceased' THEN 'reported_deceased'
+        ELSE 'missing'
+    END)::disaster_service.human_status
+"""
+
+_PEOPLE_STATUS_BY_PERSON_SQL = f"""
+    UPDATE disaster_service.people p
+    SET status = {_PEOPLE_STATUS_CASE_EXPRESSION}
+    FROM disaster_service.missing_person_cases mc
+    WHERE mc.id = $1
+      AND p.missing_person_case_id = mc.id
+"""
+
+_PEOPLE_STATUS_BY_NOVELTY_SQL = f"""
+    UPDATE disaster_service.people p
+    SET status = {_PEOPLE_STATUS_CASE_EXPRESSION}
+    FROM disaster_service.missing_person_cases mc
+    WHERE mc.id = (
+        SELECT person_id
+        FROM disaster_service.person_status_reports
+        WHERE id = $1
+    )
+      AND p.missing_person_case_id = mc.id
+"""
+
+# CHG-084 — Retirar el caso borra su fila humana (la proyección cae
+# en cascada); republicar la recrea desde el caso y el expediente.
+_PEOPLE_HIDE_SQL = """
+    DELETE FROM disaster_service.people p
+    USING disaster_service.missing_person_cases mc,
+          disaster_service.missing_person_reports r
+    WHERE r.id = $1
+      AND mc.public_case_code = r.public_case_code
+      AND p.missing_person_case_id = mc.id
+"""
+
+_PEOPLE_RESTORE_SQL = f"""
+    INSERT INTO disaster_service.people (
+        source_id, display_name, status, location, related_event,
+        latitude, longitude, missing_person_case_id
+    )
+    SELECT $2, mc.display_name, {_PEOPLE_STATUS_CASE_EXPRESSION},
+           mc.municipality || ', ' || mc.department,
+           'Reporte ciudadano de persona desaparecida',
+           r.last_seen_latitude, r.last_seen_longitude, mc.id
+    FROM disaster_service.missing_person_cases mc
+    INNER JOIN disaster_service.missing_person_reports r
+        ON mc.public_case_code = r.public_case_code
+    WHERE r.id = $1
+      AND NOT EXISTS (
+          SELECT 1 FROM disaster_service.people p
+          WHERE p.missing_person_case_id = mc.id
+      )
+    RETURNING id, latitude, longitude
+"""
 
 # CHG-081 — Retirar el caso también retira su punto del mapa: se
 # desvincula y se borra en la misma sentencia (el chequeo de la FK
