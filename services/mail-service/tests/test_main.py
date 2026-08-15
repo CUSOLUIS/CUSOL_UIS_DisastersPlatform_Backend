@@ -196,3 +196,57 @@ async def test_smtp_failure_raises_delivery_error(monkeypatch):
         await SmtpDeliverer(settings).deliver(
             "persona@example.com", email
         )
+
+
+# CHG-054 — Novedad del avance de un reporte hecho con cuenta.
+
+
+def report_status_payload(**overrides):
+    payload = {
+        "recipient": "persona@example.com",
+        "reportLabel": "Reporte de edificio sin verificar",
+        "trackingCode": "BR-2026-AAAA1111",
+        "statusLabel": "Fue revisado y aceptado por el equipo.",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_report_status_email_accepted():
+    deliverer = RecordingDeliverer()
+    client = make_client(deliverer)
+
+    response = client.post(
+        "/internal/v1/report-status-emails", json=report_status_payload()
+    )
+
+    assert response.status_code == 202
+    recipient, email = deliverer.sent[0]
+    assert recipient == "persona@example.com"
+    assert "BR-2026-AAAA1111" in email.subject
+    assert "aceptado" in email.text_body
+    assert "BR-2026-AAAA1111" in email.html_body
+    assert "prioridad de revisión" in email.text_body
+
+
+def test_report_status_email_invalid_recipient():
+    client = make_client(RecordingDeliverer())
+
+    response = client.post(
+        "/internal/v1/report-status-emails",
+        json=report_status_payload(recipient="no-es-correo"),
+    )
+
+    assert response.status_code == 422
+
+
+def test_report_status_email_delivery_error_is_503():
+    client = make_client(
+        RecordingDeliverer(error=DeliveryError("SMTP caído"))
+    )
+
+    response = client.post(
+        "/internal/v1/report-status-emails", json=report_status_payload()
+    )
+
+    assert response.status_code == 503

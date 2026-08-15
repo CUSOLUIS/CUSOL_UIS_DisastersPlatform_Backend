@@ -101,6 +101,8 @@ class StoredReport:
     reporter_phone_encrypted: bytes | None
     reporter_email_encrypted: bytes | None
     official_report_number: str | None
+    # CHG-054: identidad opaca del reportante con sesión (o None).
+    reporter_account_id: UUID | None = None
 
 
 # CHG-035 — Expediente privado de edificio; lo sensible llega cifrado
@@ -966,12 +968,13 @@ class PostgresDisasterRepository:
                             reporter_phone_encrypted,
                             reporter_email_encrypted,
                             official_report_number,
-                            last_seen_latitude, last_seen_longitude
+                            last_seen_latitude, last_seen_longitude,
+                            reporter_account_id
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                             $11, $12, $13, $14, $15, $16, $17, $18, $19,
                             $20, $21, $22, $23, $24, $25, $26, $27, $28,
-                            $29, $30, $31, $32, $33, $34
+                            $29, $30, $31, $32, $33, $34, $35
                         )
                         RETURNING id, public_case_code, status, received_at
                         """,
@@ -1009,6 +1012,7 @@ class PostgresDisasterRepository:
                         report.official_report_number,
                         report.last_seen_latitude,
                         report.last_seen_longitude,
+                        report.reporter_account_id,
                     )
                     for photo in photos:
                         await connection.execute(
@@ -2482,13 +2486,16 @@ class PostgresDisasterRepository:
             {base}
             SELECT * FROM classified
             {where_clause}
-            ORDER BY received_at DESC, id DESC
+            ORDER BY (account_id IS NOT NULL) DESC,
+                     received_at DESC, id DESC
             LIMIT ${limit_parameter} OFFSET ${offset_parameter}
             """,
             *values,
             limit,
             offset,
         )
+        # CHG-054: los envíos hechos con cuenta van primero en la
+        # bandeja (prioridad de revisión sobre los anónimos).
         return [dict(row) for row in rows], int(total)
 
     async def admin_submissions_overview(self) -> dict:
@@ -2923,7 +2930,11 @@ _ADMIN_UNIFIED_CTE = """
         r.public_case_code AS tracking_code,
         'Reporte de persona desaparecida' AS title,
         r.municipality || ', ' || r.department AS location_label,
-        'Reporte ciudadano' AS source_label,
+        CASE
+            WHEN r.reporter_account_id IS NOT NULL
+                THEN 'Reporte con cuenta'
+            ELSE 'Reporte anónimo'
+        END AS source_label,
         r.status::text AS domain_status,
         r.needs_information,
         r.archived_at,
@@ -2932,7 +2943,8 @@ _ADMIN_UNIFIED_CTE = """
         r.version,
         (SELECT COUNT(*)
          FROM disaster_service.missing_person_report_photos p
-         WHERE p.report_id = r.id)::int AS evidence_count
+         WHERE p.report_id = r.id)::int AS evidence_count,
+        r.reporter_account_id AS account_id
     FROM disaster_service.missing_person_reports r
     UNION ALL
     SELECT
@@ -2941,7 +2953,11 @@ _ADMIN_UNIFIED_CTE = """
         b.public_tracking_code,
         left('Edificio sin verificar — ' || b.building_reference, 200),
         b.municipality || ', ' || b.department,
-        'Reporte ciudadano',
+        CASE
+            WHEN b.actor_account_id IS NOT NULL
+                THEN 'Reporte con cuenta'
+            ELSE 'Reporte anónimo'
+        END,
         b.moderation_status::text,
         b.needs_information,
         b.archived_at,
@@ -2950,7 +2966,8 @@ _ADMIN_UNIFIED_CTE = """
         b.version,
         (SELECT COUNT(*)
          FROM disaster_service.unverified_building_report_files f
-         WHERE f.report_id = b.id)::int
+         WHERE f.report_id = b.id)::int,
+        b.actor_account_id
     FROM disaster_service.unverified_building_reports b
     UNION ALL
     SELECT
@@ -2974,7 +2991,8 @@ _ADMIN_UNIFIED_CTE = """
         s.version,
         (SELECT COUNT(*)
          FROM disaster_service.person_status_report_photos p
-         WHERE p.report_id = s.id)::int
+         WHERE p.report_id = s.id)::int,
+        s.account_id
     FROM disaster_service.person_status_reports s
     UNION ALL
     SELECT
@@ -2995,7 +3013,8 @@ _ADMIN_UNIFIED_CTE = """
         t.version,
         (SELECT COUNT(*)
          FROM disaster_service.aid_location_rating_photos p
-         WHERE p.rating_id = t.id)::int
+         WHERE p.rating_id = t.id)::int,
+        t.account_id
     FROM disaster_service.aid_location_ratings t
     INNER JOIN disaster_service.aid_locations al
         ON al.id = t.location_id
@@ -3019,7 +3038,8 @@ _ADMIN_UNIFIED_CTE = """
         o.received_at,
         o.updated_at,
         o.version,
-        0
+        0,
+        o.account_id
     FROM disaster_service.aid_offers o
 """
 

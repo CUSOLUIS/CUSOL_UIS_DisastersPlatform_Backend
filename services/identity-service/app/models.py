@@ -90,6 +90,21 @@ class EmailVerificationReceipt(ApiModel):
     verified_at: datetime
 
 
+# CHG-054 — Novedad del avance de un reporte para el dueño de la cuenta.
+class ReportStatusNotificationInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    account_id: UUID
+    report_label: str = Field(min_length=3, max_length=120)
+    tracking_code: str = Field(min_length=3, max_length=80)
+    status_label: str = Field(min_length=3, max_length=300)
+
+
 class AccountSessionInput(ApiModel):
     model_config = ConfigDict(
         alias_generator=to_camel,

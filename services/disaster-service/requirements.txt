@@ -5,3 +5,4 @@ python-multipart==0.0.20
 pillow==11.3.0
 pillow-heif==0.22.0
 cryptography==45.0.3
+httpx==0.28.1

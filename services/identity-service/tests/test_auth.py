@@ -155,6 +155,19 @@ class CaptureMailer:
             }
         )
 
+    async def send_report_status(
+        self, recipient, report_label, tracking_code, status_label
+    ) -> None:
+        # CHG-054: novedades de reportes con cuenta.
+        self.sent.append(
+            {
+                "recipient": recipient,
+                "report_label": report_label,
+                "tracking_code": tracking_code,
+                "status_label": status_label,
+            }
+        )
+
 
 def build_app(repository=None, mailer=None):
     return (
@@ -615,3 +628,57 @@ async def test_me_valid_expired_and_revoked_sessions():
 
     missing = await request(app, "GET", "/internal/v1/auth/me")
     assert missing.status_code == 401
+
+
+# CHG-054 — Notificación del avance de un reporte con cuenta.
+
+
+@pytest.mark.anyio
+async def test_report_status_notification_uses_account_email():
+    repository = FakeIdentityRepository()
+    mailer = CaptureMailer()
+    app = build_app(repository, mailer)
+    await register_and_activate(app, repository, mailer)
+    account = await repository.get_account_by_email(
+        "ana.rojas@example.com"
+    )
+
+    response = await request(
+        app,
+        "POST",
+        "/internal/v1/notifications/report-status",
+        json={
+            "accountId": str(account.id),
+            "reportLabel": "Reporte de edificio sin verificar",
+            "trackingCode": "BR-2026-AAAA1111",
+            "statusLabel": "Fue revisado y aceptado por el equipo.",
+        },
+    )
+
+    assert response.status_code == 202
+    notice = mailer.sent[-1]
+    assert notice["recipient"] == "ana.rojas@example.com"
+    assert notice["tracking_code"] == "BR-2026-AAAA1111"
+    assert "aceptado" in notice["status_label"]
+
+
+@pytest.mark.anyio
+async def test_report_status_notification_unknown_account_is_404():
+    repository = FakeIdentityRepository()
+    mailer = CaptureMailer()
+    app = build_app(repository, mailer)
+
+    response = await request(
+        app,
+        "POST",
+        "/internal/v1/notifications/report-status",
+        json={
+            "accountId": "99999999-9999-4999-8999-999999999999",
+            "reportLabel": "Reporte de edificio sin verificar",
+            "trackingCode": "BR-2026-AAAA1111",
+            "statusLabel": "Fue revisado y aceptado por el equipo.",
+        },
+    )
+
+    assert response.status_code == 404
+    assert all("tracking_code" not in item for item in mailer.sent)

@@ -752,6 +752,9 @@ def create_app(
     async def create_missing_person_report(
         request: Request,
         upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
     ):
         if not reports_limiter.allow(client_key(request)):
             return rate_limited_response(
@@ -779,6 +782,15 @@ def create_app(
                     problem_type="payload-too-large",
                 )
 
+        # CHG-054: si hay sesión válida, el reporte queda vinculado a
+        # la cuenta (notificaciones y prioridad); sin sesión sigue
+        # siendo anónimo y el canal jamás exige autenticación.
+        account = await resolve_optional_account(request, identity)
+        actor_headers_optional = (
+            {"x-actor-kind": "authenticated", "x-account-id": str(account.id)}
+            if account is not None
+            else {"x-actor-kind": "anonymous"}
+        )
         body = await request.body()
         try:
             response = await upstream.post(
@@ -789,6 +801,7 @@ def create_app(
                         "content-type", ""
                     ),
                     "idempotency-key": idempotency_key,
+                    **actor_headers_optional,
                 },
             )
             if 400 <= response.status_code < 500:
@@ -822,6 +835,26 @@ def create_app(
                 problem_type="origin-not-allowed",
             )
         return None
+
+    async def resolve_optional_account(
+        request: Request, identity: httpx.AsyncClient
+    ) -> AuthenticatedAccount | None:
+        """CHG-054: cuenta de la sesión si existe y es válida; None en
+        cualquier otro caso. Jamás convierte un canal público en uno
+        que exija sesión ni falla el envío por problemas de identidad."""
+        token = request.cookies.get(SESSION_COOKIE)
+        if not token:
+            return None
+        try:
+            response = await identity.get(
+                "/internal/v1/auth/me",
+                headers={"X-Session-Token": token},
+            )
+            if response.status_code != 200:
+                return None
+            return AuthenticatedAccount.model_validate(response.json())
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return None
 
     async def resolve_account(
         request: Request, identity: httpx.AsyncClient
@@ -1562,6 +1595,9 @@ def create_app(
     async def create_unverified_building_report(
         request: Request,
         upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
     ):
         if not building_reports_limiter.allow(client_key(request)):
             return rate_limited_response(
@@ -1586,13 +1622,20 @@ def create_app(
                     status_code=413,
                     problem_type="payload-too-large",
                 )
+        # CHG-054: cuenta opcional de la sesión; el canal sigue siendo
+        # público y jamás exige autenticación.
+        account = await resolve_optional_account(request, identity)
         # Reenvío multipart en streaming: el gateway no interpreta el
         # cuerpo, no registra sus partes y no reenvía cookies.
         headers = {
             "content-type": request.headers.get("content-type", ""),
             "idempotency-key": idempotency_key,
-            "x-actor-kind": "anonymous",
+            "x-actor-kind": (
+                "authenticated" if account is not None else "anonymous"
+            ),
         }
+        if account is not None:
+            headers["x-account-id"] = str(account.id)
         try:
             response = await upstream.post(
                 "/internal/v1/unverified-building-reports",

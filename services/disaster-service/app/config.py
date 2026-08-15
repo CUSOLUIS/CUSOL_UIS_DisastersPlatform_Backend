@@ -19,6 +19,10 @@ class Settings:
     aid_offer_encryption_key_file: str = (
         "/run/secrets/cusol/aid_offer_key"
     )
+    # CHG-054: identity-service entrega las novedades de reportes con
+    # cuenta (dueño de los correos de los titulares).
+    identity_service_url: str = "http://identity-service:8002"
+    notification_timeout_seconds: float = 5.0
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -44,5 +48,11 @@ class Settings:
             aid_offer_encryption_key_file=os.getenv(
                 "AID_OFFER_ENCRYPTION_KEY_FILE",
                 "/run/secrets/cusol/aid_offer_key",
+            ),
+            identity_service_url=os.getenv(
+                "IDENTITY_SERVICE_URL", "http://identity-service:8002"
+            ).rstrip("/"),
+            notification_timeout_seconds=float(
+                os.getenv("NOTIFICATION_TIMEOUT_SECONDS", "5")
             ),
         )

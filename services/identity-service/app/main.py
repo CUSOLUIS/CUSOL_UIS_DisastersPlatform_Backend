@@ -37,6 +37,7 @@ from .models import (
     EmailVerificationInput,
     EmailVerificationEnvelope,
     HealthStatus,
+    ReportStatusNotificationInput,
     SessionEnvelope,
 )
 from .repository import (
@@ -322,6 +323,48 @@ def create_app(
             account=authenticated_account(account, session_expires_at),
             session_token=session_token,
             session_expires_at=session_expires_at,
+        )
+
+    @application.post(
+        "/internal/v1/notifications/report-status",
+        status_code=202,
+        tags=["Notifications"],
+    )
+    async def notify_report_status(
+        request: Request,
+        data: Annotated[IdentityRepository, Depends(get_repository)],
+    ):
+        # CHG-054: disaster-service avisa el avance de un reporte hecho
+        # con cuenta; el correo del titular jamás sale de este servicio.
+        try:
+            payload = ReportStatusNotificationInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return validation_problem(error)
+
+        account = await data.get_account_by_id(payload.account_id)
+        if account is None:
+            return problem(
+                404,
+                "Cuenta no disponible",
+                "La cuenta indicada no existe.",
+            )
+        try:
+            await outbound_mailer.send_report_status(
+                account.email,
+                payload.report_label,
+                payload.tracking_code,
+                payload.status_label,
+            )
+        except Exception:
+            return problem(
+                503,
+                "Notificación no disponible",
+                "No fue posible entregar la novedad del reporte.",
+            )
+        return JSONResponse(
+            status_code=202, content={"status": "accepted"}
         )
 
     @application.post(

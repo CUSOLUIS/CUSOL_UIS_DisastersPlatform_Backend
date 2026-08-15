@@ -14,7 +14,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .config import Settings
 from .delivery import Deliverer, DeliveryError, SmtpDeliverer
-from .templates import render_verification_email
+from .templates import (
+    render_report_status_email,
+    render_verification_email,
+)
 
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -39,6 +42,30 @@ class VerificationEmailInput(BaseModel):
 
 class VerificationEmailReceipt(BaseModel):
     status: str = "accepted"
+
+
+# CHG-054 — Novedad del avance de un reporte hecho con cuenta.
+class ReportStatusEmailInput(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    recipient: str = Field(min_length=6, max_length=254)
+    report_label: str = Field(
+        alias="reportLabel", min_length=3, max_length=120
+    )
+    tracking_code: str = Field(
+        alias="trackingCode", min_length=3, max_length=80
+    )
+    status_label: str = Field(
+        alias="statusLabel", min_length=3, max_length=300
+    )
+
+    @field_validator("recipient")
+    @classmethod
+    def _valid_email(cls, value: str) -> str:
+        normalized = value.strip()
+        if not EMAIL_PATTERN.match(normalized):
+            raise ValueError("recipient no es un correo válido")
+        return normalized
 
 
 def problem_response(
@@ -104,6 +131,31 @@ def create_app(
             return problem_response(
                 "No fue posible entregar el correo de verificación; "
                 "el registro puede reintentarse.",
+                title="Proveedor de correo no disponible",
+            )
+        return VerificationEmailReceipt()
+
+    @application.post(
+        "/internal/v1/report-status-emails",
+        status_code=202,
+        response_model=VerificationEmailReceipt,
+        responses={
+            422: {"description": "Datos inválidos"},
+            503: {"description": "Proveedor SMTP no disponible"},
+        },
+    )
+    async def send_report_status_email(payload: ReportStatusEmailInput):
+        email = render_report_status_email(
+            resolved_settings.public_base_url,
+            payload.report_label,
+            payload.tracking_code,
+            payload.status_label,
+        )
+        try:
+            await resolved_deliverer.deliver(payload.recipient, email)
+        except DeliveryError:
+            return problem_response(
+                "No fue posible entregar la novedad del reporte.",
                 title="Proveedor de correo no disponible",
             )
         return VerificationEmailReceipt()

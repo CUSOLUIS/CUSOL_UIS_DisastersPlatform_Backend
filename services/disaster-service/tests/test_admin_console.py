@@ -761,3 +761,117 @@ def test_validate_changes_enforces_allowlist_and_lengths():
         admin_rules.validate_changes(
             "unverified_building_report", {"sector": "x" * 200}
         )
+
+
+# CHG-054 — Notificación de avance para envíos hechos con cuenta.
+
+
+class RecordingNotifier:
+    def __init__(self, error: Exception | None = None):
+        self.error = error
+        self.notified: list[dict] = []
+
+    async def notify_report_status(
+        self, account_id, report_label, tracking_code, status_label
+    ):
+        if self.error is not None:
+            raise self.error
+        self.notified.append(
+            {
+                "account_id": account_id,
+                "report_label": report_label,
+                "tracking_code": tracking_code,
+                "status_label": status_label,
+            }
+        )
+
+
+ACCOUNT_UUID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1")
+
+
+def decision_body(action: str = "accept") -> dict:
+    return {
+        "expectedVersion": 1,
+        "action": action,
+        "reason": "verificación completada",
+    }
+
+
+@pytest.mark.anyio
+async def test_decision_notifies_account_submissions():
+    repository = FakeAdminRepository()
+    repository.summary = summary_row(account_id=ACCOUNT_UUID)
+    notifier = RecordingNotifier()
+    app = create_app(repository=repository, notifier=notifier)
+
+    response = await request_app(
+        app,
+        "POST",
+        f"/internal/v1/admin/submissions/{SUBMISSION_ID}/decisions",
+        json=decision_body("accept"),
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert len(notifier.notified) == 1
+    notice = notifier.notified[0]
+    assert notice["account_id"] == ACCOUNT_UUID
+    assert notice["report_label"] == "Reporte de edificio sin verificar"
+    assert notice["tracking_code"] == "BR-2026-AAAA1111"
+    assert "aceptado" in notice["status_label"]
+
+
+@pytest.mark.anyio
+async def test_decision_skips_notification_for_anonymous():
+    repository = FakeAdminRepository()
+    repository.summary = summary_row(account_id=None)
+    notifier = RecordingNotifier()
+    app = create_app(repository=repository, notifier=notifier)
+
+    response = await request_app(
+        app,
+        "POST",
+        f"/internal/v1/admin/submissions/{SUBMISSION_ID}/decisions",
+        json=decision_body("reject"),
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert notifier.notified == []
+
+
+@pytest.mark.anyio
+async def test_notification_failure_never_blocks_decision():
+    repository = FakeAdminRepository()
+    repository.summary = summary_row(account_id=ACCOUNT_UUID)
+    notifier = RecordingNotifier(error=RuntimeError("identity caído"))
+    app = create_app(repository=repository, notifier=notifier)
+
+    response = await request_app(
+        app,
+        "POST",
+        f"/internal/v1/admin/submissions/{SUBMISSION_ID}/decisions",
+        json=decision_body("request_changes"),
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_archive_does_not_notify():
+    repository = FakeAdminRepository()
+    repository.summary = summary_row(account_id=ACCOUNT_UUID)
+    notifier = RecordingNotifier()
+    app = create_app(repository=repository, notifier=notifier)
+
+    response = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/admin/submissions/{SUBMISSION_ID}",
+        json={"expectedVersion": 1, "reason": "cierre administrativo"},
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert notifier.notified == []

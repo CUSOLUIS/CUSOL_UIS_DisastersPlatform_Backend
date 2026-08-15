@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from pydantic import Field, TypeAdapter, ValidationError
 
 from . import admin as admin_rules
+from . import notifications
 from . import offers as offer_rules
 from .config import Settings
 from .models import (
@@ -500,12 +501,17 @@ def create_app(
     repository: DisasterRepository | None = None,
     storage: ObjectStorage | None = None,
     scanner: MalwareScanner | None = None,
+    notifier: notifications.ReportNotifier | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_environment()
     object_storage = storage or LocalObjectStorage(
         resolved_settings.upload_dir
     )
     malware_scanner = scanner or SignatureMalwareScanner()
+    report_notifier = notifier or notifications.HttpReportNotifier(
+        resolved_settings.identity_service_url,
+        resolved_settings.notification_timeout_seconds,
+    )
     fernet = build_fernet(resolved_settings.report_encryption_key)
 
     def encrypt(value: str | None) -> bytes | None:
@@ -872,6 +878,12 @@ def create_app(
                 "Encabezado requerido",
                 "Idempotency-Key debe tener entre 16 y 128 caracteres.",
             )
+        # CHG-054: cuenta opcional declarada por el gateway; el canal
+        # sigue siendo público y jamás exige sesión.
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        _actor_kind, reporter_account_id = actor
 
         declared = request.headers.get("content-length")
         if declared is not None and declared.isdigit():
@@ -1075,6 +1087,7 @@ def create_app(
             reporter_phone_encrypted=encrypt(payload.reporter_phone),
             reporter_email_encrypted=encrypt(payload.reporter_email),
             official_report_number=payload.official_report_number,
+            reporter_account_id=reporter_account_id,
         )
 
         try:
@@ -2413,6 +2426,23 @@ def create_app(
             return submission_not_found()
         if outcome == "conflict":
             return version_conflict()
+        # CHG-054: los envíos hechos con cuenta reciben la novedad por
+        # correo. Mejor esfuerzo tras confirmar la transacción: un fallo
+        # del aviso jamás revierte ni bloquea la decisión.
+        status_label = notifications.STATUS_LABELS.get(action)
+        account_id = summary_row.get("account_id")
+        if status_label and account_id is not None:
+            try:
+                await report_notifier.notify_report_status(
+                    account_id,
+                    notifications.REPORT_LABELS.get(
+                        summary_row["kind"], "Reporte"
+                    ),
+                    summary_row["tracking_code"],
+                    status_label,
+                )
+            except Exception:
+                pass
         return audit_event_id, new_version
 
     async def mutation_receipt(

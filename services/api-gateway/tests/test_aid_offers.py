@@ -444,3 +444,129 @@ async def test_directory_search_accepts_offer_kinds():
     assert item["publicOfferCode"] == "OFR-2026-PUB1"
     assert "contactName" not in item
     assert "accountId" not in item
+
+
+# CHG-054 — Cuenta opcional en el ingreso público de reportes.
+
+
+@pytest.mark.anyio
+async def test_missing_report_attaches_account_when_session_is_valid():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        if request.url.path == "/internal/v1/missing-person-reports":
+            seen["actor"] = request.headers.get("x-actor-kind")
+            seen["account"] = request.headers.get("x-account-id")
+            seen["cookie"] = request.headers.get("cookie")
+            return httpx.Response(
+                201,
+                json={
+                    "id": "10000000-0000-4000-8000-000000000009",
+                    "publicCaseCode": "MP-2026-XYZ1",
+                    "status": "under_review",
+                    "receivedAt": "2026-08-15T12:00:00Z",
+                },
+            )
+        return httpx.Response(500)
+
+    app = create_app(
+        settings=gateway_settings(),
+        client=upstream_client(handler),
+        identity_client=identity_with_session(),
+    )
+
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/missing-person-reports",
+        content=b"payload-multipart-simulado",
+        headers={
+            "Idempotency-Key": "clave-idempotente-0054",
+            "Content-Type": "multipart/form-data; boundary=x",
+        },
+        cookies={"cusol_session": "token-valido"},
+    )
+
+    assert response.status_code == 201
+    assert seen["actor"] == "authenticated"
+    assert seen["account"] == ACCOUNT_ID
+    # La cookie jamás viaja al upstream.
+    assert seen["cookie"] is None
+
+
+@pytest.mark.anyio
+async def test_missing_report_stays_anonymous_without_session():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["actor"] = request.headers.get("x-actor-kind")
+        seen["account"] = request.headers.get("x-account-id")
+        return httpx.Response(
+            201,
+            json={
+                "id": "10000000-0000-4000-8000-000000000009",
+                "publicCaseCode": "MP-2026-XYZ1",
+                "status": "under_review",
+                "receivedAt": "2026-08-15T12:00:00Z",
+            },
+        )
+
+    app = create_app(
+        settings=gateway_settings(),
+        client=upstream_client(handler),
+        identity_client=identity_with_session(),
+    )
+
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/missing-person-reports",
+        content=b"payload-multipart-simulado",
+        headers={
+            "Idempotency-Key": "clave-idempotente-0054",
+            "Content-Type": "multipart/form-data; boundary=x",
+        },
+    )
+
+    assert response.status_code == 201
+    assert seen["actor"] == "anonymous"
+    assert seen["account"] is None
+
+
+@pytest.mark.anyio
+async def test_missing_report_ignores_invalid_session_cookie():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["actor"] = request.headers.get("x-actor-kind")
+        return httpx.Response(
+            201,
+            json={
+                "id": "10000000-0000-4000-8000-000000000009",
+                "publicCaseCode": "MP-2026-XYZ1",
+                "status": "under_review",
+                "receivedAt": "2026-08-15T12:00:00Z",
+            },
+        )
+
+    app = create_app(
+        settings=gateway_settings(),
+        client=upstream_client(handler),
+        identity_client=identity_with_session(),
+    )
+
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/missing-person-reports",
+        content=b"payload-multipart-simulado",
+        headers={
+            "Idempotency-Key": "clave-idempotente-0054",
+            "Content-Type": "multipart/form-data; boundary=x",
+        },
+        cookies={"cusol_session": "token-vencido"},
+    )
+
+    # Sesión inválida: el envío sigue siendo anónimo, jamás falla.
+    assert response.status_code == 201
+    assert seen["actor"] == "anonymous"
