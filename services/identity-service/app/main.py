@@ -35,7 +35,7 @@ from .models import (
     AdminReasonInput,
     AuthenticatedAccount,
     EmailVerificationInput,
-    EmailVerificationReceipt,
+    EmailVerificationEnvelope,
     HealthStatus,
     SessionEnvelope,
 )
@@ -275,7 +275,7 @@ def create_app(
 
     @application.post(
         "/internal/v1/auth/email-verifications",
-        response_model=EmailVerificationReceipt,
+        response_model=EmailVerificationEnvelope,
         response_model_by_alias=True,
         tags=["Authentication"],
     )
@@ -290,17 +290,38 @@ def create_app(
         except ValidationError as error:
             return validation_problem(error)
 
-        verified_at = await data.consume_verification_token(
-            hash_token(payload.token), datetime.now(UTC)
+        now = datetime.now(UTC)
+        account_id = await data.consume_verification_token(
+            hash_token(payload.token), now
         )
-        if verified_at is None:
+        if account_id is None:
             return problem(
                 400,
                 "Verificación no válida",
                 "El token es inválido, venció o ya fue utilizado.",
             )
-        return EmailVerificationReceipt(
-            status="active", verified_at=verified_at
+        # CHG-051: el token probó la propiedad del correo, así que la
+        # verificación emite la sesión de bienvenida en el mismo paso.
+        account = await data.get_account_by_id(account_id)
+        if account is None or account.status != "active":
+            return problem(
+                400,
+                "Verificación no válida",
+                "La cuenta no está disponible para iniciar sesión.",
+            )
+        session_expires_at = now + timedelta(
+            hours=resolved_settings.session_ttl_hours
+        )
+        session_token = generate_token()
+        await data.create_session(
+            account.id, hash_token(session_token), session_expires_at
+        )
+        return EmailVerificationEnvelope(
+            status="active",
+            verified_at=now,
+            account=authenticated_account(account, session_expires_at),
+            session_token=session_token,
+            session_expires_at=session_expires_at,
         )
 
     @application.post(

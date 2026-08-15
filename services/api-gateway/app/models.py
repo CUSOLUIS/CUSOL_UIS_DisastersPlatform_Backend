@@ -236,11 +236,6 @@ class AccountRegistrationReceipt(ApiModel):
     created_at: datetime
 
 
-class EmailVerificationReceipt(ApiModel):
-    status: Literal["active"]
-    verified_at: datetime
-
-
 class AuthenticatedAccount(ApiModel):
     id: UUID
     display_name: str = Field(min_length=1, max_length=161)
@@ -257,6 +252,26 @@ class SessionEnvelope(ApiModel):
     account: AuthenticatedAccount
     session_token: str
     session_expires_at: datetime
+
+
+class EmailVerificationEnvelope(ApiModel):
+    """CHG-051: respuesta interna de la verificación; incluye la sesión
+    de bienvenida que el gateway convierte en cookie."""
+
+    status: Literal["active"]
+    verified_at: datetime
+    account: AuthenticatedAccount
+    session_token: str
+    session_expires_at: datetime
+
+
+class EmailVerificationReceipt(ApiModel):
+    """Respuesta pública: la cuenta queda activa y con sesión iniciada
+    (cookie); el token de sesión jamás viaja en el cuerpo."""
+
+    status: Literal["active"]
+    verified_at: datetime
+    account: AuthenticatedAccount
 
 
 # CHG-034 — Directorio humanitario y aportes (espejo del contrato).

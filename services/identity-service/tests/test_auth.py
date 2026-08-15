@@ -61,7 +61,24 @@ class FakeIdentityRepository:
         for email, account in self.accounts.items():
             if account.id == token["account_id"]:
                 self.status[email] = "active"
-        return now
+        # CHG-051: devuelve la cuenta para emitir la sesión de bienvenida.
+        return token["account_id"]
+
+    async def get_account_by_id(self, account_id):
+        for email, account in self.accounts.items():
+            if account.id == account_id:
+                from app.repository import AccountRecord
+
+                return AccountRecord(
+                    id=account.id,
+                    email=account.email,
+                    first_names=account.first_names,
+                    last_names=account.last_names,
+                    assigned_role="user",
+                    status=self.status[email],
+                    password_hash=account.password_hash,
+                )
+        return None
 
     async def get_account_by_email(self, email):
         stored = self.accounts.get(email)
@@ -355,6 +372,62 @@ async def test_email_verification_consumes_token_once():
 
 
 @pytest.mark.anyio
+async def test_email_verification_issues_welcome_session():
+    # CHG-051: verificar el correo emite la sesión de bienvenida.
+    repository = FakeIdentityRepository()
+    mailer = CaptureMailer()
+    app = build_app(repository, mailer)
+
+    await request(
+        app,
+        "POST",
+        "/internal/v1/auth/registrations",
+        json=registration_payload(),
+    )
+    token = mailer.sent[-1]["token"]
+    verified = await request(
+        app,
+        "POST",
+        "/internal/v1/auth/email-verifications",
+        json={"token": token},
+    )
+
+    assert verified.status_code == 200
+    body = verified.json()
+    assert body["status"] == "active"
+    assert body["account"]["email"] == "ana.rojas@example.com"
+    assert body["account"]["status"] == "active"
+    assert body["sessionToken"]
+    # La sesión emitida es utilizable de inmediato.
+    me = await request(
+        app,
+        "GET",
+        "/internal/v1/auth/me",
+        headers={"X-Session-Token": body["sessionToken"]},
+    )
+    assert me.status_code == 200
+    assert me.json()["email"] == "ana.rojas@example.com"
+
+
+@pytest.mark.anyio
+async def test_email_verification_session_probe():
+    repository = FakeIdentityRepository()
+    mailer = CaptureMailer()
+    app = build_app(repository, mailer)
+
+    token = await register_and_activate(app, repository, mailer)
+    assert repository.status["ana.rojas@example.com"] == "active"
+
+    reused = await request(
+        app,
+        "POST",
+        "/internal/v1/auth/email-verifications",
+        json={"token": token},
+    )
+    assert reused.status_code == 400
+
+
+@pytest.mark.anyio
 async def test_email_verification_rejects_expired_and_random_tokens():
     repository = FakeIdentityRepository()
     mailer = CaptureMailer()
@@ -416,7 +489,9 @@ async def test_login_success_returns_envelope_and_rotates_tokens():
     assert body["account"]["status"] == "active"
     # Rotación: cada login emite un token distinto.
     assert body["sessionToken"] != second.json()["sessionToken"]
-    assert len(repository.sessions) == 2
+    # CHG-051: la verificación del correo también emitió una sesión de
+    # bienvenida, además de los dos logins.
+    assert len(repository.sessions) == 3
 
 
 @pytest.mark.anyio

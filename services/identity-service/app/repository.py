@@ -51,13 +51,18 @@ class IdentityRepository(Protocol):
 
     async def consume_verification_token(
         self, token_hash: str, now: datetime
-    ) -> datetime | None:
+    ) -> UUID | None:
         """Consume el token una sola vez y activa la cuenta.
 
-        Devuelve el instante de verificación o None si el token es
-        inválido, vencido o ya consumido.
+        Devuelve el id de la cuenta verificada o None si el token es
+        inválido, vencido o ya consumido. CHG-051: el id permite emitir
+        la sesión de bienvenida en el mismo paso.
         """
         ...
+
+    async def get_account_by_id(
+        self, account_id: UUID
+    ) -> "AccountRecord | None": ...
 
     async def get_account_by_email(
         self, email: str
@@ -125,7 +130,7 @@ class PostgresIdentityRepository:
 
     async def consume_verification_token(
         self, token_hash: str, now: datetime
-    ) -> datetime | None:
+    ) -> UUID | None:
         async with self._pool.acquire() as connection:
             async with connection.transaction():
                 row = await connection.fetchrow(
@@ -154,7 +159,31 @@ class PostgresIdentityRepository:
                     row["account_id"],
                     now,
                 )
-        return now
+        return row["account_id"]
+
+    async def get_account_by_id(
+        self, account_id: UUID
+    ) -> AccountRecord | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT id, email, first_names, last_names,
+                   assigned_role, status, password_hash
+            FROM identity_service.accounts
+            WHERE id = $1
+            """,
+            account_id,
+        )
+        if row is None:
+            return None
+        return AccountRecord(
+            id=row["id"],
+            email=row["email"],
+            first_names=row["first_names"],
+            last_names=row["last_names"],
+            assigned_role=row["assigned_role"],
+            status=row["status"],
+            password_hash=row["password_hash"],
+        )
 
     async def get_account_by_email(
         self, email: str

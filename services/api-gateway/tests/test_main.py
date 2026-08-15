@@ -1103,3 +1103,81 @@ async def test_me_requires_cookie_and_forwards_session():
     assert without_cookie.status_code == 401
     assert with_cookie.status_code == 200
     assert with_cookie.json()["email"] == "ana.rojas@example.com"
+
+
+# CHG-051 — Verificar el correo inicia la sesión de bienvenida.
+
+
+@pytest.mark.anyio
+async def test_email_verification_sets_welcome_session_cookie():
+    envelope = {
+        "status": "active",
+        "verifiedAt": "2026-08-15T12:00:00Z",
+        "account": {
+            "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+            "displayName": "Ana Rojas",
+            "email": "ana.rojas@example.com",
+            "assignedRole": "user",
+            "status": "active",
+            "sessionExpiresAt": "2100-01-01T00:00:00Z",
+        },
+        "sessionToken": "token-de-bienvenida-opaco",
+        "sessionExpiresAt": "2100-01-01T00:00:00Z",
+    }
+
+    def identity_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/internal/v1/auth/email-verifications"
+        return httpx.Response(200, json=envelope)
+
+    identity = httpx.AsyncClient(
+        transport=httpx.MockTransport(identity_handler),
+        base_url="http://identity-service:8002",
+    )
+    upstream = mock_client(lambda _: httpx.Response(200, json={}))
+    app = create_app(SETTINGS, upstream, identity_client=identity)
+
+    response = await post(
+        app,
+        "/api/v1/auth/email-verifications",
+        json={"token": "x" * 43},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "active"
+    assert body["account"]["displayName"] == "Ana Rojas"
+    # El token de sesión JAMÁS viaja en el cuerpo público.
+    assert "sessionToken" not in body
+    cookie = response.headers.get("set-cookie", "")
+    assert "cusol_session=token-de-bienvenida-opaco" in cookie
+    assert "HttpOnly" in cookie
+
+
+@pytest.mark.anyio
+async def test_email_verification_passes_through_invalid_token():
+    def identity_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "type": "about:blank",
+                "title": "Verificación no válida",
+                "status": 400,
+                "detail": "El token es inválido, venció o ya fue utilizado.",
+            },
+        )
+
+    identity = httpx.AsyncClient(
+        transport=httpx.MockTransport(identity_handler),
+        base_url="http://identity-service:8002",
+    )
+    upstream = mock_client(lambda _: httpx.Response(200, json={}))
+    app = create_app(SETTINGS, upstream, identity_client=identity)
+
+    response = await post(
+        app,
+        "/api/v1/auth/email-verifications",
+        json={"token": "x" * 43},
+    )
+
+    assert response.status_code == 400
+    assert "set-cookie" not in response.headers

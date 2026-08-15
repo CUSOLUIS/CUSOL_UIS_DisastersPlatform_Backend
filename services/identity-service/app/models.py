@@ -120,6 +120,18 @@ class SessionEnvelope(ApiModel):
     session_expires_at: datetime
 
 
+class EmailVerificationEnvelope(ApiModel):
+    """CHG-051: verificar el correo prueba su propiedad, así que emite
+    la sesión de bienvenida en el mismo paso. El gateway convierte el
+    token en cookie y nunca lo devuelve en el cuerpo público."""
+
+    status: Literal["active"]
+    verified_at: datetime
+    account: AuthenticatedAccount
+    session_token: str
+    session_expires_at: datetime
+
+
 # CHG-036 — Administración de cuentas (espejo del contrato). Nunca
 # exponen hash de contraseña, tokens ni teléfono.
 class AdminAccountSummary(ApiModel):

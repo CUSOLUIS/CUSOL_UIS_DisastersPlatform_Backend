@@ -35,6 +35,7 @@ from .models import (
     AuthenticatedAccount,
     CommunityContributionReceipt,
     DisasterEventList,
+    EmailVerificationEnvelope,
     EmailVerificationReceipt,
     HealthStatus,
     HumanImpactOverview,
@@ -337,11 +338,38 @@ def create_app(
             if 400 <= response.status_code < 500:
                 return passthrough(response)
             response.raise_for_status()
-            return EmailVerificationReceipt.model_validate(
+            envelope = EmailVerificationEnvelope.model_validate(
                 response.json()
             )
         except (httpx.HTTPError, httpx.TimeoutException, ValueError):
             return identity_unavailable()
+
+        # CHG-051: la verificación probó la propiedad del correo, así
+        # que la sesión de bienvenida se materializa como cookie igual
+        # que en el login; el token jamás viaja en el cuerpo público.
+        public = JSONResponse(
+            status_code=200,
+            content=EmailVerificationReceipt(
+                status=envelope.status,
+                verified_at=envelope.verified_at,
+                account=envelope.account,
+            ).model_dump(mode="json", by_alias=True),
+        )
+        now = datetime.now(UTC)
+        max_age = max(
+            0,
+            int((envelope.session_expires_at - now).total_seconds()),
+        )
+        public.set_cookie(
+            SESSION_COOKIE,
+            envelope.session_token,
+            max_age=max_age,
+            path="/",
+            httponly=True,
+            samesite="lax",
+            secure=resolved_settings.session_cookie_secure,
+        )
+        return public
 
     @application.post(
         "/api/v1/auth/sessions",
