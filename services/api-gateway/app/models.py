@@ -94,9 +94,13 @@ class PeopleRecordPage(ApiModel):
 OperationalMapCategory = Literal[
     "missing_person",
     "collection_center",
+    # CHG-049 — puntos de recolección y ofertas comunitarias.
+    "collection_point",
     "rubble_reviewed",
     "rubble_pending",
     "building_pending",
+    "community_meal",
+    "temporary_shelter",
 ]
 CoordinatePrecision = Literal["exact", "approximate", "municipality"]
 DataClassification = Literal["demonstrative", "operational"]
@@ -176,6 +180,10 @@ class OperationalMapSummary(ApiModel):
     # CHG-010: default 0 solo tolera upstream anterior durante el
     # despliegue coordinado; la respuesta del gateway siempre lo emite.
     building_pending: int = Field(ge=0, default=0)
+    # CHG-049: nuevas categorías comunitarias, mismo criterio.
+    collection_point: int = Field(ge=0, default=0)
+    community_meal: int = Field(ge=0, default=0)
+    temporary_shelter: int = Field(ge=0, default=0)
 
 
 class OperationalMapOverview(ApiModel):

@@ -800,9 +800,12 @@ def create_app(
         by_category = {
             "missing_person": 0,
             "collection_center": 0,
+            "collection_point": 0,
             "rubble_reviewed": 0,
             "rubble_pending": 0,
             "building_pending": 0,
+            "community_meal": 0,
+            "temporary_shelter": 0,
         }
         for item in items:
             by_category[item.category] += 1
@@ -810,9 +813,12 @@ def create_app(
             summary=OperationalMapSummary(
                 missing_person=by_category["missing_person"],
                 collection_center=by_category["collection_center"],
+                collection_point=by_category["collection_point"],
                 rubble_reviewed=by_category["rubble_reviewed"],
                 rubble_pending=by_category["rubble_pending"],
                 building_pending=by_category["building_pending"],
+                community_meal=by_category["community_meal"],
+                temporary_shelter=by_category["temporary_shelter"],
             ),
             items=items,
             generated_at=datetime.now(UTC),
