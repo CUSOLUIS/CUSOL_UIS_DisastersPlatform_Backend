@@ -20,7 +20,10 @@ from app.main import (
     build_fernet,
     create_app,
 )
-from app.models import UnverifiedBuildingReportReceipt
+from app.models import (
+    DisasterEventSuggestion,
+    UnverifiedBuildingReportReceipt,
+)
 
 from test_missing_persons import (
     EICAR,
@@ -48,7 +51,10 @@ class FakeBuildingRepository:
     async def ping(self) -> bool:
         return True
 
-    async def create_unverified_building_report(self, report, files):
+    async def create_unverified_building_report(
+        self, report, files, related_event_name=None
+    ):
+        self.last_related_event_name = related_event_name
         if self.fk_violation:
             raise asyncpg.ForeignKeyViolationError("fk simulada")
         if self.fail:
@@ -463,3 +469,77 @@ def test_building_moderation_reuses_shared_transitions():
     assert not moderation.can_decide("rejected", "accepted")
     with pytest.raises(moderation.ModerationNotAllowedError):
         moderation.ensure_moderator_role("user")
+
+
+# --- CHG-092: "Evento relacionado" creable ---
+
+
+@pytest.mark.anyio
+async def test_related_event_name_reaches_repository():
+    repository = FakeBuildingRepository()
+    app = building_app(repository=repository)
+
+    response = await post_report(
+        app,
+        payload=building_payload(relatedEventName="Sismo en el Centro"),
+    )
+
+    assert response.status_code == 201
+    assert repository.last_related_event_name == "Sismo en el Centro"
+    # El expediente no lleva id: lo resuelve la transacción del repo.
+    assert repository.created_report.related_disaster_id is None
+
+
+@pytest.mark.anyio
+async def test_related_event_name_and_id_are_exclusive():
+    app = building_app()
+
+    response = await post_report(
+        app,
+        payload=building_payload(
+            relatedEventName="Sismo en el Centro",
+            relatedDisasterId="55555555-5555-4555-8555-555555555501",
+        ),
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_event_autocomplete_returns_suggestions():
+    class EventRepository(FakeBuildingRepository):
+        async def autocomplete_disaster_events(self, query, limit):
+            self.last_event_autocomplete = {
+                "query": query,
+                "limit": limit,
+            }
+            return [
+                DisasterEventSuggestion(
+                    id=UUID("77777777-7777-4777-8777-777777777701"),
+                    title="Sismo en el Centro",
+                    disaster_type="earthquake",
+                    verification_status="verified",
+                    occurred_at=datetime(2026, 8, 10, 6, 0, tzinfo=UTC),
+                    similarity=0.9,
+                )
+            ]
+
+    repository = EventRepository()
+    app = building_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "GET",
+        "/internal/v1/disaster-events/autocomplete?q=sismo&limit=5",
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert repository.last_event_autocomplete == {
+        "query": "sismo",
+        "limit": 5,
+    }
+    item = body["items"][0]
+    assert item["title"] == "Sismo en el Centro"
+    assert item["similarity"] == 0.9
+    assert item["verificationStatus"] == "verified"

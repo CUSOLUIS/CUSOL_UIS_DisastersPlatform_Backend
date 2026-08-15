@@ -216,6 +216,22 @@ class MissingPersonPublicRecord(ApiModel):
     data_classification: DataClassification
 
 
+# CHG-092 — Autocompletado creable de "Evento relacionado".
+class DisasterEventSuggestion(ApiModel):
+    id: UUID
+    title: str = Field(min_length=1)
+    disaster_type: str = Field(min_length=1)
+    verification_status: VerificationStatus
+    occurred_at: datetime | None = None
+    similarity: float = Field(ge=0.0, le=1.0)
+
+
+class DisasterEventAutocompleteResponse(ApiModel):
+    items: list[DisasterEventSuggestion] = Field(max_length=10)
+    query: str = Field(min_length=2, max_length=160)
+    generated_at: datetime
+
+
 class MissingPersonSearchResponse(ApiModel):
     items: list[MissingPersonPublicRecord] = Field(max_length=20)
     total: int = Field(ge=0)

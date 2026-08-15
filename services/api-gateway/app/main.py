@@ -51,6 +51,7 @@ from .models import (
     HumanMapOverview,
     HumanStatus,
     MissingPersonReportReceipt,
+    DisasterEventAutocompleteResponse,
     MissingPersonSearchResponse,
     PersonAutocompleteResponse,
     PersonDuplicateCheckResponse,
@@ -754,6 +755,44 @@ def create_app(
             return problem_response(
                 "No fue posible consultar la búsqueda en este momento.",
                 title="Servicio de búsqueda no disponible",
+            )
+
+    # CHG-092 — Autocompletado creable de "Evento relacionado".
+    @application.get(
+        "/api/v1/disaster-events/autocomplete",
+        response_model=DisasterEventAutocompleteResponse,
+        response_model_by_alias=True,
+        responses={
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Disasters"],
+    )
+    async def autocomplete_disaster_events(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        q: Annotated[str, Query(min_length=2, max_length=160)],
+        limit: Annotated[int, Query(ge=1, le=10)] = 5,
+    ):
+        if not suggestions_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de sugerencias por minuto."
+            )
+        try:
+            response = await upstream.get(
+                "/internal/v1/disaster-events/autocomplete",
+                params={"q": q, "limit": limit},
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return DisasterEventAutocompleteResponse.model_validate(
+                response.json()
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar los eventos en este momento.",
+                title="Servicio de sugerencias no disponible",
             )
 
     # CHG-091 — Sugerencias en tiempo real para prevenir duplicados.

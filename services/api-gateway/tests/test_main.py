@@ -718,6 +718,63 @@ async def test_missing_person_search_passes_through_client_errors():
     assert response.json()["title"] == "Consulta inválida"
 
 
+# --- CHG-092: autocompletado creable de eventos ---
+
+
+EVENT_AUTOCOMPLETE_RESPONSE = {
+    "items": [
+        {
+            "id": "77777777-7777-4777-8777-777777777701",
+            "title": "Sismo en el Centro",
+            "disasterType": "earthquake",
+            "verificationStatus": "verified",
+            "occurredAt": "2026-08-10T06:00:00Z",
+            "similarity": 0.9,
+        }
+    ],
+    "query": "sismo",
+    "generatedAt": "2026-08-15T12:00:00Z",
+}
+
+
+@pytest.mark.anyio
+async def test_event_autocomplete_is_forwarded():
+    def handler(request: httpx.Request):
+        assert request.url.path == (
+            "/internal/v1/disaster-events/autocomplete"
+        )
+        assert request.url.params["q"] == "sismo"
+        return httpx.Response(200, json=EVENT_AUTOCOMPLETE_RESPONSE)
+
+    upstream = mock_client(handler)
+    app = create_app(SETTINGS, upstream)
+
+    response = await get(
+        app, "/api/v1/disaster-events/autocomplete?q=sismo"
+    )
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["title"] == "Sismo en el Centro"
+
+
+@pytest.mark.anyio
+async def test_event_autocomplete_shares_suggestions_rate_limit():
+    upstream = mock_client(
+        lambda _: httpx.Response(200, json=EVENT_AUTOCOMPLETE_RESPONSE)
+    )
+    app = create_app(
+        custom_settings(suggestions_rate_limit_per_minute=1), upstream
+    )
+
+    first = await get(app, "/api/v1/disaster-events/autocomplete?q=sismo")
+    second = await get(app, "/api/v1/persons/autocomplete?q=Kamila")
+    await upstream.aclose()
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+
+
 # --- CHG-091: sugerencias para prevenir duplicados ---
 
 

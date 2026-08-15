@@ -43,6 +43,7 @@ from .models import (
     AidLocationRatingInput,
     ChangeSignal,
     CommunityContributionReceipt,
+    DisasterEventAutocompleteResponse,
     DisasterEventList,
     HealthStatus,
     HumanImpactOverview,
@@ -673,6 +674,33 @@ def create_app(
             total=total,
             limit=limit,
             offset=offset,
+        )
+
+    # CHG-092 — Autocompletado creable de "Evento relacionado".
+    @application.get(
+        "/internal/v1/disaster-events/autocomplete",
+        response_model=DisasterEventAutocompleteResponse,
+        response_model_by_alias=True,
+        tags=["Disasters"],
+    )
+    async def autocomplete_disaster_events(
+        data: Annotated[
+            DisasterRepository, Depends(get_repository)
+        ],
+        q: Annotated[str, Query(min_length=2, max_length=160)],
+        limit: Annotated[int, Query(ge=1, le=10)] = 5,
+    ):
+        if len(q.strip()) < 2:
+            return problem(
+                422,
+                "Consulta inválida",
+                "La consulta requiere al menos dos caracteres.",
+            )
+        items = await data.autocomplete_disaster_events(q, limit)
+        return DisasterEventAutocompleteResponse(
+            items=items,
+            query=q,
+            generated_at=datetime.now(UTC),
         )
 
     @application.get(
@@ -1980,7 +2008,9 @@ def create_app(
         try:
             receipt, created = (
                 await data.create_unverified_building_report(
-                    stored_report, stored_files
+                    stored_report,
+                    stored_files,
+                    related_event_name=payload.related_event_name,
                 )
             )
         except asyncpg.ForeignKeyViolationError:

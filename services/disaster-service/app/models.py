@@ -55,6 +55,22 @@ class DisasterEventList(ApiModel):
     offset: int = Field(ge=0)
 
 
+# CHG-092 — Autocompletado creable de "Evento relacionado".
+class DisasterEventSuggestion(ApiModel):
+    id: UUID
+    title: str = Field(min_length=1)
+    disaster_type: str = Field(min_length=1)
+    verification_status: VerificationStatus
+    occurred_at: datetime | None = None
+    similarity: float = Field(ge=0.0, le=1.0)
+
+
+class DisasterEventAutocompleteResponse(ApiModel):
+    items: list[DisasterEventSuggestion] = Field(max_length=10)
+    query: str = Field(min_length=2, max_length=160)
+    generated_at: datetime
+
+
 HumanStatus = Literal[
     "missing", "reported_deceased", "confirmed_alive", "confirmed_deceased"
 ]
@@ -776,6 +792,11 @@ class UnverifiedBuildingReportInput(ApiModel):
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
     related_disaster_id: UUID | None = None
+    # CHG-092: nombre del evento cuando el usuario escribe en vez de
+    # seleccionar; el servicio deduplica o crea. Excluyente con el id.
+    related_event_name: str | None = Field(
+        default=None, min_length=3, max_length=160
+    )
     observed_date: date
     observed_time: str | None = Field(
         default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$"
@@ -811,6 +832,19 @@ class UnverifiedBuildingReportInput(ApiModel):
             raise ValueError(
                 "latitude y longitude deben enviarse juntas o ambas "
                 "ausentes"
+            )
+        return self
+
+    # CHG-092: o se seleccionó un evento existente (id) o se escribió
+    # un nombre para resolver/crear — nunca ambos.
+    @model_validator(mode="after")
+    def _related_event_exclusive(self):
+        if (
+            self.related_disaster_id is not None
+            and self.related_event_name is not None
+        ):
+            raise ValueError(
+                "relatedDisasterId y relatedEventName son excluyentes"
             )
         return self
 

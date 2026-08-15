@@ -16,6 +16,7 @@ from .models import (
     ContributionActorKind,
     DataClassification,
     DisasterEvent,
+    DisasterEventSuggestion,
     HumanImpactSummary,
     MissingPersonDirectoryCard,
     MissingPersonPublicRecord,
@@ -396,7 +397,15 @@ class DisasterRepository(Protocol):
         self,
         report: StoredBuildingReport,
         files: list[StoredPhoto],
+        related_event_name: str | None = None,
     ) -> tuple[UnverifiedBuildingReportReceipt, bool]: ...
+
+    # CHG-092 — Autocompletado creable de "Evento relacionado".
+    async def autocomplete_disaster_events(
+        self,
+        query: str,
+        limit: int,
+    ) -> list[DisasterEventSuggestion]: ...
 
     async def decide_unverified_building_report(
         self,
@@ -478,6 +487,16 @@ FALLBACK_PERSON_SOURCE = SourceReference(
 # CHG-091: umbral de similitud trigram fijado por la especificación
 # (SIMILARITY(...) > 0.3).
 SIMILARITY_THRESHOLD = 0.3
+
+# CHG-092: umbral para asociar EN SILENCIO un evento existente al
+# enviar el reporte. Deliberadamente alto: la resolución difusa amplia
+# (0.3) ocurre en la UI donde la persona ve y elige; aquí solo se
+# reutiliza una variante de tipeo casi idéntica.
+EVENT_MATCH_THRESHOLD = 0.85
+
+# CHG-092: fuente ciudadana compartida de los eventos creados desde
+# el formulario de reporte.
+CITIZEN_EVENT_SOURCE_NAME = "Reporte ciudadano CUSOL"
 
 
 class PostgresDisasterRepository:
@@ -2086,14 +2105,143 @@ class PostgresDisasterRepository:
 
     # CHG-035 — Reporte de edificio sin verificar.
 
+    # CHG-092 — Autocompletado creable de "Evento relacionado".
+    async def autocomplete_disaster_events(
+        self,
+        query: str,
+        limit: int,
+    ) -> list[DisasterEventSuggestion]:
+        rows = await self._pool.fetch(
+            """
+            SELECT
+                id, title, disaster_type, verification_status,
+                occurred_at,
+                GREATEST(
+                    similarity(
+                        disaster_service.immutable_unaccent(title),
+                        disaster_service.immutable_unaccent($1)
+                    ),
+                    word_similarity(
+                        disaster_service.immutable_unaccent($1),
+                        disaster_service.immutable_unaccent(title)
+                    )
+                ) AS match_similarity
+            FROM disaster_service.disaster_events
+            WHERE
+                GREATEST(
+                    similarity(
+                        disaster_service.immutable_unaccent(title),
+                        disaster_service.immutable_unaccent($1)
+                    ),
+                    word_similarity(
+                        disaster_service.immutable_unaccent($1),
+                        disaster_service.immutable_unaccent(title)
+                    )
+                ) > $3
+                OR disaster_service.immutable_unaccent(title)
+                    LIKE '%' || disaster_service.immutable_unaccent($1)
+                    || '%'
+            ORDER BY match_similarity DESC, updated_at DESC, id DESC
+            LIMIT $2
+            """,
+            query.strip(),
+            limit,
+            SIMILARITY_THRESHOLD,
+        )
+        return [
+            DisasterEventSuggestion(
+                id=row["id"],
+                title=row["title"],
+                disaster_type=row["disaster_type"],
+                verification_status=row["verification_status"],
+                occurred_at=row["occurred_at"],
+                similarity=min(1.0, float(row["match_similarity"])),
+            )
+            for row in rows
+        ]
+
+    # CHG-092 — Deduplica o crea el evento nombrado, dentro de la
+    # transacción del reporte: exacto normalizado → asocia; casi
+    # idéntico (>0.85) → asocia; si no, lo crea sin verificar con la
+    # fuente ciudadana compartida.
+    async def _resolve_or_create_event(
+        self, connection, title: str
+    ) -> UUID:
+        normalized = title.strip()
+        existing = await connection.fetchrow(
+            """
+            SELECT id,
+                similarity(
+                    disaster_service.immutable_unaccent(title),
+                    disaster_service.immutable_unaccent($1)
+                ) AS match_similarity
+            FROM disaster_service.disaster_events
+            WHERE disaster_service.immutable_unaccent(title)
+                    = disaster_service.immutable_unaccent($1)
+                OR similarity(
+                    disaster_service.immutable_unaccent(title),
+                    disaster_service.immutable_unaccent($1)
+                ) > $2
+            ORDER BY
+                (disaster_service.immutable_unaccent(title)
+                    = disaster_service.immutable_unaccent($1)) DESC,
+                match_similarity DESC
+            LIMIT 1
+            """,
+            normalized,
+            EVENT_MATCH_THRESHOLD,
+        )
+        if existing is not None:
+            return existing["id"]
+
+        source_id = await connection.fetchval(
+            """
+            SELECT id FROM disaster_service.sources
+            WHERE name = $1 AND source_type = 'citizen'
+            LIMIT 1
+            """,
+            CITIZEN_EVENT_SOURCE_NAME,
+        )
+        if source_id is None:
+            source_id = await connection.fetchval(
+                """
+                INSERT INTO disaster_service.sources (name, source_type)
+                VALUES ($1, 'citizen')
+                RETURNING id
+                """,
+                CITIZEN_EVENT_SOURCE_NAME,
+            )
+
+        return await connection.fetchval(
+            """
+            INSERT INTO disaster_service.disaster_events (
+                source_id, title, disaster_type, verification_status
+            ) VALUES ($1, $2, 'reported', 'unverified')
+            RETURNING id
+            """,
+            source_id,
+            normalized,
+        )
+
     async def create_unverified_building_report(
         self,
         report: StoredBuildingReport,
         files: list[StoredPhoto],
+        related_event_name: str | None = None,
     ) -> tuple[UnverifiedBuildingReportReceipt, bool]:
+        related_disaster_id = report.related_disaster_id
         async with self._pool.acquire() as connection:
             try:
                 async with connection.transaction():
+                    # CHG-092: el nombre digitado se resuelve o crea en
+                    # esta misma transacción — si el reporte falla, no
+                    # queda un evento huérfano recién creado.
+                    if related_event_name:
+                        related_disaster_id = (
+                            await self._resolve_or_create_event(
+                                connection, related_event_name
+                            )
+                        )
                     # Crear el expediente NUNCA escribe el mapa operativo.
                     row = await connection.fetchrow(
                         """
@@ -2142,7 +2290,7 @@ class PostgresDisasterRepository:
                         report.address_protected,
                         report.latitude_protected,
                         report.longitude_protected,
-                        report.related_disaster_id,
+                        related_disaster_id,
                         report.observed_date,
                         report.observed_time,
                         report.search_status,
