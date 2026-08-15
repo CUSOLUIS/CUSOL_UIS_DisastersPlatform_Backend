@@ -265,6 +265,13 @@ PersonTransportMode = Literal[
     "private_vehicle",
     "other",
 ]
+# CHG-106 — Primer año que cubre la plataforma: una desaparición
+# registrada aquí no puede ser anterior a su puesta en operación. El
+# calendario del formulario ya no ofrece años previos; esta regla
+# impide que un envío armado a mano los cuele.
+PLATFORM_FIRST_YEAR = 2026
+
+
 PersonPhotoCategory = Literal[
     "recent_face",
     "full_body",
@@ -371,6 +378,18 @@ class MissingPersonReportInput(ApiModel):
     # una revisión previa; se acepta el campo por compatibilidad con
     # clientes antiguos y se ignora su valor.
     review_acknowledged: bool = True
+
+    # CHG-106: la última visualización no puede ser anterior al primer
+    # año que cubre la plataforma.
+    @model_validator(mode="after")
+    def _last_seen_within_coverage(self):
+        if self.last_seen_date.year < PLATFORM_FIRST_YEAR:
+            raise ValueError(
+                "lastSeenDate no puede ser anterior a "
+                f"{PLATFORM_FIRST_YEAR}, el primer año que cubre la "
+                "plataforma"
+            )
+        return self
 
     # CHG-094: la categoría de fotografía se alinea por posición con
     # las partes `photos`; el conteo real se valida al leer el

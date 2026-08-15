@@ -1171,3 +1171,31 @@ def test_public_photo_url_is_built_from_the_public_case_id():
     assert "derivado" not in url
     # Sin foto publicada no hay URL.
     assert public_photo_url_for(case_id, None) is None
+
+
+# --- CHG-106: la última visualización cae dentro de la cobertura ---
+
+
+@pytest.mark.anyio
+async def test_last_seen_before_platform_coverage_is_rejected():
+    app = report_app()
+
+    # El calendario ya no ofrece años previos; esto cubre el envío
+    # armado a mano.
+    for fecha in ["2025-12-31", "2015-06-01", "1999-01-01"]:
+        response = await post_report(
+            app, payload=valid_payload(lastSeenDate=fecha)
+        )
+        assert response.status_code == 422, fecha
+
+
+@pytest.mark.anyio
+async def test_last_seen_within_coverage_is_accepted():
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    response = await post_report(
+        app, payload=valid_payload(lastSeenDate="2026-01-01")
+    )
+
+    assert response.status_code == 201
