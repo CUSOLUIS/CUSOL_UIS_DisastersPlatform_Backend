@@ -88,12 +88,37 @@ jobs:
           # como sí hace `docker compose`, así que sin esto
           # POSTGRES_PASSWORD y ALLOWED_ORIGINS llegan vacíos al
           # contenedor y el servicio arranca en bucle con
-          # InvalidPasswordError. `set -a` exporta lo que defina el
-          # archivo para que el proceso de deploy lo herede; tiene que
-          # ser en este mismo shell.
-          set -a
-          . "$COMPOSE_DIR/.env"
-          set +a
+          # InvalidPasswordError.
+          #
+          # No se hace `source`: un .env de Compose no es un script de
+          # bash. Compose lo parsea con sus reglas, mientras que bash lo
+          # ejecuta, así que un valor con espacios, `$`, `#` o comillas
+          # aborta el paso entero. Aquí se leen pares CLAVE=VALOR y se
+          # exporta el valor literal, que es lo que hace Compose.
+          if [ ! -r "$COMPOSE_DIR/.env" ]; then
+            echo "::error::No se puede leer $COMPOSE_DIR/.env; el stack arrancaría sin credenciales."
+            exit 1
+          fi
+          while IFS= read -r linea || [ -n "$linea" ]; do
+            case "$linea" in ''|'#'*) continue ;; esac
+            clave=${linea%%=*}
+            valor=${linea#*=}
+            case "$clave" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+            case "$valor" in
+              '"'*'"') valor=${valor#\"}; valor=${valor%\"} ;;
+              "'"*"'") valor=${valor#\'}; valor=${valor%\'} ;;
+            esac
+            export "$clave=$valor"
+          done < "$COMPOSE_DIR/.env"
+          # Falla aquí, con un mensaje claro, antes que en el arranque
+          # del contenedor con un InvalidPasswordError opaco.
+          for requerida in POSTGRES_PASSWORD ALLOWED_ORIGINS; do
+            eval "valor=\${$requerida:-}"
+            if [ -z "$valor" ]; then
+              echo "::error::$requerida quedó vacía tras leer $COMPOSE_DIR/.env; el stack no se despliega."
+              exit 1
+            fi
+          done
           docker stack deploy -c docker-compose.swarm-hotpath.yml borde-hp
 
       - name: Aplicar migraciones idempotentes
