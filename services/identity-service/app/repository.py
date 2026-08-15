@@ -17,6 +17,8 @@ class AccountRecord:
     password_hash: str
     # CHG-077: bandera efectiva del sector salud (profesión + registro).
     is_health_sector: bool = False
+    # CHG-083: teléfono del perfil para precargar formularios.
+    phone: str | None = None
 
 
 @dataclass(frozen=True)
@@ -252,6 +254,7 @@ class PostgresIdentityRepository:
             """
             SELECT a.id, a.email, a.first_names, a.last_names,
                    a.assigned_role, a.status, a.password_hash,
+                   a.phone,
                    (a.health_profession IS NOT NULL
                     AND a.health_license_number IS NOT NULL)
                        AS is_health_sector,
@@ -279,6 +282,7 @@ class PostgresIdentityRepository:
                 status=row["status"],
                 password_hash=row["password_hash"],
                 is_health_sector=row["is_health_sector"],
+                phone=row["phone"],
             ),
             session_expires_at=row["expires_at"],
         )

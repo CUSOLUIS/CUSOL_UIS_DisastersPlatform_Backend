@@ -252,6 +252,8 @@ class AuthenticatedAccount(ApiModel):
     status: Literal["active"]
     session_expires_at: datetime
     is_health_sector: bool = False
+    # CHG-083: teléfono del perfil para precargar formularios.
+    phone: str | None = None
 
 
 class SessionEnvelope(ApiModel):

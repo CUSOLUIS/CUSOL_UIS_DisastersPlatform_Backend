@@ -107,6 +107,8 @@ def authenticated_account(
         # CHG-077: la bandera del sector salud viaja en la sesión para
         # que el gateway la declare al registrar novedades.
         is_health_sector=getattr(account, "is_health_sector", False),
+        # CHG-083: el teléfono del perfil precarga formularios.
+        phone=getattr(account, "phone", None),
     )
 
 

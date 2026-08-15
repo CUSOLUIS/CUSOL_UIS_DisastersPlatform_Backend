@@ -145,6 +145,9 @@ class AuthenticatedAccount(ApiModel):
     id: UUID
     display_name: str = Field(min_length=1, max_length=161)
     email: str = Field(max_length=254)
+    # CHG-083: el teléfono del perfil viaja en la sesión para
+    # precargar (editable) los datos del reportante.
+    phone: str | None = Field(default=None, max_length=30)
     assigned_role: AccountRole
     status: Literal["active"]
     session_expires_at: datetime

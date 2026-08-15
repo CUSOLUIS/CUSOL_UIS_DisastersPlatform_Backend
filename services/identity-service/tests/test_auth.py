@@ -139,6 +139,9 @@ class FakeIdentityRepository:
                             account.health_profession
                             and account.health_license_number
                         ),
+                        # CHG-083: el teléfono del perfil viaja en
+                        # la sesión.
+                        phone=account.phone,
                     ),
                     session_expires_at=session["expires_at"],
                 )
@@ -582,11 +585,13 @@ async def test_me_valid_expired_and_revoked_sessions():
     assert valid.status_code == 200
     assert valid.json()["email"] == "ana.rojas@example.com"
     assert set(valid.json().keys()) == {
-        "id", "displayName", "email", "assignedRole", "status",
-        "sessionExpiresAt", "isHealthSector",
+        "id", "displayName", "email", "phone", "assignedRole",
+        "status", "sessionExpiresAt", "isHealthSector",
     }
     # CHG-077: sin datos de salud declarados, la bandera es falsa.
     assert valid.json()["isHealthSector"] is False
+    # CHG-083: el payload de registro no envía teléfono → null.
+    assert valid.json()["phone"] is None
 
     # Vencida
     repository.sessions[hash_token(token)]["expires_at"] = (
