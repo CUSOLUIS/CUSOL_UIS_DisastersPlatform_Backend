@@ -77,7 +77,14 @@ jobs:
         run: |
           cd "$COMPOSE_DIR"
           docker compose build disasters-db disaster-service identity-service mail-service admin-bootstrap api-gateway
-          docker compose up -d --wait disasters-db disaster-service identity-service mail-service admin-bootstrap api-gateway
+          # CHG-102: api-gateway y disaster-service salen de `compose up`
+          # y pasan al stack de Swarm, que los actualiza con rolling
+          # update en vez de reemplazar el contenedor en frío. Esa es la
+          # ventana de 5-15 s de 502/503/504 que CHG-101 sortea desde el
+          # cliente; aquí se ataca en el origen. El resto de servicios
+          # sigue en compose, y el build de arriba no cambia.
+          docker compose up -d --wait disasters-db identity-service mail-service admin-bootstrap
+          docker stack deploy -c docker-compose.swarm-hotpath.yml borde-hp
 
       - name: Aplicar migraciones idempotentes
         run: |
