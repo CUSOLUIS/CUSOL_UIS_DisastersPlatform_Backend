@@ -341,6 +341,15 @@ class DisasterRepository(Protocol):
         photos: list[StoredPhoto],
     ) -> tuple[MissingPersonReportReceipt, bool]: ...
 
+    # CHG-105 — Fotografía pública del caso.
+    async def get_public_person_photo(
+        self, case_id: UUID
+    ) -> dict | None: ...
+
+    async def withdraw_public_person_photo(
+        self, case_id: UUID, withdrawn_by: str
+    ) -> bool: ...
+
     # CHG-091 — Sugerencias difusas para prevenir duplicados.
     async def autocomplete_persons(
         self,
@@ -1038,7 +1047,7 @@ class PostgresDisasterRepository:
                 approximate_age, last_seen_at, last_seen_area,
                 municipality, department, clothing_description,
                 physical_description, distinctive_marks,
-                public_photo_url, map_point_id, updated_at,
+                public_photo_object_key, map_point_id, updated_at,
                 data_classification
             FROM disaster_service.missing_person_cases
             WHERE {condition}
@@ -1062,7 +1071,9 @@ class PostgresDisasterRepository:
                 clothing_description=row["clothing_description"],
                 physical_description=row["physical_description"],
                 distinctive_marks=row["distinctive_marks"],
-                public_photo_url=row["public_photo_url"],
+                public_photo_url=public_photo_url_for(
+                    row["id"], row["public_photo_object_key"]
+                ),
                 map_point_id=row["map_point_id"],
                 updated_at=row["updated_at"],
                 data_classification=row["data_classification"],
@@ -1319,11 +1330,11 @@ class PostgresDisasterRepository:
                             last_seen_area, municipality, department,
                             clothing_description,
                             physical_description, distinctive_marks,
-                            map_point_id,
+                            map_point_id, public_photo_object_key,
                             publication_status, data_classification
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                            $11, $12, 'published', 'operational'
+                            $11, $12, $13, 'published', 'operational'
                         )
                         RETURNING id
                         """,
@@ -1339,6 +1350,9 @@ class PostgresDisasterRepository:
                         physical_description,
                         report.distinctive_marks,
                         map_point_id,
+                        # CHG-105: el reportante autorizó compartirla al
+                        # enviar, así que se publica con el caso.
+                        select_public_photo_key(photos),
                     )
                     # CHG-084: el caso publicado también alimenta la
                     # "situación humana" — fila en people (cifras y
@@ -1482,7 +1496,7 @@ class PostgresDisasterRepository:
                 mc.id, mc.public_case_code, mc.display_name,
                 mc.public_status, mc.approximate_age, mc.last_seen_at,
                 mc.last_seen_area, mc.municipality, mc.department,
-                mc.public_photo_url, mc.updated_at,
+                mc.public_photo_object_key, mc.updated_at,
                 mc.data_classification,
                 s.name AS source_name,
                 s.source_type,
@@ -1508,7 +1522,9 @@ class PostgresDisasterRepository:
                 last_seen_area=row["last_seen_area"],
                 municipality=row["municipality"],
                 department=row["department"],
-                public_photo_url=row["public_photo_url"],
+                public_photo_url=public_photo_url_for(
+                    row["id"], row["public_photo_object_key"]
+                ),
                 source=(
                     SourceReference(
                         name=row["source_name"],
@@ -1525,6 +1541,49 @@ class PostgresDisasterRepository:
         ]
         return cards, int(total)
 
+    # CHG-105 — Fotografía pública del caso: solo de casos publicados
+    # y solo el objeto derivado (sin EXIF); el original en cuarentena
+    # jamás se sirve.
+    async def get_public_person_photo(self, case_id: UUID) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT mc.public_photo_object_key AS object_key,
+                   p.content_type
+            FROM disaster_service.missing_person_cases mc
+            LEFT JOIN disaster_service.missing_person_report_photos p
+                ON p.derived_storage_key = mc.public_photo_object_key
+            WHERE mc.id = $1
+              AND mc.publication_status = 'published'
+              AND mc.public_photo_object_key IS NOT NULL
+            """,
+            case_id,
+        )
+        if row is None:
+            return None
+        return {
+            "object_key": row["object_key"],
+            "content_type": row["content_type"] or "image/jpeg",
+        }
+
+    # CHG-105 — Retirada rápida: deja de publicarse sin tocar el
+    # expediente, que conserva la fotografía original.
+    async def withdraw_public_person_photo(
+        self, case_id: UUID, withdrawn_by: str
+    ) -> bool:
+        result = await self._pool.execute(
+            """
+            UPDATE disaster_service.missing_person_cases
+            SET public_photo_object_key = NULL,
+                public_photo_withdrawn_at = NOW(),
+                public_photo_withdrawn_by = $2,
+                updated_at = NOW()
+            WHERE id = $1 AND public_photo_object_key IS NOT NULL
+            """,
+            case_id,
+            withdrawn_by,
+        )
+        return result.endswith("1")
+
     # CHG-091 — Sugerencias difusas para prevenir duplicados. Solo la
     # proyección pública publicada. similarity() cubre nombre completo
     # contra nombre completo; word_similarity() cubre lo que se escribe
@@ -1536,7 +1595,7 @@ class PostgresDisasterRepository:
             mc.id, mc.public_case_code, mc.display_name,
             mc.public_status, mc.approximate_age, mc.last_seen_at,
             mc.last_seen_area, mc.municipality, mc.department,
-            mc.public_photo_url, mc.updated_at,
+            mc.public_photo_object_key, mc.updated_at,
             mc.data_classification,
             s.name AS source_name, s.source_type, s.url AS source_url,
             GREATEST(
@@ -1611,7 +1670,9 @@ class PostgresDisasterRepository:
             last_seen_area=row["last_seen_area"],
             municipality=row["municipality"],
             department=row["department"],
-            public_photo_url=row["public_photo_url"],
+            public_photo_url=public_photo_url_for(
+                row["id"], row["public_photo_object_key"]
+            ),
             source=(
                 SourceReference(
                     name=row["source_name"],
@@ -4141,6 +4202,30 @@ _CASE_PUBLICATION_BY_ACTION = {
     "reject": "rejected",
     "archive": "withdrawn",
 }
+
+# CHG-105 — Ruta pública de la foto de un caso. Se construye a partir
+# del identificador del caso, que ya es público: la clave del objeto
+# nunca sale al cliente porque contiene el id del expediente privado.
+def public_photo_url_for(case_id, object_key: str | None) -> str | None:
+    if not object_key:
+        return None
+    return f"/api/v1/public/missing-persons/{case_id}/photo"
+
+
+# CHG-105 — La foto que se publica con el caso. Se prefiere la que el
+# reportante marcó como rostro reciente (CHG-094); si no declaró
+# categorías, la primera que envió. Siempre el objeto DERIVADO, que va
+# sin metadatos EXIF: el original queda en cuarentena y jamás se sirve.
+def select_public_photo_key(photos: list["StoredPhoto"]) -> str | None:
+    if not photos:
+        return None
+
+    preferidas = [p for p in photos if p.category == "recent_face"]
+    elegida = preferidas[0] if preferidas else min(
+        photos, key=lambda p: p.position
+    )
+    return elegida.derived_storage_key
+
 
 # CHG-084 — Proyección humana del caso: fila en people (cifras y
 # tabla) y punto 'approximate' en people_map_projection (DEC-007

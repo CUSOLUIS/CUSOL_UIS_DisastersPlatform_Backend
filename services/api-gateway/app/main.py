@@ -795,6 +795,46 @@ def create_app(
                 title="Servicio de sugerencias no disponible",
             )
 
+    # CHG-105 — Fotografía pública del caso: se reenvía tal cual, con
+    # su tipo de contenido y su cabecera de caché.
+    @application.get(
+        "/api/v1/public/missing-persons/{case_id}/photo",
+        responses={
+            404: {"description": "Sin fotografía pública"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["MissingPersons"],
+    )
+    async def serve_public_person_photo(
+        case_id: str,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        try:
+            response = await upstream.get(
+                f"/internal/v1/public/missing-persons/{case_id}/photo",
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            from fastapi.responses import Response as RawResponse
+
+            return RawResponse(
+                content=response.content,
+                media_type=response.headers.get(
+                    "content-type", "image/jpeg"
+                ),
+                headers={
+                    "Cache-Control": response.headers.get(
+                        "cache-control", "public, max-age=300"
+                    )
+                },
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible servir la fotografía en este momento.",
+                title="Fotografía no disponible",
+            )
+
     # CHG-091 — Sugerencias en tiempo real para prevenir duplicados.
     @application.get(
         "/api/v1/persons/autocomplete",

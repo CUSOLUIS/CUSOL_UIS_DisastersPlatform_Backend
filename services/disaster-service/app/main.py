@@ -977,6 +977,47 @@ def create_app(
             items=items, total=total, query=q
         )
 
+    # CHG-105 — Fotografía pública del caso. La ruta usa el id del
+    # caso, que ya es público; la clave del objeto nunca sale al
+    # cliente porque contiene el id del expediente privado.
+    @application.get(
+        "/internal/v1/public/missing-persons/{case_id}/photo",
+        tags=["MissingPersons"],
+    )
+    async def serve_public_person_photo(
+        case_id: UUID,
+        data: Annotated[
+            DisasterRepository, Depends(get_repository)
+        ],
+    ):
+        photo = await data.get_public_person_photo(case_id)
+        if photo is None:
+            return problem(
+                404,
+                "Fotografía no disponible",
+                "El caso no tiene una fotografía pública.",
+            )
+        try:
+            content = object_storage.load(photo["object_key"])
+        except StorageUnavailableError:
+            content = None
+        if content is None:
+            return problem(
+                503,
+                "Fotografía no disponible",
+                "No fue posible leer la fotografía en este momento.",
+            )
+
+        from fastapi.responses import Response as RawResponse
+
+        return RawResponse(
+            content=content,
+            media_type=photo["content_type"],
+            # Pública y cacheable, pero por poco tiempo: si el equipo
+            # la retira, la copia vieja no debe sobrevivir mucho.
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
     # CHG-091 — Sugerencias en tiempo real para prevenir duplicados.
     @application.get(
         "/internal/v1/persons/autocomplete",
@@ -3073,6 +3114,41 @@ def create_app(
         return await mutation_receipt(
             data, submission_id, audit_event_id
         )
+
+    # CHG-105 — Retirada rápida de la fotografía pública: deja de
+    # publicarse de inmediato sin tocar el expediente, que conserva el
+    # original. Es la contraparte de publicar al crear.
+    @application.delete(
+        "/internal/v1/admin/missing-persons/{case_id}/public-photo",
+        tags=["Administration"],
+    )
+    async def admin_withdraw_public_photo(
+        case_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display = actor
+        retirada = await data.withdraw_public_person_photo(
+            case_id, actor_display
+        )
+        await data.admin_write_audit(
+            actor_account_id,
+            actor_display,
+            "public_photo_withdrawn",
+            "missing_person_case",
+            case_id,
+            "success" if retirada else "failed",
+        )
+        if not retirada:
+            return problem(
+                404,
+                "Fotografía no disponible",
+                "El caso no tiene una fotografía pública que retirar.",
+            )
+        return {"status": "withdrawn"}
 
     @application.delete(
         "/internal/v1/admin/submissions/{submission_id}",

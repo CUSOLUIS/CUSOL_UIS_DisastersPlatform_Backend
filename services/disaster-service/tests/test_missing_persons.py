@@ -1105,3 +1105,69 @@ async def test_phone_without_digits_or_leading_zero_is_rejected():
             app, payload=valid_payload(reporterPhone=phone)
         )
         assert response.status_code == 422, phone
+
+
+# --- CHG-105: fotografía pública del caso ---
+
+
+def test_public_photo_prefers_the_declared_face_photo():
+    from app.repository import StoredPhoto, select_public_photo_key
+
+    def foto(position, category=None):
+        return StoredPhoto(
+            id=uuid4(),
+            position=position,
+            storage_key=f"cuarentena/{position}.bin",
+            derived_storage_key=f"derivado/{position}.jpg",
+            content_type="image/jpeg",
+            size_bytes=1024,
+            sha256="x",
+            exif_removed=True,
+            malware_scan="clean",
+            category=category,
+        )
+
+    # Con categorías declaradas gana el rostro reciente, no la primera.
+    elegida = select_public_photo_key(
+        [foto(1, "full_body"), foto(2, "recent_face"), foto(3)]
+    )
+    assert elegida == "derivado/2.jpg"
+
+    # Sin categorías, la primera que envió.
+    assert select_public_photo_key([foto(2), foto(1)]) == "derivado/1.jpg"
+
+    # Sin fotos no hay nada que publicar.
+    assert select_public_photo_key([]) is None
+
+
+def test_public_photo_never_exposes_the_quarantined_original():
+    from app.repository import StoredPhoto, select_public_photo_key
+
+    photo = StoredPhoto(
+        id=uuid4(),
+        position=1,
+        storage_key="cuarentena/original.bin",
+        derived_storage_key="derivado/limpio.jpg",
+        content_type="image/jpeg",
+        size_bytes=1024,
+        sha256="x",
+        exif_removed=True,
+        malware_scan="clean",
+    )
+
+    # Siempre el derivado sin EXIF; el original queda en el expediente.
+    assert select_public_photo_key([photo]) == "derivado/limpio.jpg"
+
+
+def test_public_photo_url_is_built_from_the_public_case_id():
+    from app.repository import public_photo_url_for
+
+    case_id = UUID("55555555-5555-4555-8555-555555555501")
+    url = public_photo_url_for(case_id, "derivado/limpio.jpg")
+
+    assert url == f"/api/v1/public/missing-persons/{case_id}/photo"
+    # La clave del objeto lleva el id del expediente privado: jamás
+    # puede aparecer en la URL pública.
+    assert "derivado" not in url
+    # Sin foto publicada no hay URL.
+    assert public_photo_url_for(case_id, None) is None
