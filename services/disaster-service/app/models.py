@@ -15,6 +15,15 @@ SourceType = Literal[
 ]
 
 
+# CHG-100 — Teléfonos de contacto. El límite anterior (40 caracteres,
+# sin formato) dejaba pasar números de 25 dígitos que nadie puede
+# marcar. El patrón admite los separadores con los que la gente
+# escribe ("+57 (300) 123-4567") y acota los dígitos a E.164: entre 7
+# y 15, sin cero inicial.
+PHONE_PATTERN = r"^\+?[\s().-]*[1-9](?:[\s().-]*\d){6,14}$"
+PHONE_MAX_LENGTH = 25
+
+
 def to_camel(value: str) -> str:
     parts = value.split("_")
     return parts[0] + "".join(part.capitalize() for part in parts[1:])
@@ -331,7 +340,9 @@ class MissingPersonReportInput(ApiModel):
     additional_description: str | None = Field(default=None, max_length=2000)
     reporter_name: str = Field(min_length=1, max_length=160)
     reporter_relationship: str = Field(min_length=1, max_length=100)
-    reporter_phone: str | None = Field(default=None, max_length=40)
+    reporter_phone: str | None = Field(
+        default=None, max_length=PHONE_MAX_LENGTH, pattern=PHONE_PATTERN
+    )
     reporter_email: str | None = Field(default=None, max_length=254)
     official_report_number: str | None = Field(default=None, max_length=100)
     # CHG-094 — Entidad donde se interpuso la denuncia.
@@ -534,7 +545,7 @@ class _AidOfferCommonInput(ApiModel):
     available_until: datetime
     contact_name: str = Field(min_length=2, max_length=160)
     contact_phone: str | None = Field(
-        default=None, min_length=7, max_length=40
+        default=None, max_length=PHONE_MAX_LENGTH, pattern=PHONE_PATTERN
     )
     contact_email: str | None = Field(default=None, max_length=254)
     truth_confirmed: Literal[True]
@@ -888,7 +899,9 @@ class UnverifiedBuildingReportInput(ApiModel):
     reporter_name: str = Field(min_length=1, max_length=160)
     reporter_role: str = Field(min_length=1, max_length=100)
     reporter_organization: str | None = Field(default=None, max_length=160)
-    reporter_phone: str | None = Field(default=None, max_length=40)
+    reporter_phone: str | None = Field(
+        default=None, max_length=PHONE_MAX_LENGTH, pattern=PHONE_PATTERN
+    )
     reporter_email: str | None = Field(default=None, max_length=254)
     official_report_number: str | None = Field(default=None, max_length=100)
     # CHG-066: instantánea opcional de la ubicación del reportante al

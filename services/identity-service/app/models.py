@@ -17,6 +17,13 @@ def to_camel(value: str) -> str:
     return parts[0] + "".join(part.capitalize() for part in parts[1:])
 
 
+# CHG-100 — Teléfono de contacto con formato E.164 tolerante a
+# separadores, igual que en disaster-service: antes bastaba con 7
+# dígitos, así que un número de 25 pasaba sin protestar.
+PHONE_PATTERN = r"^\+?[\s().-]*[1-9](?:[\s().-]*\d){6,14}$"
+PHONE_MAX_LENGTH = 25
+
+
 class ApiModel(BaseModel):
     model_config = ConfigDict(
         alias_generator=to_camel,
@@ -42,7 +49,9 @@ class AccountRegistrationInput(ApiModel):
     first_names: str = Field(min_length=1, max_length=80)
     last_names: str = Field(min_length=1, max_length=80)
     email: str = Field(max_length=254)
-    phone: str | None = Field(default=None, min_length=7, max_length=30)
+    phone: str | None = Field(
+        default=None, max_length=PHONE_MAX_LENGTH, pattern=PHONE_PATTERN
+    )
     department: str = Field(min_length=1, max_length=100)
     municipality: str = Field(min_length=1, max_length=100)
     requested_account_type: RequestedAccountType

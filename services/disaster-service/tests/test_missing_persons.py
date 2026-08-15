@@ -1057,3 +1057,51 @@ async def test_report_without_new_fields_still_works():
     stored = repository.created_report
     assert stored.tattoo_description is None
     assert stored.reporter_phone_public is False
+
+
+# --- CHG-100: el teléfono de contacto se valida contra E.164 ---
+
+
+@pytest.mark.anyio
+async def test_absurdly_long_phone_is_rejected():
+    app = report_app()
+
+    # El caso del reporte: 25 dígitos pasaban el límite anterior de 40
+    # y quedaban guardados como contacto inservible.
+    response = await post_report(
+        app,
+        payload=valid_payload(
+            reporterPhone="3345676543234565432356543",
+        ),
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_real_phone_formats_are_accepted():
+    for phone in [
+        "3001234567",
+        "+57 300 123 4567",
+        "(607) 634-5678",
+        "+123456789012345",
+    ]:
+        repository = FakeMissingPersonRepository()
+        app = report_app(repository=repository)
+
+        response = await post_report(
+            app, payload=valid_payload(reporterPhone=phone)
+        )
+
+        assert response.status_code == 201, phone
+
+
+@pytest.mark.anyio
+async def test_phone_without_digits_or_leading_zero_is_rejected():
+    app = report_app()
+
+    for phone in ["12345", "0300123456", "sin-numero"]:
+        response = await post_report(
+            app, payload=valid_payload(reporterPhone=phone)
+        )
+        assert response.status_code == 422, phone
