@@ -52,6 +52,8 @@ from .models import (
     HumanStatus,
     MissingPersonReportReceipt,
     MissingPersonSearchResponse,
+    PersonAutocompleteResponse,
+    PersonDuplicateCheckResponse,
     OperationalMapOverview,
     PeopleRecordPage,
     PublicPersonStatus,
@@ -164,6 +166,11 @@ def create_app(
     # CHG-034: límites separados por búsqueda, aporte anónimo y cuenta.
     directory_search_limiter = SlidingWindowRateLimiter(
         resolved_settings.directory_search_rate_limit_per_minute
+    )
+    # CHG-091: sugerencias mientras se escribe (autocomplete y chequeo
+    # de duplicados comparten presupuesto por origen).
+    suggestions_limiter = SlidingWindowRateLimiter(
+        resolved_settings.suggestions_rate_limit_per_minute
     )
     change_signal_limiter = SlidingWindowRateLimiter(
         resolved_settings.change_signal_rate_limit_per_minute
@@ -747,6 +754,90 @@ def create_app(
             return problem_response(
                 "No fue posible consultar la búsqueda en este momento.",
                 title="Servicio de búsqueda no disponible",
+            )
+
+    # CHG-091 — Sugerencias en tiempo real para prevenir duplicados.
+    @application.get(
+        "/api/v1/persons/autocomplete",
+        response_model=PersonAutocompleteResponse,
+        response_model_by_alias=True,
+        responses={
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["MissingPersons"],
+    )
+    async def autocomplete_persons(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        q: Annotated[str, Query(min_length=2, max_length=100)],
+        limit: Annotated[int, Query(ge=1, le=10)] = 5,
+    ):
+        if not suggestions_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de sugerencias por minuto."
+            )
+        try:
+            response = await upstream.get(
+                "/internal/v1/persons/autocomplete",
+                params={"q": q, "limit": limit},
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return PersonAutocompleteResponse.model_validate(
+                response.json()
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar las sugerencias en este momento.",
+                title="Servicio de sugerencias no disponible",
+            )
+
+    @application.get(
+        "/api/v1/persons/check-duplicates",
+        response_model=PersonDuplicateCheckResponse,
+        response_model_by_alias=True,
+        responses={
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["MissingPersons"],
+    )
+    async def check_person_duplicates(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        first_name: Annotated[
+            str, Query(alias="firstName", min_length=1, max_length=120)
+        ],
+        last_name: Annotated[
+            str, Query(alias="lastName", max_length=120)
+        ] = "",
+        limit: Annotated[int, Query(ge=1, le=10)] = 5,
+    ):
+        if not suggestions_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de sugerencias por minuto."
+            )
+        try:
+            response = await upstream.get(
+                "/internal/v1/persons/check-duplicates",
+                params={
+                    "firstName": first_name,
+                    "lastName": last_name,
+                    "limit": limit,
+                },
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return PersonDuplicateCheckResponse.model_validate(
+                response.json()
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible verificar duplicados en este momento.",
+                title="Servicio de sugerencias no disponible",
             )
 
     @application.post(

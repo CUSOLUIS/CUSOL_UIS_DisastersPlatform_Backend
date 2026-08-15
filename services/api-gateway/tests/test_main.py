@@ -615,6 +615,42 @@ RECEIPT_RESPONSE = {
     "receivedAt": "2026-08-12T16:00:00Z",
 }
 
+SUGGESTION_ITEM = {
+    "kind": "missing_person",
+    "id": "55555555-5555-4555-8555-555555555501",
+    "publicCaseCode": "MP-2026-DEMO01",
+    "displayName": "Camila Rueda (caso demo)",
+    "status": "missing",
+    "approximateAge": 34,
+    "lastSeenAt": "2026-08-10T18:30:00Z",
+    "lastSeenArea": "Sector Café Madrid",
+    "municipality": "Bucaramanga",
+    "department": "Santander",
+    "publicPhotoUrl": None,
+    "source": {
+        "name": "Registro público CUSOL",
+        "sourceType": "citizen",
+        "url": None,
+    },
+    "updatedAt": "2026-08-12T10:00:00Z",
+    "dataClassification": "demonstrative",
+    "similarity": 0.62,
+}
+
+AUTOCOMPLETE_RESPONSE = {
+    "items": [SUGGESTION_ITEM],
+    "query": "Kamila",
+    "generatedAt": "2026-08-15T12:00:00Z",
+}
+
+DUPLICATES_RESPONSE = {
+    "items": [SUGGESTION_ITEM],
+    "firstName": "Kamila",
+    "lastName": "Rueda",
+    "generatedAt": "2026-08-15T12:00:00Z",
+}
+
+
 REPORT_HEADERS = {"Idempotency-Key": "clave-idempotente-0001"}
 
 
@@ -680,6 +716,74 @@ async def test_missing_person_search_passes_through_client_errors():
 
     assert response.status_code == 422
     assert response.json()["title"] == "Consulta inválida"
+
+
+# --- CHG-091: sugerencias para prevenir duplicados ---
+
+
+@pytest.mark.anyio
+async def test_person_autocomplete_is_forwarded():
+    def handler(request: httpx.Request):
+        assert request.url.path == "/internal/v1/persons/autocomplete"
+        assert request.url.params["q"] == "Kamila"
+        assert request.url.params["limit"] == "5"
+        return httpx.Response(200, json=AUTOCOMPLETE_RESPONSE)
+
+    upstream = mock_client(handler)
+    app = create_app(SETTINGS, upstream)
+
+    response = await get(app, "/api/v1/persons/autocomplete?q=Kamila")
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["publicCaseCode"] == "MP-2026-DEMO01"
+    assert item["similarity"] == 0.62
+
+
+@pytest.mark.anyio
+async def test_person_check_duplicates_is_forwarded():
+    def handler(request: httpx.Request):
+        assert request.url.path == (
+            "/internal/v1/persons/check-duplicates"
+        )
+        assert request.url.params["firstName"] == "Kamila"
+        assert request.url.params["lastName"] == "Rueda"
+        return httpx.Response(200, json=DUPLICATES_RESPONSE)
+
+    upstream = mock_client(handler)
+    app = create_app(SETTINGS, upstream)
+
+    response = await get(
+        app,
+        "/api/v1/persons/check-duplicates"
+        "?firstName=Kamila&lastName=Rueda",
+    )
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["status"] == "missing"
+
+
+@pytest.mark.anyio
+async def test_person_suggestions_share_rate_limit():
+    upstream = mock_client(
+        lambda _: httpx.Response(200, json=AUTOCOMPLETE_RESPONSE)
+    )
+    app = create_app(
+        custom_settings(suggestions_rate_limit_per_minute=1), upstream
+    )
+
+    first = await get(app, "/api/v1/persons/autocomplete?q=Kamila")
+    second = await get(
+        app,
+        "/api/v1/persons/check-duplicates?firstName=Kamila",
+    )
+    await upstream.aclose()
+
+    assert first.status_code == 200
+    # Autocomplete y chequeo comparten el presupuesto por origen.
+    assert second.status_code == 429
 
 
 @pytest.mark.anyio

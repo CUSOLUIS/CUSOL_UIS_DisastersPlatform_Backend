@@ -426,6 +426,25 @@ class TemporaryShelterOfferDirectoryCard(ApiModel):
     data_classification: DataClassification
 
 
+# CHG-091 — Sugerencias en tiempo real para prevenir duplicados: la
+# tarjeta del directorio más la similitud trigram calculada en la base.
+class PersonSuggestion(MissingPersonDirectoryCard):
+    similarity: float = Field(ge=0.0, le=1.0)
+
+
+class PersonAutocompleteResponse(ApiModel):
+    items: list[PersonSuggestion] = Field(max_length=10)
+    query: str = Field(min_length=2, max_length=100)
+    generated_at: datetime
+
+
+class PersonDuplicateCheckResponse(ApiModel):
+    items: list[PersonSuggestion] = Field(max_length=10)
+    first_name: str = Field(min_length=1, max_length=120)
+    last_name: str = Field(max_length=120)
+    generated_at: datetime
+
+
 class HumanitarianDirectorySearchResponse(ApiModel):
     items: list[
         MissingPersonDirectoryCard

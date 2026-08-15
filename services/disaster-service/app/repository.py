@@ -22,6 +22,7 @@ from .models import (
     MissingPersonReportReceipt,
     OperationalMapPoint,
     PersonRecord,
+    PersonSuggestion,
     PublicPersonStatus,
     SourceReference,
     TemporaryShelterOfferDirectoryCard,
@@ -318,6 +319,19 @@ class DisasterRepository(Protocol):
         photos: list[StoredPhoto],
     ) -> tuple[MissingPersonReportReceipt, bool]: ...
 
+    # CHG-091 — Sugerencias difusas para prevenir duplicados.
+    async def autocomplete_persons(
+        self,
+        query: str,
+        limit: int,
+    ) -> list[PersonSuggestion]: ...
+
+    async def check_person_duplicates(
+        self,
+        full_name: str,
+        limit: int,
+    ) -> list[PersonSuggestion]: ...
+
     # CHG-034 — Directorio humanitario y aportes con evidencia.
     async def search_directory_missing_persons(
         self,
@@ -460,6 +474,10 @@ FALLBACK_PERSON_SOURCE = SourceReference(
     source_type="citizen",
     url=None,
 )
+
+# CHG-091: umbral de similitud trigram fijado por la especificación
+# (SIMILARITY(...) > 0.3).
+SIMILARITY_THRESHOLD = 0.3
 
 
 class PostgresDisasterRepository:
@@ -1431,6 +1449,143 @@ class PostgresDisasterRepository:
             for row in rows
         ]
         return cards, int(total)
+
+    # CHG-091 — Sugerencias difusas para prevenir duplicados. Solo la
+    # proyección pública publicada. similarity() cubre nombre completo
+    # contra nombre completo; word_similarity() cubre lo que se escribe
+    # a medias ("balentina" → "Valentina Gómez (caso demo)" da 0.7 por
+    # palabra y solo 0.24 global, que perdería el caso). La subcadena
+    # conserva el comportamiento exacto de la búsqueda existente.
+    _SUGGESTION_SQL = """
+        SELECT
+            mc.id, mc.public_case_code, mc.display_name,
+            mc.public_status, mc.approximate_age, mc.last_seen_at,
+            mc.last_seen_area, mc.municipality, mc.department,
+            mc.public_photo_url, mc.updated_at,
+            mc.data_classification,
+            s.name AS source_name, s.source_type, s.url AS source_url,
+            GREATEST(
+                similarity(
+                    disaster_service.immutable_unaccent(mc.display_name),
+                    disaster_service.immutable_unaccent($1)
+                ),
+                word_similarity(
+                    disaster_service.immutable_unaccent($1),
+                    disaster_service.immutable_unaccent(mc.display_name)
+                ),
+                word_similarity(
+                    disaster_service.immutable_unaccent($1),
+                    disaster_service.immutable_unaccent(
+                        array_to_string(mc.aliases, ' ')
+                    )
+                ),
+                -- El código es identificador exacto: si coincide, la
+                -- sugerencia manda con similitud plena.
+                CASE
+                    WHEN lower(mc.public_case_code)
+                        LIKE '%' || lower($1) || '%'
+                    THEN 1.0::real
+                    ELSE 0.0::real
+                END
+            ) AS match_similarity
+        FROM disaster_service.missing_person_cases mc
+        LEFT JOIN disaster_service.sources s ON s.id = mc.source_id
+        WHERE mc.publication_status = 'published'
+            AND (
+                GREATEST(
+                    similarity(
+                        disaster_service.immutable_unaccent(
+                            mc.display_name
+                        ),
+                        disaster_service.immutable_unaccent($1)
+                    ),
+                    word_similarity(
+                        disaster_service.immutable_unaccent($1),
+                        disaster_service.immutable_unaccent(
+                            mc.display_name
+                        )
+                    ),
+                    word_similarity(
+                        disaster_service.immutable_unaccent($1),
+                        disaster_service.immutable_unaccent(
+                            array_to_string(mc.aliases, ' ')
+                        )
+                    )
+                ) > $3
+                OR disaster_service.immutable_unaccent(mc.display_name)
+                    LIKE '%' || disaster_service.immutable_unaccent($1)
+                    || '%'
+                OR lower(mc.public_case_code)
+                    LIKE '%' || lower($1) || '%'
+                OR disaster_service.immutable_unaccent(mc.municipality)
+                    LIKE '%' || disaster_service.immutable_unaccent($1)
+                    || '%'
+            )
+        ORDER BY match_similarity DESC, mc.updated_at DESC, mc.id DESC
+        LIMIT $2
+    """
+
+    def _suggestion_from_row(self, row: dict) -> PersonSuggestion:
+        return PersonSuggestion(
+            id=row["id"],
+            public_case_code=row["public_case_code"],
+            display_name=row["display_name"],
+            status=row["public_status"],
+            approximate_age=row["approximate_age"],
+            last_seen_at=row["last_seen_at"],
+            last_seen_area=row["last_seen_area"],
+            municipality=row["municipality"],
+            department=row["department"],
+            public_photo_url=row["public_photo_url"],
+            source=(
+                SourceReference(
+                    name=row["source_name"],
+                    source_type=row["source_type"],
+                    url=row["source_url"],
+                )
+                if row["source_name"] is not None
+                else FALLBACK_PERSON_SOURCE
+            ),
+            updated_at=row["updated_at"],
+            data_classification=row["data_classification"],
+            similarity=min(1.0, float(row["match_similarity"])),
+        )
+
+    async def autocomplete_persons(
+        self,
+        query: str,
+        limit: int,
+    ) -> list[PersonSuggestion]:
+        rows = await self._pool.fetch(
+            self._SUGGESTION_SQL,
+            query.strip(),
+            limit,
+            SIMILARITY_THRESHOLD,
+        )
+        return [self._suggestion_from_row(row) for row in rows]
+
+    async def check_person_duplicates(
+        self,
+        full_name: str,
+        limit: int,
+    ) -> list[PersonSuggestion]:
+        # Al verificar duplicados la subcadena de municipio/código no
+        # aplica: se compara el nombre completo digitado contra el
+        # nombre público, exigiendo el umbral de similitud.
+        rows = await self._pool.fetch(
+            """
+            SELECT * FROM (
+            """
+            + self._SUGGESTION_SQL
+            + """
+            ) candidates
+            WHERE candidates.match_similarity > $3
+            """,
+            full_name.strip(),
+            limit,
+            SIMILARITY_THRESHOLD,
+        )
+        return [self._suggestion_from_row(row) for row in rows]
 
     async def search_directory_aid_locations(
         self,

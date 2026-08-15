@@ -628,6 +628,27 @@ class HumanitarianDirectorySearchResponse(ApiModel):
     generated_at: datetime
 
 
+# CHG-091 — Sugerencias en tiempo real para prevenir duplicados.
+# La sugerencia es la tarjeta pública del directorio más la similitud
+# calculada por pg_trgm, para que el frontend la proyecte directo a
+# sus componentes existentes.
+class PersonSuggestion(MissingPersonDirectoryCard):
+    similarity: float = Field(ge=0.0, le=1.0)
+
+
+class PersonAutocompleteResponse(ApiModel):
+    items: list[PersonSuggestion] = Field(max_length=10)
+    query: str = Field(min_length=2, max_length=100)
+    generated_at: datetime
+
+
+class PersonDuplicateCheckResponse(ApiModel):
+    items: list[PersonSuggestion] = Field(max_length=10)
+    first_name: str = Field(min_length=1, max_length=120)
+    last_name: str = Field(max_length=120)
+    generated_at: datetime
+
+
 class MissingPersonStatusReportInput(ApiModel):
     """Novedad privada sobre una persona; nunca se serializa en
     respuestas ni cambia el estado público al crearse."""

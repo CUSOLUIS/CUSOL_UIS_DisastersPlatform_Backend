@@ -22,6 +22,9 @@ class Settings:
     # CHG-034: límites separados por búsqueda de directorio, aporte
     # anónimo (por origen) y aporte con cuenta (por cuenta).
     directory_search_rate_limit_per_minute: int = 60
+    # CHG-091: sugerencias mientras se escribe; con debounce de 400 ms
+    # un tecleo rapido puede producir ~2 consultas/s en rafagas cortas.
+    suggestions_rate_limit_per_minute: int = 120
     # CHG-082: sonda de la señal de cambios (una consulta cada ~10 s
     # por pestaña abierta).
     change_signal_rate_limit_per_minute: int = 30
@@ -87,6 +90,9 @@ class Settings:
                 os.getenv(
                     "DIRECTORY_SEARCH_RATE_LIMIT_PER_MINUTE", "60"
                 )
+            ),
+            suggestions_rate_limit_per_minute=int(
+                os.getenv("SUGGESTIONS_RATE_LIMIT_PER_MINUTE", "120")
             ),
             anonymous_contribution_rate_limit_per_minute=int(
                 os.getenv(

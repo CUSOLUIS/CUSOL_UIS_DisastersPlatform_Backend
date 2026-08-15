@@ -13,6 +13,7 @@ from app.config import Settings
 from app.models import (
     MissingPersonPublicRecord,
     MissingPersonReportReceipt,
+    PersonSuggestion,
 )
 from app.photos import (
     SignatureMalwareScanner,
@@ -46,6 +47,23 @@ PUBLIC_RECORD = MissingPersonPublicRecord(
     data_classification="demonstrative",
 )
 
+SUGGESTION = PersonSuggestion(
+    id=UUID("55555555-5555-4555-8555-555555555501"),
+    public_case_code="MP-2026-DEMO01",
+    display_name="Camila Rueda (caso demo)",
+    status="missing",
+    approximate_age=34,
+    last_seen_at=datetime(2026, 8, 10, 18, 30, tzinfo=UTC),
+    last_seen_area="Sector Café Madrid",
+    municipality="Bucaramanga",
+    department="Santander",
+    public_photo_url=None,
+    source={"name": "Registro público CUSOL", "sourceType": "citizen", "url": None},
+    updated_at=datetime(2026, 8, 12, 10, 0, tzinfo=UTC),
+    data_classification="demonstrative",
+    similarity=0.62,
+)
+
 RECEIPT = MissingPersonReportReceipt(
     id=UUID("66666666-6666-4666-8666-666666666601"),
     public_case_code="MP-2026-AAAA1111",
@@ -68,6 +86,15 @@ class FakeMissingPersonRepository:
     async def search_missing_persons(self, query, limit):
         self.last_search = {"query": query, "limit": limit}
         return [PUBLIC_RECORD], 1
+
+    # CHG-091 — Sugerencias difusas.
+    async def autocomplete_persons(self, query, limit):
+        self.last_autocomplete = {"query": query, "limit": limit}
+        return [SUGGESTION]
+
+    async def check_person_duplicates(self, full_name, limit):
+        self.last_duplicates = {"fullName": full_name, "limit": limit}
+        return [SUGGESTION]
 
     async def create_missing_person_report(self, report, photos):
         if self.fail:
@@ -227,6 +254,82 @@ async def test_search_rejects_short_queries():
 
     assert too_short.status_code == 422
     assert blank.status_code == 422
+
+
+# --- CHG-091: sugerencias para prevenir duplicados ---
+
+
+@pytest.mark.anyio
+async def test_autocomplete_returns_suggestions_with_similarity():
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    response = await request_app(
+        app, "GET", "/internal/v1/persons/autocomplete?q=Kamila&limit=5"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["query"] == "Kamila"
+    assert repository.last_autocomplete == {"query": "Kamila", "limit": 5}
+    item = body["items"][0]
+    # La tarjeta pública del directorio + similitud; nada privado.
+    assert item["publicCaseCode"] == "MP-2026-DEMO01"
+    assert item["status"] == "missing"
+    assert item["municipality"] == "Bucaramanga"
+    assert item["similarity"] == 0.62
+    forbidden = {
+        "documentNumber", "medicalInformation", "reporterName",
+        "reporterPhone", "reporterEmail",
+    }
+    assert forbidden.isdisjoint(item.keys())
+
+
+@pytest.mark.anyio
+async def test_autocomplete_rejects_short_queries():
+    app = report_app()
+
+    response = await request_app(
+        app, "GET", "/internal/v1/persons/autocomplete?q=%20a"
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_check_duplicates_joins_names_and_returns_matches():
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "GET",
+        "/internal/v1/persons/check-duplicates"
+        "?firstName=Kamila&lastName=Rueda",
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["firstName"] == "Kamila"
+    assert body["lastName"] == "Rueda"
+    assert repository.last_duplicates == {
+        "fullName": "Kamila Rueda",
+        "limit": 5,
+    }
+    assert body["items"][0]["publicCaseCode"] == "MP-2026-DEMO01"
+
+
+@pytest.mark.anyio
+async def test_check_duplicates_rejects_names_too_short():
+    app = report_app()
+
+    response = await request_app(
+        app,
+        "GET",
+        "/internal/v1/persons/check-duplicates?firstName=Jo&lastName=",
+    )
+
+    assert response.status_code == 422
 
 
 # --- Recepción de reportes ---

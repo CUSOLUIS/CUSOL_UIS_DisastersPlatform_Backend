@@ -62,6 +62,8 @@ from .models import (
     OperationalMapPoint,
     OperationalMapSummary,
     PeopleRecordPage,
+    PersonAutocompleteResponse,
+    PersonDuplicateCheckResponse,
     PersonStatusReportPublic,
     PersonStatusReportsPage,
     PublicPersonStatus,
@@ -903,6 +905,66 @@ def create_app(
         items, total = await data.search_missing_persons(q, limit)
         return MissingPersonSearchResponse(
             items=items, total=total, query=q
+        )
+
+    # CHG-091 — Sugerencias en tiempo real para prevenir duplicados.
+    @application.get(
+        "/internal/v1/persons/autocomplete",
+        response_model=PersonAutocompleteResponse,
+        response_model_by_alias=True,
+        tags=["MissingPersons"],
+    )
+    async def autocomplete_persons(
+        data: Annotated[
+            DisasterRepository, Depends(get_repository)
+        ],
+        q: Annotated[str, Query(min_length=2, max_length=100)],
+        limit: Annotated[int, Query(ge=1, le=10)] = 5,
+    ):
+        if len(q.strip()) < 2:
+            return problem(
+                422,
+                "Consulta inválida",
+                "La consulta requiere al menos dos caracteres.",
+            )
+        items = await data.autocomplete_persons(q, limit)
+        return PersonAutocompleteResponse(
+            items=items,
+            query=q,
+            generated_at=datetime.now(UTC),
+        )
+
+    @application.get(
+        "/internal/v1/persons/check-duplicates",
+        response_model=PersonDuplicateCheckResponse,
+        response_model_by_alias=True,
+        tags=["MissingPersons"],
+    )
+    async def check_person_duplicates(
+        data: Annotated[
+            DisasterRepository, Depends(get_repository)
+        ],
+        first_name: Annotated[
+            str, Query(alias="firstName", min_length=1, max_length=120)
+        ],
+        last_name: Annotated[
+            str, Query(alias="lastName", max_length=120)
+        ] = "",
+        limit: Annotated[int, Query(ge=1, le=10)] = 5,
+    ):
+        full_name = f"{first_name.strip()} {last_name.strip()}".strip()
+        if len(full_name) < 3:
+            return problem(
+                422,
+                "Consulta inválida",
+                "El nombre requiere al menos tres caracteres.",
+            )
+        items = await data.check_person_duplicates(full_name, limit)
+        return PersonDuplicateCheckResponse(
+            items=items,
+            first_name=first_name,
+            last_name=last_name,
+            generated_at=datetime.now(UTC),
         )
 
     @application.post(
