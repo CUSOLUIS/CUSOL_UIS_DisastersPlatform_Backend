@@ -27,3 +27,33 @@ ALTER TABLE disaster_service.missing_person_cases
         public_photo_withdrawn_at IS NULL
         OR public_photo_object_key IS NULL
     );
+
+-- Backfill de los casos creados antes de este cambio. Sus fotografías
+-- estaban guardadas y con la misma autorización del reportante, pero
+-- sin camino hacia la vista pública, así que la ficha mostraba el
+-- marcador genérico. Se aplica el mismo criterio que el código: se
+-- prefiere la marcada como rostro reciente y, en su defecto, la
+-- primera; siempre el objeto derivado, nunca el original en cuarentena.
+--
+-- Idempotente y respetuoso de las decisiones ya tomadas: solo toca
+-- casos publicados que aún no tienen fotografía publicada y a los que
+-- nadie se la ha retirado.
+UPDATE disaster_service.missing_person_cases mc
+SET public_photo_object_key = elegida.derived_storage_key,
+    updated_at = NOW()
+FROM (
+    SELECT DISTINCT ON (r.public_case_code)
+           r.public_case_code,
+           p.derived_storage_key
+    FROM disaster_service.missing_person_reports r
+    JOIN disaster_service.missing_person_report_photos p
+        ON p.report_id = r.id
+    WHERE p.malware_scan = 'clean'
+    ORDER BY r.public_case_code,
+             (p.category = 'recent_face') DESC NULLS LAST,
+             p.position ASC
+) AS elegida
+WHERE mc.public_case_code = elegida.public_case_code
+  AND mc.publication_status = 'published'
+  AND mc.public_photo_object_key IS NULL
+  AND mc.public_photo_withdrawn_at IS NULL;
