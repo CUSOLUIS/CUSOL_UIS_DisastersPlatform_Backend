@@ -137,14 +137,48 @@ jobs:
       - name: Forzar el hot path a la imagen recién construida
         run: |
           cd "$COMPOSE_DIR"
+
+          # `docker compose config --images <servicio>` IGNORA el
+          # argumento en esta versión de Compose: imprime TODAS las
+          # imágenes del archivo y en orden arbitrario, así que el
+          # `head -1` de la primera versión devolvía la imagen de otro
+          # servicio (admin-bootstrap cuando se pedía api-gateway). En
+          # producción eso significa poner el hot path a correr otra
+          # cosa. La correspondencia fiable es la etiqueta que Compose
+          # graba en cada imagen que construye
+          # (`com.docker.compose.service`): se cruza el conjunto de
+          # imágenes del archivo con las etiquetadas para el servicio.
+          normaliza() {
+            case "${1##*/}" in
+              *:*) printf '%s\n' "$1" ;;
+              *) printf '%s:latest\n' "$1" ;;
+            esac
+          }
+
+          del_archivo=$(docker compose config --images | while IFS= read -r i; do normaliza "$i"; done)
+
           for servicio in disaster-service api-gateway; do
             echo "--- $servicio ---"
-            imagen=$(docker compose config --images "$servicio" 2>/dev/null | head -1)
+            etiquetadas=$(docker image ls --filter "label=com.docker.compose.service=$servicio" --format '{{.Repository}}:{{.Tag}}')
+            imagen=''
+            for candidata in $etiquetadas; do
+              for declarada_archivo in $del_archivo; do
+                if [ "$candidata" = "$declarada_archivo" ]; then
+                  imagen=$candidata
+                  break 2
+                fi
+              done
+            done
             if [ -z "$imagen" ]; then
-              echo "::error::No se pudo determinar la imagen de $servicio en $COMPOSE_DIR."
+              echo "::error::No se pudo identificar sin ambigüedad la imagen de $servicio en $COMPOSE_DIR."
+              echo "  imágenes del archivo:            $(echo $del_archivo)"
+              echo "  imágenes etiquetadas para $servicio: ${etiquetadas:-ninguna}"
               exit 1
             fi
-            id=$(docker image inspect --format '{{.Id}}' "$imagen")
+            if ! id=$(docker image inspect --format '{{.Id}}' "$imagen" 2>/dev/null); then
+              echo "::error::$imagen no existe en este nodo después del build."
+              exit 1
+            fi
             echo "  imagen construida: $imagen"
             echo "  identificador:     $id"
 
@@ -162,9 +196,26 @@ jobs:
               echo "::warning::borde-hp_$servicio no existe en el stack borde-hp; no hay nada que forzar."
               continue
             fi
-            echo "  imagen declarada por el stack: $(docker service inspect "borde-hp_$servicio" --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')"
-            docker service update --detach=false --resolve-image=never \
-              --force --image "$id" "borde-hp_$servicio"
+            declarada_stack=$(docker service inspect "borde-hp_$servicio" --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')
+            echo "  imagen declarada por el stack: $declarada_stack"
+            # Swarm fija un digest a la etiqueta al desplegar, y ese
+            # digest es lo que congela el contenido: mientras siga ahí,
+            # reiniciar la réplica reproduce la imagen vieja aunque la
+            # etiqueta ya apunte a otra cosa. Se compara sin él.
+            if [ "$(normaliza "${declarada_stack%@*}")" != "$imagen" ]; then
+              echo "::warning::El stack declara ${declarada_stack%@*} pero Compose construye $imagen. Mientras docker-compose.swarm-hotpath.yml (que vive fuera de este repo) no apunte a la misma etiqueta, cada 'stack deploy' vuelve a dejar producción en la imagen anterior."
+            fi
+
+            # --no-resolve-image es el flag real: --resolve-image=never
+            # no existe y hacía fallar este paso entero (el despliegue
+            # de fa14ff8/71468eb murió aquí). Evita que Swarm consulte
+            # el registro y vuelva a fijar un digest, así que la
+            # especificación queda con la etiqueta, que en este nodo ya
+            # apunta al contenido recién construido. --force redespliega
+            # aunque la especificación no cambie y --detach=false espera
+            # a que las réplicas converjan.
+            docker service update --detach=false --no-resolve-image \
+              --force --image "$imagen" "borde-hp_$servicio"
 
             for contenedor in $(docker ps -q --filter "label=com.docker.swarm.service.name=borde-hp_$servicio"); do
               corriendo=$(docker inspect --format '{{.Image}}' "$contenedor")
