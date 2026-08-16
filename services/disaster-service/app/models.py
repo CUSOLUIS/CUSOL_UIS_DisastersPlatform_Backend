@@ -5,6 +5,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .person_options import DOCUMENT_TYPES, NATIONALITIES, SEXES
+from .text_quality import TextQualityError, validate_community_text
 
 
 VerificationStatus = Literal[
@@ -783,6 +784,19 @@ class MissingPersonStatusReportInput(ApiModel):
     location_description: str | None = Field(default=None, max_length=300)
     truth_confirmed: Literal[True]
     review_acknowledged: Literal[True]
+
+    # CHG-107: 30 caracteres los cumplen treinta letras iguales. Esta
+    # regla no juzga el contenido —eso es del equipo de revisión— sino
+    # que descarta lo que evidentemente no es una descripción escrita.
+    @model_validator(mode="after")
+    def _evidence_is_readable(self):
+        try:
+            validate_community_text(
+                self.evidence_description, "evidenceDescription"
+            )
+        except TextQualityError as error:
+            raise ValueError(str(error)) from error
+        return self
 
 
 class AidLocationRatingInput(ApiModel):

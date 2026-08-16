@@ -4110,14 +4110,24 @@ _PERSON_PUBLIC_STATUS_EXPRESSION = """
             LIMIT 1
         ),
         (
+            -- CHG-107: el umbral cuenta CUENTAS DISTINTAS, no reportes.
+            -- Antes era COUNT(*), así que un mismo actor enviando cinco
+            -- novedades cambiaba el estado público de una persona
+            -- desaparecida; con reportes anónimos, sin coste alguno.
+            -- Ahora solo suman aportes con cuenta identificable y cada
+            -- cuenta cuenta una vez: reunir cinco exige cinco correos
+            -- verificados distintos. Los anónimos se siguen guardando y
+            -- se revisan, pero no mueven el estado por sí solos.
             SELECT r.claimed_outcome
             FROM disaster_service.person_status_reports r
             WHERE r.person_id = mc.id
               AND r.moderation_status NOT IN ('rejected', 'withdrawn')
               AND r.archived_at IS NULL
+              AND r.account_id IS NOT NULL
             GROUP BY r.claimed_outcome
-            HAVING COUNT(*) >= 5
-            ORDER BY COUNT(*) DESC, MAX(r.received_at) DESC
+            HAVING COUNT(DISTINCT r.account_id) >= 5
+            ORDER BY COUNT(DISTINCT r.account_id) DESC,
+                     MAX(r.received_at) DESC
             LIMIT 1
         ),
         'missing'
