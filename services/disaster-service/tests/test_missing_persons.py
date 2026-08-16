@@ -1199,3 +1199,66 @@ async def test_last_seen_within_coverage_is_accepted():
     )
 
     assert response.status_code == 201
+
+
+# --- CHG-113: la vestimenta es opcional ---
+
+
+@pytest.mark.anyio
+async def test_report_without_clothing_description_is_accepted():
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    payload = valid_payload()
+    payload.pop("clothingDescription")
+
+    response = await post_report(app, payload=payload)
+
+    assert response.status_code == 201
+    assert repository.created_report.clothing_description is None
+
+
+@pytest.mark.anyio
+async def test_blank_clothing_description_is_stored_as_absent():
+    # Quien no sabe la ropa y deja el campo en blanco dice lo mismo que
+    # quien lo omite: se guarda como ausencia, no como cadena vacía, o
+    # la ficha pública mostraría "Vestimenta:" seguido de nada en vez de
+    # su texto de respaldo.
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    response = await post_report(
+        app, payload=valid_payload(clothingDescription="   ")
+    )
+
+    assert response.status_code == 201
+    assert repository.created_report.clothing_description is None
+
+
+@pytest.mark.anyio
+async def test_clothing_description_is_still_stored_when_known():
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    response = await post_report(
+        app,
+        payload=valid_payload(
+            clothingDescription="Chaqueta amarilla y jean azul"
+        ),
+    )
+
+    assert response.status_code == 201
+    assert repository.created_report.clothing_description == (
+        "Chaqueta amarilla y jean azul"
+    )
+
+
+@pytest.mark.anyio
+async def test_clothing_description_still_has_a_length_limit():
+    app = report_app()
+
+    response = await post_report(
+        app, payload=valid_payload(clothingDescription="x" * 1001)
+    )
+
+    assert response.status_code == 422

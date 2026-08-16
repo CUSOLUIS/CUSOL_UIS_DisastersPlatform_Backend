@@ -105,8 +105,10 @@ EDITABLE_FIELDS: dict[str, dict[str, EditableField]] = {
         "department": EditableField("department", 100),
         "municipality": EditableField("municipality", 100),
         "lastSeenArea": EditableField("last_seen_area", 300),
+        # CHG-113: opcional desde el envío, así que la moderación
+        # también puede vaciarlo para retirar un "no sé" heredado.
         "clothingDescription": EditableField(
-            "clothing_description", 1000, "multiline"
+            "clothing_description", 1000, "multiline", min_length=0
         ),
         "circumstances": EditableField(
             "circumstances", 2000, "multiline"

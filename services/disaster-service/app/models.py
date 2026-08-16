@@ -343,7 +343,13 @@ class MissingPersonReportInput(ApiModel):
     department: str = Field(min_length=1, max_length=100)
     municipality: str = Field(min_length=1, max_length=100)
     last_seen_area: str = Field(min_length=1, max_length=300)
-    clothing_description: str = Field(min_length=1, max_length=1000)
+    # CHG-113: quien denuncia una desaparición muchas veces no sabe
+    # con qué ropa salió la persona. Exigirlo llenaba la columna de
+    # "no sé" — texto que además entra en el índice de búsqueda de
+    # casos, así que degradaba la búsqueda para todos.
+    clothing_description: str | None = Field(
+        default=None, max_length=1000
+    )
     circumstances: str = Field(min_length=1, max_length=2000)
     additional_description: str | None = Field(default=None, max_length=2000)
     reporter_name: str = Field(min_length=1, max_length=160)
@@ -379,6 +385,17 @@ class MissingPersonReportInput(ApiModel):
     # una revisión previa; se acepta el campo por compatibilidad con
     # clientes antiguos y se ignora su valor.
     review_acknowledged: bool = True
+
+    # CHG-113: un cliente que mande la vestimenta en blanco está
+    # diciendo lo mismo que uno que la omite. Se guarda como ausencia y
+    # no como cadena vacía: la ficha pública distingue "sin dato" de un
+    # texto vacío, y la búsqueda de casos no indexa nada.
+    @model_validator(mode="after")
+    def _blank_clothing_is_absent(self):
+        if self.clothing_description is not None:
+            limpio = self.clothing_description.strip()
+            self.clothing_description = limpio or None
+        return self
 
     # CHG-106: la última visualización no puede ser anterior al primer
     # año que cubre la plataforma.

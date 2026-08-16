@@ -101,7 +101,8 @@ class StoredReport:
     department: str
     municipality: str
     last_seen_area: str
-    clothing_description: str
+    # CHG-113: opcional; quien reporta puede no conocer la vestimenta.
+    clothing_description: str | None
     circumstances: str
     additional_description: str | None
     reporter_name_encrypted: bytes
