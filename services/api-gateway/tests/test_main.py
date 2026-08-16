@@ -1397,3 +1397,104 @@ async def test_change_signal_rate_limit():
 
     assert first.status_code == 200
     assert second.status_code == 429
+
+
+# CHG-111 — La plataforma tiene que poder demostrar qué código sirve.
+
+
+@pytest.mark.anyio
+async def test_version_reports_own_and_upstream_revision():
+    def handler(request: httpx.Request):
+        assert request.url.path == "/health/version"
+        return httpx.Response(
+            200,
+            json={"service": "disaster-service", "revision": "abc123"},
+        )
+
+    upstream = mock_client(handler)
+    app = create_app(custom_settings(git_revision="def456"), upstream)
+
+    response = await get(app, "/api/v1/platform/version")
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "service": "api-gateway",
+        "revision": "def456",
+        "upstream": {
+            "service": "disaster-service",
+            "revision": "abc123",
+        },
+    }
+
+
+@pytest.mark.anyio
+async def test_version_answers_even_if_upstream_is_down():
+    # La revisión del gateway es justo lo que hay que comprobar cuando
+    # algo va mal; no puede depender de que el otro servicio conteste.
+    def handler(_: httpx.Request):
+        raise httpx.ConnectError("sin ruta al servicio de desastres")
+
+    upstream = mock_client(handler)
+    app = create_app(custom_settings(git_revision="def456"), upstream)
+
+    response = await get(app, "/api/v1/platform/version")
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "service": "api-gateway",
+        "revision": "def456",
+        "upstream": None,
+    }
+
+
+@pytest.mark.anyio
+async def test_version_ignores_an_unreadable_upstream_answer():
+    upstream = mock_client(
+        lambda _: httpx.Response(200, json={"nada": "que ver"})
+    )
+    app = create_app(custom_settings(git_revision="def456"), upstream)
+
+    response = await get(app, "/api/v1/platform/version")
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    assert response.json()["upstream"] is None
+    assert response.json()["revision"] == "def456"
+
+
+@pytest.mark.anyio
+async def test_version_is_unknown_when_the_image_was_built_without_it():
+    upstream = mock_client(
+        lambda _: httpx.Response(
+            200, json={"service": "disaster-service", "revision": "unknown"}
+        )
+    )
+    app = create_app(SETTINGS, upstream)
+
+    response = await get(app, "/api/v1/platform/version")
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    # Nunca se inventa una revisión: si no la sabe, lo dice.
+    assert response.json()["revision"] == "unknown"
+
+
+@pytest.mark.anyio
+async def test_version_enforces_its_rate_limit():
+    upstream = mock_client(
+        lambda _: httpx.Response(
+            200, json={"service": "disaster-service", "revision": "abc123"}
+        )
+    )
+    app = create_app(
+        custom_settings(version_rate_limit_per_minute=1), upstream
+    )
+
+    first = await get(app, "/api/v1/platform/version")
+    second = await get(app, "/api/v1/platform/version")
+    await upstream.aclose()
+
+    assert first.status_code == 200
+    assert second.status_code == 429

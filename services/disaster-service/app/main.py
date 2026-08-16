@@ -68,6 +68,7 @@ from .models import (
     PersonStatusReportPublic,
     PersonStatusReportsPage,
     PublicPersonStatus,
+    ServiceVersion,
     UnverifiedBuildingReportInput,
     UnverifiedBuildingReportReceipt,
     VerificationStatus,
@@ -647,6 +648,20 @@ def create_app(
     )
     async def liveness() -> HealthStatus:
         return HealthStatus(status="ok", service="disaster-service")
+
+    # CHG-111: el gateway lee esto para publicar la revisión que corre
+    # detrás de él. Vive en el espacio de salud interno, no en el
+    # contrato público.
+    @application.get(
+        "/health/version",
+        response_model=ServiceVersion,
+        tags=["Platform"],
+    )
+    async def version() -> ServiceVersion:
+        return ServiceVersion(
+            service="disaster-service",
+            revision=resolved_settings.git_revision,
+        )
 
     @application.get(
         "/health/ready",

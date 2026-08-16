@@ -28,6 +28,10 @@ services:
     build:
       context: ./services/disaster-service
       target: development
+      args:
+        # CHG-111: en local no hay commit desplegado; la revisión
+        # queda en "unknown" salvo que se exporte GIT_REVISION.
+        GIT_REVISION: ${GIT_REVISION:-unknown}
     environment:
       DATABASE_URL: >-
         postgresql://${POSTGRES_USER:-disasters}:${POSTGRES_PASSWORD:-disasters-local-only}@disasters-db:5432/${POSTGRES_DB:-disasters}
@@ -199,6 +203,10 @@ services:
     build:
       context: ./services/api-gateway
       target: development
+      args:
+        # CHG-111: en local no hay commit desplegado; la revisión
+        # queda en "unknown" salvo que se exporte GIT_REVISION.
+        GIT_REVISION: ${GIT_REVISION:-unknown}
     environment:
       DISASTER_SERVICE_URL: http://disaster-service:8001
       IDENTITY_SERVICE_URL: http://identity-service:8002

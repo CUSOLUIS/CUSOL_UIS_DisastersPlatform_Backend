@@ -12,6 +12,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# CHG-111: el commit del que salió esta imagen viaja dentro de ella.
+# Va después de las capas caras (dependencias) y junto al código, que
+# ya cambia en cada commit, así que no invalida caché útil. Sin el
+# argumento —desarrollo local, build manual— queda en "unknown".
+ARG GIT_REVISION=unknown
+ENV GIT_REVISION=${GIT_REVISION}
+
 # CHG-007: directorio de objetos para fotografías (volumen en Compose).
 RUN mkdir -p /data/uploads
 

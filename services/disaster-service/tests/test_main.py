@@ -6,6 +6,7 @@ import pytest
 
 from pydantic import ValidationError
 
+from app.config import Settings
 from app.main import create_app, protect_missing_person
 from app.models import (
     DisasterEvent,
@@ -453,3 +454,45 @@ def test_protect_missing_person_keeps_building_pending_intact():
     )
 
     assert protect_missing_person(building) is building
+
+
+# CHG-111 — El servicio declara de qué commit salió su imagen.
+
+
+@pytest.mark.anyio
+async def test_version_reports_the_build_revision():
+    app = create_app(
+        settings=Settings(
+            database_url="postgresql://test:test@localhost:5432/test",
+            database_pool_min_size=1,
+            database_pool_max_size=2,
+            git_revision="abc123",
+        ),
+        repository=FakeRepository(),
+    )
+
+    response = await get(app, "/health/version")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "service": "disaster-service",
+        "revision": "abc123",
+    }
+
+
+@pytest.mark.anyio
+async def test_version_is_unknown_without_the_build_argument():
+    app = create_app(
+        settings=Settings(
+            database_url="postgresql://test:test@localhost:5432/test",
+            database_pool_min_size=1,
+            database_pool_max_size=2,
+        ),
+        repository=FakeRepository(),
+    )
+
+    response = await get(app, "/health/version")
+
+    assert response.status_code == 200
+    # Sin el argumento no se inventa una revisión.
+    assert response.json()["revision"] == "unknown"

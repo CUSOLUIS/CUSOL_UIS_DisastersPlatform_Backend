@@ -57,7 +57,9 @@ from .models import (
     PersonDuplicateCheckResponse,
     OperationalMapOverview,
     PeopleRecordPage,
+    PlatformVersion,
     PublicPersonStatus,
+    ServiceVersion,
     SessionEnvelope,
     UnverifiedBuildingReportReceipt,
     VerificationStatus,
@@ -175,6 +177,11 @@ def create_app(
     )
     change_signal_limiter = SlidingWindowRateLimiter(
         resolved_settings.change_signal_rate_limit_per_minute
+    )
+    # CHG-111: la consulta de revisión es pública y consulta al servicio
+    # de desastres, así que lleva su propio presupuesto por origen.
+    version_limiter = SlidingWindowRateLimiter(
+        resolved_settings.version_rate_limit_per_minute
     )
     anonymous_contribution_limiter = SlidingWindowRateLimiter(
         resolved_settings.anonymous_contribution_rate_limit_per_minute
@@ -2167,6 +2174,37 @@ def create_app(
                 "No fue posible consultar la señal de cambios.",
                 title="Señal no disponible",
             )
+
+    # CHG-111 — Qué revisión está sirviendo la plataforma. Existe para
+    # que un despliegue no pueda distinguirse de un despliegue que no
+    # ocurrió: el pipeline compara esto con el commit desplegado y
+    # aborta si no coinciden.
+    @application.get(
+        "/api/v1/platform/version",
+        response_model=PlatformVersion,
+        responses={429: {"description": "Límite de consultas excedido"}},
+        tags=["Platform"],
+    )
+    async def platform_version(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        if not version_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        detras: ServiceVersion | None = None
+        try:
+            response = await upstream.get("/health/version")
+            response.raise_for_status()
+            detras = ServiceVersion.model_validate(response.json())
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            detras = None
+        return PlatformVersion(
+            service="api-gateway",
+            revision=resolved_settings.git_revision,
+            upstream=detras,
+        )
 
     @application.get(
         "/api/v1/humanitarian-directory/search",

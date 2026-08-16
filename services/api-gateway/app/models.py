@@ -768,3 +768,18 @@ class MyReportsPage(ApiModel):
 class HealthStatus(BaseModel):
     status: Literal["ok"]
     service: str
+
+
+class ServiceVersion(BaseModel):
+    service: str
+    revision: str
+
+
+class PlatformVersion(BaseModel):
+    # CHG-111: qué código está sirviendo de verdad. `revision` es
+    # "unknown" si la imagen se construyó sin GIT_REVISION, y `upstream`
+    # es null si el servicio de desastres no contesta: la verificación
+    # del gateway no puede depender de que el otro esté vivo.
+    service: str
+    revision: str
+    upstream: ServiceVersion | None = None

@@ -44,6 +44,14 @@ class Settings:
     # CHG-066: reportes de presencia por dispositivo (throttle cliente
     # ~30 s; el límite cubre abusos).
     presence_rate_limit_per_minute: int = 10
+    # CHG-111: la consulta de revisión la usa el pipeline (una vez por
+    # despliegue) y cualquiera que quiera comprobar qué corre; con 30
+    # por minuto y origen sobra sin abrir un vector de amplificación.
+    version_rate_limit_per_minute: int = 30
+    # CHG-111: commit del que salió la imagen. Lo inyecta el build
+    # (`--build-arg GIT_REVISION`); sin él la imagen no sabe de dónde
+    # viene y lo dice, en vez de fingir una revisión.
+    git_revision: str = "unknown"
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -130,4 +138,9 @@ class Settings:
             presence_rate_limit_per_minute=int(
                 os.getenv("PRESENCE_RATE_LIMIT_PER_MINUTE", "10")
             ),
+            version_rate_limit_per_minute=int(
+                os.getenv("VERSION_RATE_LIMIT_PER_MINUTE", "30")
+            ),
+            git_revision=os.getenv("GIT_REVISION", "unknown").strip()
+            or "unknown",
         )

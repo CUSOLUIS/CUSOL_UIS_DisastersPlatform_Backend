@@ -25,6 +25,8 @@ class Settings:
     # cuenta (dueño de los correos de los titulares).
     identity_service_url: str = "http://identity-service:8002"
     notification_timeout_seconds: float = 5.0
+    # CHG-111: commit del que salió la imagen, inyectado por el build.
+    git_revision: str = "unknown"
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -57,4 +59,6 @@ class Settings:
             notification_timeout_seconds=float(
                 os.getenv("NOTIFICATION_TIMEOUT_SECONDS", "5")
             ),
+            git_revision=os.getenv("GIT_REVISION", "unknown").strip()
+            or "unknown",
         )

@@ -1293,3 +1293,10 @@ class ChangeSignal(ApiModel):
 class HealthStatus(BaseModel):
     status: Literal["ok"]
     service: str
+
+
+class ServiceVersion(BaseModel):
+    # CHG-111: "unknown" cuando la imagen se construyó sin
+    # GIT_REVISION; nunca se inventa una revisión.
+    service: str
+    revision: str
