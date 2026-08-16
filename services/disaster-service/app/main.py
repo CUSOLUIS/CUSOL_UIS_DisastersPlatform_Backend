@@ -112,17 +112,28 @@ from .storage import (
 )
 
 
-def problem(status_code: int, title: str, detail: str) -> JSONResponse:
+def problem(
+    status_code: int,
+    title: str,
+    detail: str,
+    fields: list[str] | None = None,
+) -> JSONResponse:
     """Respuesta `application/problem+json` sin datos sensibles."""
+    content = {
+        "type": "about:blank",
+        "title": title,
+        "status": status_code,
+        "detail": detail,
+    }
+    # CHG-114: `detail` es para la persona; `fields` es para el cliente,
+    # que con las claves resalta el campo y desplaza la pantalla hasta
+    # él. Sin esta lista tendría que adivinarlas parseando el texto.
+    if fields:
+        content["fields"] = fields
     return JSONResponse(
         status_code=status_code,
         media_type="application/problem+json",
-        content={
-            "type": "about:blank",
-            "title": title,
-            "status": status_code,
-            "detail": detail,
-        },
+        content=content,
     )
 
 
@@ -415,6 +426,64 @@ ADMIN_FIELD_SPECS: dict[str, list[tuple]] = {
          "email"),
     ],
 }
+
+
+# CHG-114 — Nombres legibles de los campos para los mensajes de
+# rechazo. Antes el `detail` del 422 concatenaba las claves del modelo
+# ("Revisa los campos: reporterPhone.") y quien reporta no tiene por
+# qué saber qué es eso. Las etiquetas ya existían para la consola
+# administrativa (CHG-036), así que se reutiliza esa tabla en vez de
+# mantener un segundo diccionario que se desincronice.
+FIELD_LABELS: dict[str, str] = {
+    clave: etiqueta
+    for especificaciones in ADMIN_FIELD_SPECS.values()
+    for clave, etiqueta, *_ in especificaciones
+}
+
+# Campos que el formulario envía y la consola no muestra, así que no
+# tenían etiqueta.
+FIELD_LABELS.update(
+    {
+        "genderIdentity": "Sexo",
+        "nationality": "Nacionalidad",
+        "heightCm": "Estatura",
+        "build": "Contextura",
+        "skinTone": "Tono de piel",
+        "hairDescription": "Cabello",
+        "eyeDescription": "Ojos",
+        "isReporterPhonePublic": "Autoriza compartir su teléfono",
+        "isReporterEmailPublic": "Autoriza compartir su correo",
+        "photoCategories": "Categorías de las fotografías",
+        "truthConfirmed": "Confirmación de veracidad",
+        "photoAuthorizationConfirmed": "Autorización de las fotografías",
+        "reviewAcknowledged": "Confirmación de revisión",
+        "relatedDisasterId": "Evento relacionado",
+        "payload": "Formulario",
+    }
+)
+
+
+def field_label(clave: str) -> str:
+    """Etiqueta legible; si no hay, la clave tal cual (nunca vacía)."""
+    return FIELD_LABELS.get(clave, clave)
+
+
+def invalid_fields(error: ValidationError) -> list[str]:
+    """Claves rechazadas, sin repetir y sin devolver valor alguno."""
+    return sorted(
+        {
+            str(item["loc"][0]) if item["loc"] else "payload"
+            for item in error.errors()
+        }
+    )
+
+
+def invalid_fields_detail(claves: list[str]) -> str:
+    return (
+        "Revisa los campos: "
+        + ", ".join(field_label(clave) for clave in claves)
+        + "."
+    )
 
 # Unión discriminada del contrato para el ingreso de ofertas (CHG-044).
 AID_OFFER_INPUT_ADAPTER: TypeAdapter = TypeAdapter(
@@ -1160,16 +1229,12 @@ def create_app(
             )
         except ValidationError as error:
             # Nunca se devuelven ni registran los valores enviados.
-            fields = sorted(
-                {
-                    str(item["loc"][0]) if item["loc"] else "payload"
-                    for item in error.errors()
-                }
-            )
+            claves = invalid_fields(error)
             return problem(
                 422,
                 "Datos inválidos",
-                "Revisa los campos: " + ", ".join(fields) + ".",
+                invalid_fields_detail(claves),
+                fields=claves,
             )
 
         if payload.reporter_phone is None and payload.reporter_email is None:
@@ -1458,16 +1523,12 @@ def create_app(
 
     def invalid_fields_problem(error: ValidationError) -> JSONResponse:
         # Nunca se devuelven ni registran los valores enviados.
-        fields = sorted(
-            {
-                str(item["loc"][0]) if item["loc"] else "payload"
-                for item in error.errors()
-            }
-        )
+        claves = invalid_fields(error)
         return problem(
             422,
             "Datos inválidos",
-            "Revisa los campos: " + ", ".join(fields) + ".",
+            invalid_fields_detail(claves),
+            fields=claves,
         )
 
     async def prepare_photo_parts(
@@ -2166,7 +2227,8 @@ def create_app(
             return problem(
                 422,
                 "Datos inválidos",
-                "Revisa los campos: relatedDisasterId.",
+                invalid_fields_detail(["relatedDisasterId"]),
+                fields=["relatedDisasterId"],
             )
         except asyncpg.PostgresError:
             cleanup()
@@ -2328,7 +2390,8 @@ def create_app(
             return problem(
                 422,
                 "Datos inválidos",
-                "Revisa los campos: relatedDisasterId.",
+                invalid_fields_detail(["relatedDisasterId"]),
+                fields=["relatedDisasterId"],
             )
         except asyncpg.PostgresError:
             return problem(

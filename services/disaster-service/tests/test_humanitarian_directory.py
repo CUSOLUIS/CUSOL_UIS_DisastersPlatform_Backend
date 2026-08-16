@@ -596,9 +596,11 @@ async def test_status_report_rejects_extra_or_invalid_fields():
     )
 
     assert response.status_code == 422
-    detail = response.json()["detail"]
-    assert "claimedOutcome" in detail
-    assert "alive" not in detail  # nunca se devuelven valores enviados
+    cuerpo = response.json()
+    # CHG-114: etiqueta en español en el texto, clave en `fields`.
+    assert "Resultado alegado" in cuerpo["detail"]
+    assert "claimedOutcome" in cuerpo["fields"]
+    assert "alive" not in cuerpo["detail"]  # nunca se devuelven valores
 
 
 @pytest.mark.anyio
@@ -753,7 +755,11 @@ async def test_rating_rejects_out_of_range_stars():
     )
 
     assert response.status_code == 422
-    assert "rating" in response.json()["detail"]
+    # CHG-114: el texto nombra el campo como lo ve quien reporta; la
+    # clave interna viaja aparte, para que el cliente pueda resaltarlo.
+    cuerpo = response.json()
+    assert cuerpo["detail"] == "Revisa los campos: Estrellas."
+    assert cuerpo["fields"] == ["rating"]
 
 
 @pytest.mark.anyio

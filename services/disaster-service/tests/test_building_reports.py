@@ -388,7 +388,10 @@ async def test_report_rejects_unknown_related_disaster():
     )
 
     assert response.status_code == 422
-    assert "relatedDisasterId" in response.json()["detail"]
+    cuerpo = response.json()
+    # CHG-114: el aviso nombra el campo, no la clave del modelo.
+    assert cuerpo["detail"] == "Revisa los campos: Evento relacionado."
+    assert cuerpo["fields"] == ["relatedDisasterId"]
     assert storage.objects == {}
 
 

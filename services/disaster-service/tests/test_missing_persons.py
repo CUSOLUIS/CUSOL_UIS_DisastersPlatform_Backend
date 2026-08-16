@@ -1262,3 +1262,56 @@ async def test_clothing_description_still_has_a_length_limit():
     )
 
     assert response.status_code == 422
+
+
+# --- CHG-114: el rechazo se lee y señala el campo ---
+
+
+@pytest.mark.anyio
+async def test_rejection_names_fields_in_spanish_and_lists_keys():
+    # El reporte de UX mostraba "Revisa los campos: reporterPhone.":
+    # la clave del modelo, en inglés, delante de quien está
+    # denunciando una desaparición.
+    app = report_app()
+
+    response = await post_report(
+        app, payload=valid_payload(reporterPhone="3001234567-")
+    )
+
+    assert response.status_code == 422
+    cuerpo = response.json()
+    assert cuerpo["detail"] == (
+        "Revisa los campos: Teléfono del reportante."
+    )
+    # La clave viaja aparte: es lo que permite al formulario resaltar
+    # el campo y desplazarse hasta él.
+    assert cuerpo["fields"] == ["reporterPhone"]
+
+
+@pytest.mark.anyio
+async def test_rejection_lists_every_invalid_field_with_its_label():
+    app = report_app()
+
+    payload = valid_payload(reporterPhone="3001234567-")
+    payload["circumstances"] = ""
+
+    response = await post_report(app, payload=payload)
+
+    assert response.status_code == 422
+    cuerpo = response.json()
+    assert cuerpo["fields"] == ["circumstances", "reporterPhone"]
+    assert cuerpo["detail"] == (
+        "Revisa los campos: Circunstancias, Teléfono del reportante."
+    )
+
+
+@pytest.mark.anyio
+async def test_unknown_field_key_is_shown_as_is():
+    # Una clave sin etiqueta conocida se muestra tal cual: peor que una
+    # etiqueta, mejor que un hueco.
+    from app.main import field_label, invalid_fields_detail
+
+    assert field_label("campoQueNoExiste") == "campoQueNoExiste"
+    assert invalid_fields_detail(["campoQueNoExiste"]) == (
+        "Revisa los campos: campoQueNoExiste."
+    )
