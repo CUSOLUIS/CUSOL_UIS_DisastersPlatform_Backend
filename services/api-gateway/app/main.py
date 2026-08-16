@@ -1678,6 +1678,36 @@ def create_app(
             AdminMutationReceipt,
         )
 
+    # CHG-107: la retirada rápida de la fotografía pública (CHG-105)
+    # vivía solo en el servicio interno, así que la consola no podía
+    # ejecutarla: la contraparte de publicar al crear no era alcanzable.
+    @application.delete(
+        "/api/v1/admin/missing-persons/{case_id}/public-photo",
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "El caso no tiene fotografía pública"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_withdraw_public_photo(
+        case_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "DELETE",
+            f"/internal/v1/admin/missing-persons/{case_id}/public-photo",
+            None,
+        )
+
     @application.post(
         "/api/v1/admin/submissions/{submission_id}/decisions",
         response_model=AdminMutationReceipt,
