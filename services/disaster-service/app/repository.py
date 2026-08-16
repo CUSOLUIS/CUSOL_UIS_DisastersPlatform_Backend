@@ -4339,9 +4339,25 @@ _PEOPLE_PROJECTION_INSERT_SQL = """
 # equipo la dieron por encontrada) y deceased→reported_deceased (la
 # plataforma no certifica fallecimientos oficialmente).
 _PEOPLE_STATUS_CASE_EXPRESSION = """
-    (CASE mc.public_status::text
-        WHEN 'found' THEN 'confirmed_alive'
-        WHEN 'deceased' THEN 'reported_deceased'
+    (CASE
+        WHEN mc.public_status::text = 'found' THEN 'confirmed_alive'
+        -- CHG-124: el sector salud tiene potestad para certificar el
+        -- deceso; con una novedad efectiva suya declarándolo, la
+        -- persona pasa a muerte CONFIRMADA. Sin ese respaldo queda en
+        -- reportada (la plataforma no certifica por sí sola). La
+        -- condición es la misma de CHG-120/122: si la consola
+        -- invalida esa novedad, la confirmación cae con ella.
+        WHEN mc.public_status::text = 'deceased' THEN
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM disaster_service.person_status_reports hr
+                WHERE hr.person_id = mc.id
+                  AND hr.reporter_health_sector
+                  AND hr.claimed_outcome = 'deceased'
+                  AND hr.moderation_status NOT IN ('rejected', 'withdrawn')
+                  AND hr.archived_at IS NULL
+            ) THEN 'confirmed_deceased'
+            ELSE 'reported_deceased' END
         ELSE 'missing'
     END)::disaster_service.human_status
 """
