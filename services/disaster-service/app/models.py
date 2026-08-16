@@ -21,6 +21,20 @@ SourceType = Literal[
 # marcar. El patrón admite los separadores con los que la gente
 # escribe ("+57 (300) 123-4567") y acota los dígitos a E.164: entre 7
 # y 15, sin cero inicial.
+# CHG-115 — La edad se deriva de la fecha de nacimiento cuando esta
+# viene; el tope es el mismo del modelo y del CHECK de la base.
+MAX_APPROXIMATE_AGE = 120
+
+
+def age_from_birth_date(birth_date: date, today: date) -> int:
+    """Edad cumplida: no se cumplen años hasta que llega el día."""
+    cumplido = (today.month, today.day) >= (
+        birth_date.month,
+        birth_date.day,
+    )
+    return today.year - birth_date.year - (0 if cumplido else 1)
+
+
 PHONE_PATTERN = r"^\+?[\s().-]*[1-9](?:[\s().-]*\d){6,14}$"
 PHONE_MAX_LENGTH = 25
 
@@ -454,6 +468,26 @@ class MissingPersonReportInput(ApiModel):
                 )
             if self.birth_date > date.today():
                 raise ValueError("birthDate no puede estar en el futuro")
+        return self
+
+    # CHG-115: dos campos que describen el mismo hecho se
+    # contradecían (`2004-11-23` junto a `12`). Con fecha de
+    # nacimiento la edad es derivada: el formulario web ya la calcula,
+    # pero el APK instalado y cualquier otro cliente siguen mandándola
+    # a mano, así que aquí se recalcula y se descarta la recibida.
+    # Sin fecha de nacimiento se respeta tal cual: es el caso normal,
+    # quien reporta rara vez conoce la fecha exacta.
+    @model_validator(mode="after")
+    def _age_follows_birth_date(self):
+        if self.birth_date is None:
+            return self
+        edad = age_from_birth_date(self.birth_date, date.today())
+        if edad > MAX_APPROXIMATE_AGE:
+            raise ValueError(
+                "birthDate implica una edad mayor a "
+                f"{MAX_APPROXIMATE_AGE} años"
+            )
+        self.approximate_age = edad
         return self
 
     @model_validator(mode="after")

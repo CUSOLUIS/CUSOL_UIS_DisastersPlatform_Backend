@@ -1315,3 +1315,77 @@ async def test_unknown_field_key_is_shown_as_is():
     assert invalid_fields_detail(["campoQueNoExiste"]) == (
         "Revisa los campos: campoQueNoExiste."
     )
+
+
+# --- CHG-115: la edad se deriva de la fecha de nacimiento ---
+
+
+def test_age_counts_the_day_not_only_the_year():
+    from datetime import date
+
+    from app.models import age_from_birth_date
+
+    # El caso de la captura: 2004-11-23 no son 12 años.
+    assert age_from_birth_date(date(2004, 11, 23), date(2026, 8, 16)) == 21
+    # Víspera del cumpleaños: todavía no los cumple.
+    assert age_from_birth_date(date(2004, 11, 23), date(2026, 11, 22)) == 21
+    # El día del cumpleaños ya cuenta.
+    assert age_from_birth_date(date(2004, 11, 23), date(2026, 11, 23)) == 22
+    # Nacido un 29 de febrero, en un año sin ese día.
+    assert age_from_birth_date(date(2004, 2, 29), date(2026, 2, 28)) == 21
+    assert age_from_birth_date(date(2004, 2, 29), date(2026, 3, 1)) == 22
+
+
+@pytest.mark.anyio
+async def test_report_recomputes_age_from_birth_date():
+    from datetime import date, timedelta
+
+    from app.models import age_from_birth_date
+
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    nacimiento = date.today() - timedelta(days=365 * 30 + 8)
+    esperada = age_from_birth_date(nacimiento, date.today())
+
+    # La edad recibida es la del defecto: escrita a mano y contradiciendo
+    # a la fecha. El servicio la descarta.
+    response = await post_report(
+        app,
+        payload=valid_payload(
+            birthDate=nacimiento.isoformat(), approximateAge=12
+        ),
+    )
+
+    assert response.status_code == 201
+    assert repository.created_report.approximate_age == esperada
+    assert esperada != 12
+
+
+@pytest.mark.anyio
+async def test_manual_age_is_kept_without_birth_date():
+    # Sin fecha de nacimiento la edad aproximada es el único dato que
+    # hay, y es el caso normal en una desaparición.
+    repository = FakeMissingPersonRepository()
+    app = report_app(repository=repository)
+
+    payload = valid_payload(approximateAge=34)
+    payload.pop("birthDate", None)
+
+    response = await post_report(app, payload=payload)
+
+    assert response.status_code == 201
+    assert repository.created_report.approximate_age == 34
+
+
+@pytest.mark.anyio
+async def test_birth_date_beyond_the_age_ceiling_is_rejected():
+    # 120 es el tope del modelo y del CHECK de la base: guardar la edad
+    # recortada sería volver a tener un dato que miente.
+    app = report_app()
+
+    response = await post_report(
+        app, payload=valid_payload(birthDate="1900-01-01")
+    )
+
+    assert response.status_code == 422
