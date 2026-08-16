@@ -2561,6 +2561,10 @@ def create_app(
         response_model_by_alias=True,
         responses={
             404: {"description": "Persona inexistente o no publicable"},
+            409: {
+                "description": "Caso verificado por el sector salud "
+                "o desenlace fallecido definitivo"
+            },
             413: {"description": "Carga demasiado grande"},
             415: {"description": "Fotografía no permitida"},
             422: {"description": "Evidencia o datos inválidos"},
@@ -2597,6 +2601,10 @@ def create_app(
             401: {"description": "Sesión ausente, vencida o revocada"},
             403: {"description": "Origen no permitido"},
             404: {"description": "Persona inexistente o no publicable"},
+            409: {
+                "description": "Caso verificado por el sector salud "
+                "o desenlace fallecido definitivo"
+            },
             413: {"description": "Carga demasiado grande"},
             415: {"description": "Fotografía no permitida"},
             422: {"description": "Evidencia o datos inválidos"},

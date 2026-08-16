@@ -21,6 +21,10 @@ from app.models import (
     MissingPersonDirectoryCard,
     SourceReference,
 )
+from app.repository import (
+    DeceasedOutcomeFinalError,
+    HealthVerifiedCaseError,
+)
 from app.storage import StorageUnavailableError
 
 from test_missing_persons import (
@@ -83,9 +87,23 @@ class FakeDirectoryRepository:
         fail: bool = False,
         publishable_persons: set[UUID] | None = None,
         publishable_locations: set[UUID] | None = None,
+        health_verified: bool = False,
+        health_verified_on_create: bool = False,
+        public_status: str = "missing",
+        deceased_on_create: bool = False,
     ):
         self.duplicate = duplicate
         self.fail = fail
+        # CHG-120: caso con novedad efectiva del sector salud; la
+        # variante `on_create` simula la carrera que solo detecta la
+        # comprobación transaccional.
+        self.health_verified = health_verified
+        self.health_verified_on_create = health_verified_on_create
+        # CHG-122: estado público del caso para la máquina de estados;
+        # `deceased_on_create` simula el fallecimiento registrado en
+        # plena carrera.
+        self.public_status = public_status
+        self.deceased_on_create = deceased_on_create
         self.publishable_persons = (
             publishable_persons
             if publishable_persons is not None
@@ -143,8 +161,19 @@ class FakeDirectoryRepository:
         }
         return [LOCATION_CARD], 1
 
-    async def person_is_publishable(self, person_id):
-        return person_id in self.publishable_persons
+    # CHG-120: bloqueo por novedad efectiva del sector salud.
+    async def person_has_effective_health_report(self, person_id):
+        if self.fail:
+            raise asyncpg.PostgresError("fallo simulado")
+        return self.health_verified
+
+    # CHG-122: estado público para la máquina de estados.
+    async def person_public_status(self, person_id):
+        if self.fail:
+            raise asyncpg.PostgresError("fallo simulado")
+        if person_id not in self.publishable_persons:
+            return None
+        return self.public_status
 
     # CHG-077: novedades visibles de una persona publicada.
     async def list_person_status_reports(self, person_id, limit):
@@ -198,6 +227,15 @@ class FakeDirectoryRepository:
 
         if self.fail:
             raise asyncpg.PostgresError("fallo simulado")
+        # CHG-120: la comprobación transaccional cierra la carrera.
+        if (
+            self.health_verified_on_create
+            and not report.reporter_health_sector
+        ):
+            raise HealthVerifiedCaseError
+        # CHG-122: fallecimiento registrado en plena carrera.
+        if self.deceased_on_create and report.claimed_outcome == "found":
+            raise DeceasedOutcomeFinalError
         if self.duplicate:
             return (
                 CommunityContributionReceipt(
@@ -871,6 +909,243 @@ async def test_status_report_health_flag_ignored_for_anonymous():
 
     assert response.status_code == 202
     assert repository.created_status_report.reporter_health_sector is False
+
+
+# --- CHG-120: un reporte del sector salud cierra las novedades ---
+
+
+@pytest.mark.anyio
+async def test_status_report_blocked_after_health_verification():
+    # Caso con novedad efectiva del sector salud: un envío anónimo
+    # recibe 409 y no deja rastro (ni fila ni archivos).
+    repository = FakeDirectoryRepository(health_verified=True)
+    storage = FakeStorage()
+    app = directory_app(repository=repository, storage=storage)
+
+    response = await request_app(
+        app,
+        "POST",
+        STATUS_PATH,
+        headers=IDEMPOTENCY,
+        data={"payload": json.dumps(status_payload())},
+        files=photos_form(1),
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["title"] == "Caso verificado por el sector salud"
+    assert repository.created_status_report is None
+    assert storage.objects == {}
+
+
+@pytest.mark.anyio
+async def test_status_report_blocked_for_plain_account_too():
+    # La restricción es de rol, no de sesión: una cuenta autenticada
+    # sin rol de salud también queda bloqueada.
+    repository = FakeDirectoryRepository(health_verified=True)
+    app = directory_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "POST",
+        STATUS_PATH,
+        headers={
+            **IDEMPOTENCY,
+            "X-Actor-Kind": "authenticated",
+            "X-Account-Id": str(uuid4()),
+        },
+        data={"payload": json.dumps(status_payload())},
+        files=photos_form(1),
+    )
+
+    assert response.status_code == 409
+    assert repository.created_status_report is None
+
+
+@pytest.mark.anyio
+async def test_status_report_health_sector_can_still_report():
+    # El sector salud no se bloquea a sí mismo: otra persona del
+    # sector puede corregir el desenlace (CHG-077: su novedad más
+    # reciente manda).
+    repository = FakeDirectoryRepository(health_verified=True)
+    app = directory_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "POST",
+        STATUS_PATH,
+        headers={
+            **IDEMPOTENCY,
+            "X-Actor-Kind": "authenticated",
+            "X-Account-Id": str(uuid4()),
+            "X-Actor-Health": "true",
+        },
+        data={"payload": json.dumps(status_payload())},
+        files=photos_form(1),
+    )
+
+    assert response.status_code == 202
+    assert repository.created_status_report.reporter_health_sector is True
+
+
+@pytest.mark.anyio
+async def test_status_report_health_race_cleans_files():
+    # La verificación llegó entre el pre-chequeo y la inserción: la
+    # comprobación transaccional responde 409 y los archivos de este
+    # intento se limpian.
+    repository = FakeDirectoryRepository(health_verified_on_create=True)
+    storage = FakeStorage()
+    app = directory_app(repository=repository, storage=storage)
+
+    response = await request_app(
+        app,
+        "POST",
+        STATUS_PATH,
+        headers=IDEMPOTENCY,
+        data={"payload": json.dumps(status_payload())},
+        files=photos_form(2),
+    )
+
+    assert response.status_code == 409
+    assert storage.objects == {}
+    assert len(storage.deleted) == 4
+
+
+# --- CHG-122: el desenlace fallecido es definitivo ---
+
+
+@pytest.mark.anyio
+async def test_deceased_case_rejects_found_even_from_health_sector():
+    # El escenario de las capturas: salud reportó fallecida y otra
+    # cuenta de salud intenta "encontrada". La máquina de estados lo
+    # rechaza para todos los roles.
+    repository = FakeDirectoryRepository(
+        health_verified=True, public_status="deceased"
+    )
+    storage = FakeStorage()
+    app = directory_app(repository=repository, storage=storage)
+
+    response = await request_app(
+        app,
+        "POST",
+        STATUS_PATH,
+        headers={
+            **IDEMPOTENCY,
+            "X-Actor-Kind": "authenticated",
+            "X-Account-Id": str(uuid4()),
+            "X-Actor-Health": "true",
+        },
+        data={
+            "payload": json.dumps(
+                status_payload(claimedOutcome="found")
+            )
+        },
+        files=photos_form(1),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["title"] == (
+        "El desenlace fallecido es definitivo"
+    )
+    assert repository.created_status_report is None
+    assert storage.objects == {}
+
+
+@pytest.mark.anyio
+async def test_deceased_case_rejects_found_from_anonymous():
+    # Caso fallecido por umbral comunitario (sin novedad de salud que
+    # active CHG-120): un anónimo tampoco puede volverlo "encontrada".
+    repository = FakeDirectoryRepository(public_status="deceased")
+    app = directory_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "POST",
+        STATUS_PATH,
+        headers=IDEMPOTENCY,
+        data={
+            "payload": json.dumps(
+                status_payload(claimedOutcome="found")
+            )
+        },
+        files=photos_form(1),
+    )
+
+    assert response.status_code == 409
+    assert repository.created_status_report is None
+
+
+@pytest.mark.anyio
+async def test_deceased_case_accepts_deceased_confirmation():
+    # Reportar `deceased` sobre un caso ya fallecido confirma, no
+    # contradice: sigue permitido.
+    repository = FakeDirectoryRepository(public_status="deceased")
+    app = directory_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "POST",
+        STATUS_PATH,
+        headers=IDEMPOTENCY,
+        data={
+            "payload": json.dumps(
+                status_payload(claimedOutcome="deceased")
+            )
+        },
+        files=photos_form(1),
+    )
+
+    assert response.status_code == 202
+    assert repository.created_status_report.claimed_outcome == "deceased"
+
+
+@pytest.mark.anyio
+async def test_found_case_still_accepts_deceased():
+    # found → deceased es una transición válida de la máquina.
+    repository = FakeDirectoryRepository(public_status="found")
+    app = directory_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "POST",
+        STATUS_PATH,
+        headers=IDEMPOTENCY,
+        data={
+            "payload": json.dumps(
+                status_payload(claimedOutcome="deceased")
+            )
+        },
+        files=photos_form(1),
+    )
+
+    assert response.status_code == 202
+
+
+@pytest.mark.anyio
+async def test_deceased_race_cleans_files():
+    # El fallecimiento se registró entre el pre-chequeo y la
+    # inserción: la comprobación transaccional responde 409 y los
+    # archivos de este intento se limpian.
+    repository = FakeDirectoryRepository(deceased_on_create=True)
+    storage = FakeStorage()
+    app = directory_app(repository=repository, storage=storage)
+
+    response = await request_app(
+        app,
+        "POST",
+        STATUS_PATH,
+        headers=IDEMPOTENCY,
+        data={
+            "payload": json.dumps(
+                status_payload(claimedOutcome="found")
+            )
+        },
+        files=photos_form(2),
+    )
+
+    assert response.status_code == 409
+    assert storage.objects == {}
+    assert len(storage.deleted) == 4
 
 
 @pytest.mark.anyio

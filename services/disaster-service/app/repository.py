@@ -274,6 +274,16 @@ class AidOfferIdempotencyConflictError(Exception):
     """Misma llave idempotente con un cuerpo distinto (409)."""
 
 
+class HealthVerifiedCaseError(Exception):
+    """CHG-120: el caso tiene una novedad efectiva del sector salud;
+    solo el propio sector salud puede seguir reportando (409)."""
+
+
+class DeceasedOutcomeFinalError(Exception):
+    """CHG-122: el caso está en `deceased`, un desenlace definitivo;
+    una novedad de `found` no puede sobrescribirlo (409)."""
+
+
 @dataclass(frozen=True)
 class StoredPhoto:
     id: UUID
@@ -387,7 +397,15 @@ class DisasterRepository(Protocol):
         offset: int,
     ) -> tuple[list[AidLocationDirectoryCard], int]: ...
 
-    async def person_is_publishable(self, person_id: UUID) -> bool: ...
+    # CHG-122: person_is_publishable se retiró — person_public_status
+    # responde publicable (estado) o no (None) en una sola consulta.
+    async def person_public_status(
+        self, person_id: UUID
+    ) -> str | None: ...
+
+    async def person_has_effective_health_report(
+        self, person_id: UUID
+    ) -> bool: ...
 
     async def aid_location_is_publishable(
         self, location_id: UUID
@@ -1838,21 +1856,6 @@ class PostgresDisasterRepository:
         ]
         return cards, int(total)
 
-    async def person_is_publishable(self, person_id: UUID) -> bool:
-        # Existencia privada nunca se filtra: no publicable == inexistente.
-        return bool(
-            await self._pool.fetchval(
-                """
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM disaster_service.missing_person_cases
-                    WHERE id = $1 AND publication_status = 'published'
-                )
-                """,
-                person_id,
-            )
-        )
-
     async def aid_location_is_publishable(self, location_id: UUID) -> bool:
         return bool(
             await self._pool.fetchval(
@@ -1866,6 +1869,25 @@ class PostgresDisasterRepository:
                 location_id,
             )
         )
+
+    async def person_has_effective_health_report(
+        self, person_id: UUID
+    ) -> bool:
+        return bool(
+            await self._pool.fetchval(
+                _PERSON_HAS_EFFECTIVE_HEALTH_REPORT_SQL, person_id
+            )
+        )
+
+    async def person_public_status(
+        self, person_id: UUID
+    ) -> str | None:
+        """CHG-122: estado público del caso publicado; None si no
+        existe o no es publicable (indistinguibles a propósito)."""
+        status = await self._pool.fetchval(
+            _PERSON_PUBLIC_STATUS_IF_PUBLISHED_SQL, person_id
+        )
+        return None if status is None else str(status)
 
     async def list_person_status_reports(
         self, person_id: UUID, limit: int
@@ -1913,6 +1935,31 @@ class PostgresDisasterRepository:
         async with self._pool.acquire() as connection:
             try:
                 async with connection.transaction():
+                    # CHG-120: con una novedad efectiva del sector
+                    # salud, el caso no recibe más novedades salvo del
+                    # propio sector salud. El pre-chequeo del endpoint
+                    # ya filtró; esta comprobación dentro de la
+                    # transacción cierra la carrera entre dos envíos
+                    # simultáneos.
+                    if not report.reporter_health_sector:
+                        blocked = await connection.fetchval(
+                            _PERSON_HAS_EFFECTIVE_HEALTH_REPORT_SQL,
+                            report.person_id,
+                        )
+                        if blocked:
+                            raise HealthVerifiedCaseError
+                    # CHG-122: `deceased` es terminal para TODOS los
+                    # roles, sector salud incluido — una "encontrada"
+                    # posterior no lo sobrescribe. Igual que arriba,
+                    # el pre-chequeo del endpoint ya filtró y esta
+                    # comprobación cierra la carrera.
+                    if report.claimed_outcome == "found":
+                        current_status = await connection.fetchval(
+                            _PERSON_PUBLIC_STATUS_IF_PUBLISHED_SQL,
+                            report.person_id,
+                        )
+                        if current_status == "deceased":
+                            raise DeceasedOutcomeFinalError
                     # CHG-077: crear una novedad SÍ puede cambiar el
                     # estado público — sector salud de inmediato y el
                     # umbral comunitario de 5 coincidencias; el
@@ -4101,13 +4148,20 @@ _PERSON_PUBLIC_STATUS_EXPRESSION = """
             LIMIT 1
         ),
         (
+            -- CHG-122: `deceased` es definitivo. Con novedades de
+            -- salud contradictorias ganaba la más reciente y una
+            -- "encontrada" posterior pisaba el fallecimiento; ahora
+            -- `deceased` gana aunque no sea la última. Revertirlo
+            -- exige invalidar el registro (rechazar/archivar la
+            -- novedad), nunca sobrescribirlo con otra novedad.
             SELECT r.claimed_outcome
             FROM disaster_service.person_status_reports r
             WHERE r.person_id = mc.id
               AND r.moderation_status NOT IN ('rejected', 'withdrawn')
               AND r.archived_at IS NULL
               AND r.reporter_health_sector
-            ORDER BY r.received_at DESC
+            ORDER BY (r.claimed_outcome = 'deceased') DESC,
+                     r.received_at DESC
             LIMIT 1
         ),
         (
@@ -4127,12 +4181,38 @@ _PERSON_PUBLIC_STATUS_EXPRESSION = """
               AND r.account_id IS NOT NULL
             GROUP BY r.claimed_outcome
             HAVING COUNT(DISTINCT r.account_id) >= 5
-            ORDER BY COUNT(DISTINCT r.account_id) DESC,
+            -- CHG-122: si ambos desenlaces alcanzan el umbral,
+            -- `deceased` es definitivo y gana sobre los votos.
+            ORDER BY (r.claimed_outcome = 'deceased') DESC,
+                     COUNT(DISTINCT r.account_id) DESC,
                      MAX(r.received_at) DESC
             LIMIT 1
         ),
         'missing'
     )
+"""
+
+# CHG-120 — La misma condición que la prioridad 2 del estado público:
+# una novedad del sector salud no rechazada/retirada y sin archivar.
+# Mientras exista, el caso no recibe novedades de otros actores; si el
+# super admin la rechaza o archiva, el bloqueo cae en el mismo acto.
+_PERSON_HAS_EFFECTIVE_HEALTH_REPORT_SQL = """
+    SELECT EXISTS (
+        SELECT 1
+        FROM disaster_service.person_status_reports r
+        WHERE r.person_id = $1
+          AND r.reporter_health_sector
+          AND r.moderation_status NOT IN ('rejected', 'withdrawn')
+          AND r.archived_at IS NULL
+    )
+"""
+
+# CHG-122 — Estado público del caso solo si está publicado (para el
+# guardián de transición: `deceased` no se sobrescribe con `found`).
+_PERSON_PUBLIC_STATUS_IF_PUBLISHED_SQL = """
+    SELECT public_status
+    FROM disaster_service.missing_person_cases
+    WHERE id = $1 AND publication_status = 'published'
 """
 
 # Variante por persona (creación de novedades y decisiones directas).

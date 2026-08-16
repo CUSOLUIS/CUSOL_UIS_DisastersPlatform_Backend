@@ -93,7 +93,9 @@ from .photos import (
 from .models import SourceReference
 from .repository import (
     AidOfferIdempotencyConflictError,
+    DeceasedOutcomeFinalError,
     DisasterRepository,
+    HealthVerifiedCaseError,
     HumanMapCell,
     PostgresDisasterRepository,
     StoredAidOffer,
@@ -134,6 +136,34 @@ def problem(
         status_code=status_code,
         media_type="application/problem+json",
         content=content,
+    )
+
+
+# CHG-120 — Respuesta única del bloqueo por verificación del sector
+# salud: 409 (no el 404 uniforme — la persona sigue publicada; lo
+# cerrado es el canal de novedades).
+def _health_verified_case_problem() -> JSONResponse:
+    return problem(
+        409,
+        "Caso verificado por el sector salud",
+        "Personal del sector salud ya reportó el desenlace de esta "
+        "persona; mientras esa verificación siga vigente no se "
+        "reciben nuevas novedades sobre el caso.",
+    )
+
+
+# CHG-122 — La máquina de estados del caso: `deceased` es terminal y
+# ninguna novedad de `found` lo sobrescribe, venga del rol que venga.
+# Revertirlo es tarea de la consola (rechazar/archivar la novedad de
+# fallecimiento), no de otra novedad.
+def _deceased_final_problem() -> JSONResponse:
+    return problem(
+        409,
+        "El desenlace fallecido es definitivo",
+        "Esta persona fue reportada como fallecida y ese desenlace no "
+        "puede sobrescribirse con una novedad de encontrada. Si el "
+        "reporte de fallecimiento fuera erróneo, el equipo puede "
+        "invalidarlo desde la consola de revisión.",
     )
 
 
@@ -1757,8 +1787,10 @@ def create_app(
 
         # 404 uniforme: inexistente y no publicable son indistinguibles
         # para no filtrar la existencia de expedientes privados.
+        # CHG-122: además del sí/no publicable, el estado público
+        # alimenta la máquina de estados (deceased es terminal).
         try:
-            publishable = await data.person_is_publishable(person_id)
+            public_status = await data.person_public_status(person_id)
         except asyncpg.PostgresError:
             return problem(
                 503,
@@ -1766,12 +1798,40 @@ def create_app(
                 "No fue posible validar la persona; la novedad no fue "
                 "registrada.",
             )
-        if not publishable:
+        if public_status is None:
             return problem(
                 404,
                 "Persona no disponible",
                 "La persona no existe o no es publicable.",
             )
+
+        # CHG-120: el rol lo resuelve identity y lo declara el gateway;
+        # el cliente final jamás controla esta bandera (CHG-077).
+        actor_is_health_sector = (
+            actor_kind == "authenticated"
+            and request.headers.get("x-actor-health") == "true"
+        )
+        # CHG-120: con una novedad efectiva del sector salud el caso
+        # queda verificado y no recibe más novedades de otros actores.
+        # Pre-chequeo barato antes de procesar fotografías; la
+        # comprobación autoritativa corre dentro de la transacción de
+        # inserción.
+        if not actor_is_health_sector:
+            try:
+                health_verified = (
+                    await data.person_has_effective_health_report(
+                        person_id
+                    )
+                )
+            except asyncpg.PostgresError:
+                return problem(
+                    503,
+                    "Servicio de evidencia no disponible",
+                    "No fue posible validar la persona; la novedad no "
+                    "fue registrada.",
+                )
+            if health_verified:
+                return _health_verified_case_problem()
 
         try:
             form = await request.form()
@@ -1791,6 +1851,17 @@ def create_app(
             )
         except ValidationError as error:
             return invalid_fields_problem(error)
+
+        # CHG-122: `deceased` es terminal para todos los roles, sector
+        # salud incluido — "encontrada" no lo sobrescribe. Reportar
+        # `deceased` sobre un caso ya fallecido confirma, no
+        # contradice, y sigue permitido. Pre-chequeo barato; la
+        # comprobación autoritativa corre en la transacción.
+        if (
+            payload.claimed_outcome == "found"
+            and public_status == "deceased"
+        ):
+            return _deceased_final_problem()
 
         occurred_at = payload.occurred_at
         if occurred_at is not None:
@@ -1855,17 +1926,22 @@ def create_app(
             ),
             actor_kind=actor_kind,
             account_id=account_id,
-            # CHG-077: la bandera la declara el gateway (resuelta
-            # contra identity), jamás el cliente final.
-            reporter_health_sector=(
-                actor_kind == "authenticated"
-                and request.headers.get("x-actor-health") == "true"
-            ),
+            reporter_health_sector=actor_is_health_sector,
         )
         try:
             receipt, created = await data.create_person_status_report(
                 stored_report, stored_photos
             )
+        except HealthVerifiedCaseError:
+            # CHG-120: otro envío del sector salud verificó el caso
+            # entre el pre-chequeo y la inserción.
+            cleanup()
+            return _health_verified_case_problem()
+        except DeceasedOutcomeFinalError:
+            # CHG-122: el fallecimiento se registró entre el
+            # pre-chequeo y la inserción.
+            cleanup()
+            return _deceased_final_problem()
         except asyncpg.PostgresError:
             cleanup()
             return problem(
