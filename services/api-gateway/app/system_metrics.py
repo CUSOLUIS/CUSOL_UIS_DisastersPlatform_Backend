@@ -11,6 +11,10 @@ la consola tengan historia desde la primera carga. Las tasas (CPU %,
 bytes/s de red) se derivan de la diferencia con la muestra anterior;
 la primera muestra usa los acumulados desde el arranque para la CPU y
 0 para la red.
+
+CHG-140: la temperatura sale de /sys/class/thermal (también del host
+dentro del contenedor). Las VPS virtualizadas no suelen exponer zonas
+térmicas, así que el campo es opcional y su ausencia nunca es error.
 """
 
 from collections import deque
@@ -26,8 +30,10 @@ class SystemMetricsSampler:
         proc_root: str = "/proc",
         disk_path: str = "/",
         history: int = 180,
+        sys_root: str = "/sys",
     ) -> None:
         self._proc = Path(proc_root)
+        self._sys = Path(sys_root)
         self._disk_path = disk_path
         self.samples: deque[dict] = deque(maxlen=history)
         self._previous_cpu: tuple[int, int] | None = None
@@ -64,6 +70,39 @@ class SystemMetricsSampler:
             rx += int(fields[0])
             tx += int(fields[8])
         return rx, tx
+
+    # CHG-140: zonas cuyo `type` corresponde al CPU/SoC según la
+    # plataforma (Pi: cpu-thermal; x86: x86_pkg_temp/coretemp; ARM
+    # genérico: soc).
+    _CPU_ZONE_HINTS = ("cpu", "soc", "x86_pkg_temp", "coretemp")
+
+    def _cpu_temperature(self) -> float | None:
+        """Temperatura del host en °C, o None si no hay sensores.
+
+        Prefiere la zona térmica del CPU/SoC; sin coincidencia toma la
+        más caliente. Cualquier zona ilegible se ignora: en una VPS sin
+        sensores el resultado es None, nunca una excepción.
+        """
+        preferred: float | None = None
+        hottest: float | None = None
+        for zone in sorted(self._sys.glob("class/thermal/thermal_zone*")):
+            try:
+                zone_type = (zone / "type").read_text(
+                    encoding="ascii"
+                ).strip().lower()
+                celsius = int((zone / "temp").read_text(
+                    encoding="ascii"
+                ).strip()) / 1000.0
+            except (OSError, ValueError):
+                continue
+            if hottest is None or celsius > hottest:
+                hottest = celsius
+            if preferred is None and any(
+                hint in zone_type for hint in self._CPU_ZONE_HINTS
+            ):
+                preferred = celsius
+        result = preferred if preferred is not None else hottest
+        return round(result, 1) if result is not None else None
 
     def sample(self) -> dict:
         now = time.monotonic()
@@ -105,6 +144,7 @@ class SystemMetricsSampler:
         sample = {
             "sampled_at": datetime.now(UTC),
             "cpu_percent": round(min(100.0, max(0.0, cpu_percent)), 2),
+            "cpu_temperature_celsius": self._cpu_temperature(),
             "load_1m": load_1m,
             "load_5m": load_5m,
             "load_15m": load_15m,

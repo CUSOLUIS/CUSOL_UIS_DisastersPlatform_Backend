@@ -68,6 +68,15 @@ def write_fake_proc(
     )
 
 
+def write_fake_thermal_zone(
+    root, index: int, zone_type: str, millidegrees: int
+) -> None:
+    zone = root / "class" / "thermal" / f"thermal_zone{index}"
+    zone.mkdir(parents=True, exist_ok=True)
+    (zone / "type").write_text(f"{zone_type}\n", encoding="ascii")
+    (zone / "temp").write_text(f"{millidegrees}\n", encoding="ascii")
+
+
 def test_sampler_derives_rates_between_samples(tmp_path, monkeypatch):
     clock = iter([100.0, 110.0])
     monkeypatch.setattr(
@@ -97,6 +106,42 @@ def test_sampler_derives_rates_between_samples(tmp_path, monkeypatch):
     assert second["network_rx_bytes_per_second"] == 51_200.0
     assert second["network_tx_bytes_per_second"] == 10_240.0
     assert len(sampler.samples) == 2
+
+
+# CHG-140: la temperatura prefiere la zona del CPU/SoC, cae al máximo
+# sin coincidencia de tipo y es None cuando el host no expone sensores.
+def test_sampler_prefers_cpu_thermal_zone(tmp_path, monkeypatch):
+    monkeypatch.setattr(system_metrics.time, "monotonic", lambda: 1.0)
+    write_fake_proc(tmp_path, busy=10, total=100, rx=0, tx=0)
+    write_fake_thermal_zone(tmp_path, 0, "acpitz", 61_000)
+    write_fake_thermal_zone(tmp_path, 1, "cpu-thermal", 44_650)
+    sampler = SystemMetricsSampler(
+        proc_root=str(tmp_path), sys_root=str(tmp_path), history=5
+    )
+
+    assert sampler.sample()["cpu_temperature_celsius"] == 44.6
+
+
+def test_sampler_falls_back_to_hottest_zone(tmp_path, monkeypatch):
+    monkeypatch.setattr(system_metrics.time, "monotonic", lambda: 1.0)
+    write_fake_proc(tmp_path, busy=10, total=100, rx=0, tx=0)
+    write_fake_thermal_zone(tmp_path, 0, "acpitz", 38_000)
+    write_fake_thermal_zone(tmp_path, 1, "nvme", 52_500)
+    sampler = SystemMetricsSampler(
+        proc_root=str(tmp_path), sys_root=str(tmp_path), history=5
+    )
+
+    assert sampler.sample()["cpu_temperature_celsius"] == 52.5
+
+
+def test_sampler_without_thermal_sensors_reports_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(system_metrics.time, "monotonic", lambda: 1.0)
+    write_fake_proc(tmp_path, busy=10, total=100, rx=0, tx=0)
+    sampler = SystemMetricsSampler(
+        proc_root=str(tmp_path), sys_root=str(tmp_path), history=5
+    )
+
+    assert sampler.sample()["cpu_temperature_celsius"] is None
 
 
 def test_sampler_ring_keeps_only_recent_history(tmp_path, monkeypatch):
@@ -195,6 +240,7 @@ async def test_system_metrics_returns_snapshot_and_series():
     for key in (
         "sampledAt",
         "cpuPercent",
+        "cpuTemperatureCelsius",
         "load1m",
         "memoryTotalBytes",
         "memoryUsedBytes",

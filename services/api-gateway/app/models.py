@@ -577,6 +577,9 @@ class AdminOverview(ApiModel):
 class SystemMetricsSample(ApiModel):
     sampled_at: datetime
     cpu_percent: float = Field(ge=0, le=100)
+    # CHG-140: None cuando el host no expone sensores térmicos (VPS
+    # virtualizadas); la consola degrada a "N/D".
+    cpu_temperature_celsius: float | None = None
     load_1m: float = Field(ge=0)
     load_5m: float = Field(ge=0)
     load_15m: float = Field(ge=0)
