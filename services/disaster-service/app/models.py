@@ -1313,7 +1313,9 @@ class VolunteerAlertPage(ApiModel):
 # vigencia en horas. Sin datos de contacto: descripción, dirección y
 # coordenadas son públicas por diseño (DEC-125-12).
 HELP_REQUEST_MIN_HOURS = 1
-HELP_REQUEST_MAX_HOURS = 72
+# CHG-130: la vigencia se expresa en horas (1-72) o días (1-30); el
+# cliente convierte días a horas y el tope del contrato es 30 días.
+HELP_REQUEST_MAX_HOURS = 720
 
 
 class HelpRequestInput(ApiModel):

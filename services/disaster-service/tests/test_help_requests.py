@@ -299,7 +299,7 @@ async def test_create_rejects_junk_description():
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("hours", [0, 73, -4])
+@pytest.mark.parametrize("hours", [0, 721, -4])
 async def test_create_rejects_out_of_range_duration(hours):
     app = help_app()
     response = await post_help_request(
@@ -307,6 +307,24 @@ async def test_create_rejects_out_of_range_duration(hours):
     )
     assert response.status_code == 422
     assert "durationHours" in response.json().get("fields", [])
+
+
+# CHG-130 — la vigencia también se expresa en días (el cliente los
+# convierte a horas); el tope es 30 días = 720 horas.
+@pytest.mark.anyio
+async def test_create_accepts_duration_in_days():
+    repository = FakeHelpRequestRepository()
+    app = help_app(repository=repository)
+
+    response = await post_help_request(
+        app, payload=valid_payload(durationHours=720)
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    received = datetime.fromisoformat(body["receivedAt"])
+    expires = datetime.fromisoformat(body["expiresAt"])
+    assert expires - received == timedelta(days=30)
 
 
 @pytest.mark.anyio
