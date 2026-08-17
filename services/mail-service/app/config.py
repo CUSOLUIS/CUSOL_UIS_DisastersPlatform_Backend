@@ -19,6 +19,9 @@ class Settings:
     smtp_timeout_seconds: float = 15.0
     mail_from: str = "no-reply@cusol.local"
     mail_from_name: str = "Plataforma CUSOL Desastres"
+    # CHG-135: buzón vigilado al que llegan las respuestas cuando el
+    # From es del dominio de la plataforma (vacío = sin Reply-To).
+    mail_reply_to: str = ""
     public_base_url: str = "http://localhost:3100"
 
     @property
@@ -39,6 +42,7 @@ class Settings:
             mail_from_name=os.getenv(
                 "MAIL_FROM_NAME", "Plataforma CUSOL Desastres"
             ),
+            mail_reply_to=os.getenv("MAIL_REPLY_TO", "").strip(),
             public_base_url=os.getenv(
                 "PUBLIC_BASE_URL", "http://localhost:3100"
             ).rstrip("/"),

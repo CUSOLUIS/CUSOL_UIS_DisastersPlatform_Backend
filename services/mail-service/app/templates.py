@@ -14,6 +14,9 @@ class RenderedEmail:
     subject: str
     text_body: str
     html_body: str
+    # CHG-135: tipo de plantilla, para los logs de entrega (jamás el
+    # cuerpo ni el destinatario completo).
+    kind: str = "desconocida"
 
 
 def verification_link(public_base_url: str, token: str) -> str:
@@ -83,7 +86,10 @@ def render_report_status_email(
 </div>
 """
     return RenderedEmail(
-        subject=subject, text_body=text_body, html_body=html_body
+        subject=subject,
+        text_body=text_body,
+        html_body=html_body,
+        kind="novedad-reporte",
     )
 
 
@@ -169,5 +175,8 @@ def render_verification_email(
 </div>
 """
     return RenderedEmail(
-        subject=subject, text_body=text_body, html_body=html_body
+        subject=subject,
+        text_body=text_body,
+        html_body=html_body,
+        kind="verificacion-cuenta",
     )

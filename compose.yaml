@@ -160,6 +160,9 @@ services:
       SMTP_PASSWORD: ${MAIL_SMTP_PASSWORD:-}
       MAIL_FROM: ${MAIL_FROM:-no-reply@cusol.local}
       MAIL_FROM_NAME: ${MAIL_FROM_NAME:-Plataforma CUSOL Desastres}
+      # CHG-135: las respuestas llegan a un buzón vigilado aunque el
+      # From sea del dominio de la plataforma.
+      MAIL_REPLY_TO: ${MAIL_REPLY_TO:-}
       PUBLIC_BASE_URL: ${MAIL_PUBLIC_BASE_URL:-http://localhost:${FRONTEND_PORT:-3100}}
     volumes:
       - ./services/mail-service/app:/app/app:ro

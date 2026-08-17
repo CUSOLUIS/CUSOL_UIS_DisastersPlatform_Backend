@@ -6,6 +6,7 @@ from email.message import EmailMessage
 import pytest
 from fastapi.testclient import TestClient
 
+from app import delivery
 from app.config import Settings
 from app.delivery import DeliveryError, SmtpDeliverer
 from app.main import create_app
@@ -183,19 +184,124 @@ async def test_unauthenticated_delivery_skips_starttls(fake_smtp):
 
 @pytest.mark.anyio
 async def test_smtp_failure_raises_delivery_error(monkeypatch):
+    attempts = {"count": 0}
+
     def boom(*args, **kwargs):
+        attempts["count"] += 1
         raise smtplib.SMTPServerDisconnected("adiós")
 
     monkeypatch.setattr(smtplib, "SMTP", boom)
+    # CHG-135: sin esperas reales en pruebas.
+    monkeypatch.setattr(delivery, "RETRY_DELAYS_SECONDS", (0, 0))
     settings = Settings()
     email = render_verification_email(
         settings.public_base_url, TOKEN, 24
     )
 
-    with pytest.raises(DeliveryError):
+    with pytest.raises(DeliveryError) as excinfo:
         await SmtpDeliverer(settings).deliver(
             "persona@example.com", email
         )
+    # La desconexión es transitoria: se agotan los reintentos acotados.
+    assert attempts["count"] == 3
+    assert excinfo.value.transient is True
+
+
+# CHG-135 — Reintentos acotados y clasificación de errores del
+# proveedor: los transitorios reintentan con backoff, los permanentes
+# no; el código SMTP real queda en el error (y en los logs).
+@pytest.mark.anyio
+async def test_transient_smtp_code_retries_then_succeeds(monkeypatch):
+    attempts = {"count": 0}
+
+    class FlakySmtp(FakeSmtp):
+        def send_message(self, message):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise smtplib.SMTPResponseException(
+                    451, b"4.3.0 Temporary system problem"
+                )
+            super().send_message(message)
+
+    monkeypatch.setattr(smtplib, "SMTP", FlakySmtp)
+    monkeypatch.setattr(delivery, "RETRY_DELAYS_SECONDS", (0, 0))
+    FakeSmtp.instances = []
+    settings = Settings()
+    email = render_verification_email(
+        settings.public_base_url, TOKEN, 24
+    )
+
+    await SmtpDeliverer(settings).deliver("persona@example.com", email)
+
+    assert attempts["count"] == 2
+
+
+@pytest.mark.anyio
+async def test_permanent_smtp_code_does_not_retry(monkeypatch):
+    attempts = {"count": 0}
+
+    class RejectingSmtp(FakeSmtp):
+        def send_message(self, message):
+            attempts["count"] += 1
+            raise smtplib.SMTPResponseException(
+                525, b"5.7.1 Unauthorized IP address"
+            )
+
+    monkeypatch.setattr(smtplib, "SMTP", RejectingSmtp)
+    monkeypatch.setattr(delivery, "RETRY_DELAYS_SECONDS", (0, 0))
+    FakeSmtp.instances = []
+    settings = Settings()
+    email = render_verification_email(
+        settings.public_base_url, TOKEN, 24
+    )
+
+    with pytest.raises(DeliveryError) as excinfo:
+        await SmtpDeliverer(settings).deliver(
+            "persona@example.com", email
+        )
+
+    assert attempts["count"] == 1
+    assert excinfo.value.smtp_code == 525
+    assert excinfo.value.transient is False
+
+
+# CHG-135 — Reply-To configurado: las respuestas van al buzón vigilado.
+@pytest.mark.anyio
+async def test_reply_to_header_when_configured(fake_smtp):
+    settings = Settings(mail_reply_to="operador@example.com")
+    email = render_verification_email(
+        settings.public_base_url, TOKEN, 24
+    )
+
+    await SmtpDeliverer(settings).deliver("persona@example.com", email)
+
+    message = fake_smtp.instances[0].messages[0]
+    assert message["Reply-To"] == "operador@example.com"
+
+    fake_smtp.instances = []
+    await SmtpDeliverer(Settings()).deliver("persona@example.com", email)
+    assert fake_smtp.instances[0].messages[0]["Reply-To"] is None
+
+
+# CHG-135 — Los logs identifican intento, plantilla y dominio, nunca la
+# dirección completa ni el cuerpo.
+@pytest.mark.anyio
+async def test_delivery_log_uses_domain_only(fake_smtp, caplog):
+    settings = Settings()
+    email = render_verification_email(
+        settings.public_base_url, TOKEN, 24
+    )
+
+    with caplog.at_level("INFO", logger="mail-service.delivery"):
+        await SmtpDeliverer(settings).deliver(
+            "persona@example.com", email
+        )
+
+    record = caplog.records[-1].getMessage()
+    assert "example.com" in record
+    assert "persona@example.com" not in record
+    assert "verificacion-cuenta" in record
+    assert TOKEN not in record
 
 
 # CHG-054 — Novedad del avance de un reporte hecho con cuenta.
