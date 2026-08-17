@@ -2830,6 +2830,7 @@ def create_app(
             address=row["address"],
             latitude=row["latitude"],
             longitude=row["longitude"],
+            notification_radius_km=row.get("notification_radius_km"),
             created_at=row["created_at"],
             expires_at=row["expires_at"],
             attenders_count=row["attenders_count"],
@@ -2928,6 +2929,7 @@ def create_app(
                 address=payload.address.strip(),
                 latitude=payload.latitude,
                 longitude=payload.longitude,
+                notification_radius_km=payload.notification_radius_km,
                 duration_hours=payload.duration_hours,
                 photo_storage_key=(
                     photo.storage_key if photo else None

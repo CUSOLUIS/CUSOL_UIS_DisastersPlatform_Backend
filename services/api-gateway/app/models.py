@@ -787,6 +787,8 @@ class ActiveHelpRequest(ApiModel):
     # CHG-127: null cuando la solicitud llegó solo con dirección.
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
+    # CHG-131: radio de aviso en km; null si la solicitud no lo definió.
+    notification_radius_km: int | None = Field(default=None, ge=1, le=100)
     created_at: datetime
     expires_at: datetime
     attenders_count: int = Field(ge=0)

@@ -51,6 +51,7 @@ class FakeHelpRequestRepository:
             "address": "Calle 10 #5-20, Bucaramanga",
             "latitude": 7.12,
             "longitude": -73.12,
+            "notification_radius_km": None,
             "created_at": created,
             "expires_at": created
             + timedelta(hours=1 if expired else 24),
@@ -85,6 +86,7 @@ class FakeHelpRequestRepository:
             "address": kwargs["address"],
             "latitude": kwargs["latitude"],
             "longitude": kwargs["longitude"],
+            "notification_radius_km": kwargs["notification_radius_km"],
             "created_at": created,
             "expires_at": created
             + timedelta(hours=kwargs["duration_hours"]),
@@ -245,6 +247,47 @@ async def test_create_without_coordinates():
     item = listing.json()["items"][0]
     assert item["latitude"] is None
     assert item["longitude"] is None
+
+
+# CHG-131 — el radio de aviso viaja con la solicitud y se proyecta en
+# el listado; exige coordenadas y rango 1-100 km.
+@pytest.mark.anyio
+async def test_create_stores_notification_radius():
+    repository = FakeHelpRequestRepository()
+    app = help_app(repository=repository)
+
+    response = await post_help_request(
+        app, payload=valid_payload(notificationRadiusKm=15)
+    )
+
+    assert response.status_code == 201
+    row = next(iter(repository.rows.values()))
+    assert row["notification_radius_km"] == 15
+
+    listing = await request_app(app, "GET", "/internal/v1/help-requests")
+    assert listing.json()["items"][0]["notificationRadiusKm"] == 15
+
+
+@pytest.mark.anyio
+async def test_create_rejects_radius_without_coordinates():
+    app = help_app()
+
+    payload = valid_payload(notificationRadiusKm=15)
+    del payload["latitude"]
+    del payload["longitude"]
+    response = await post_help_request(app, payload=payload)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("radius", [0, 101, -3])
+async def test_create_rejects_out_of_range_radius(radius):
+    app = help_app()
+    response = await post_help_request(
+        app, payload=valid_payload(notificationRadiusKm=radius)
+    )
+    assert response.status_code == 422
 
 
 # CHG-127 / DEC-127-01 — el par viaja completo o no viaja.

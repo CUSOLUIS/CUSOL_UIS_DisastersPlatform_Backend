@@ -3458,6 +3458,7 @@ class PostgresDisasterRepository:
         address: str,
         latitude: float | None,
         longitude: float | None,
+        notification_radius_km: int | None,
         duration_hours: int,
         photo_storage_key: str | None,
         photo_derived_storage_key: str | None,
@@ -3473,12 +3474,12 @@ class PostgresDisasterRepository:
             INSERT INTO disaster_service.help_requests (
                 idempotency_key, public_code, reporter_account_id,
                 description, address, latitude, longitude,
-                duration_hours, photo_storage_key,
-                photo_derived_storage_key, photo_content_type,
-                expires_at
+                notification_radius_km, duration_hours,
+                photo_storage_key, photo_derived_storage_key,
+                photo_content_type, expires_at
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                NOW() + make_interval(hours => $8)
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                NOW() + make_interval(hours => $9)
             )
             ON CONFLICT (idempotency_key) DO NOTHING
             RETURNING id, public_code, created_at, expires_at
@@ -3490,6 +3491,7 @@ class PostgresDisasterRepository:
             address,
             latitude,
             longitude,
+            notification_radius_km,
             duration_hours,
             photo_storage_key,
             photo_derived_storage_key,
@@ -3521,6 +3523,7 @@ class PostgresDisasterRepository:
                 hr.address,
                 hr.latitude,
                 hr.longitude,
+                hr.notification_radius_km,
                 hr.created_at,
                 hr.expires_at,
                 (SELECT COUNT(*)

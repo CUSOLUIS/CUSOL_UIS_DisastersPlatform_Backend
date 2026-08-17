@@ -1335,6 +1335,9 @@ class HelpRequestInput(ApiModel):
     duration_hours: int = Field(
         ge=HELP_REQUEST_MIN_HOURS, le=HELP_REQUEST_MAX_HOURS
     )
+    # CHG-131: radio de aviso en la app instalada, en km a la redonda
+    # del punto; exige coordenadas.
+    notification_radius_km: int | None = Field(default=None, ge=1, le=100)
 
     @model_validator(mode="after")
     def _coordinates_pair(self):
@@ -1342,6 +1345,15 @@ class HelpRequestInput(ApiModel):
             raise ValueError(
                 "latitude y longitude deben enviarse juntas o ambas "
                 "ausentes"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _radius_needs_coordinates(self):
+        if self.notification_radius_km is not None and self.latitude is None:
+            raise ValueError(
+                "notificationRadiusKm exige latitude y longitude: sin "
+                "punto no hay distancias que medir"
             )
         return self
 
@@ -1371,6 +1383,8 @@ class ActiveHelpRequest(ApiModel):
     # CHG-127: null cuando la solicitud llegó solo con dirección.
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
+    # CHG-131: radio de aviso en km; null si la solicitud no lo definió.
+    notification_radius_km: int | None = Field(default=None, ge=1, le=100)
     created_at: datetime
     expires_at: datetime
     attenders_count: int = Field(ge=0)
