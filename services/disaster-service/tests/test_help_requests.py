@@ -249,6 +249,26 @@ async def test_create_without_coordinates():
     assert item["longitude"] is None
 
 
+# CHG-137 — los clientes con bundle anterior a CHG-136 aún adjuntan la
+# instantánea del reportante: se acepta y se descarta sin almacenarla.
+@pytest.mark.anyio
+async def test_create_ignores_legacy_reporter_snapshot():
+    repository = FakeHelpRequestRepository()
+    app = help_app(repository=repository)
+
+    response = await post_help_request(
+        app,
+        payload=valid_payload(
+            reporterLatitude=7.11, reporterLongitude=-73.12
+        ),
+    )
+
+    assert response.status_code == 201
+    row = next(iter(repository.rows.values()))
+    assert "reporter_latitude" not in row
+    assert "reporter_longitude" not in row
+
+
 # CHG-131 — el radio de aviso viaja con la solicitud y se proyecta en
 # el listado; exige coordenadas y rango 1-100 km.
 @pytest.mark.anyio

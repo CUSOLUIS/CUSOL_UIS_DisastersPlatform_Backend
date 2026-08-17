@@ -1338,6 +1338,17 @@ class HelpRequestInput(ApiModel):
     # CHG-131: radio de aviso en la app instalada, en km a la redonda
     # del punto; exige coordenadas.
     notification_radius_km: int | None = Field(default=None, ge=1, le=100)
+    # CHG-137: clientes con bundle anterior a CHG-136 aún adjuntan la
+    # instantánea del reportante. Se ACEPTA y se DESCARTA: jamás se
+    # almacena, se registra ni se usa (la solicitud es pública por
+    # diseño, DEC-125-12). Sin esto, `extra="forbid"` tumbaba el envío
+    # de esos clientes con un 422 por campos que el formulario no pide.
+    reporter_latitude: float | None = Field(
+        default=None, ge=-90, le=90, exclude=True
+    )
+    reporter_longitude: float | None = Field(
+        default=None, ge=-180, le=180, exclude=True
+    )
 
     @model_validator(mode="after")
     def _coordinates_pair(self):
