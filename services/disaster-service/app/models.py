@@ -1309,6 +1309,73 @@ class VolunteerAlertPage(ApiModel):
     generated_at: datetime
 
 
+# CHG-125 — «Necesitamos ayuda»: solicitud pública de emergencia con
+# vigencia en horas. Sin datos de contacto: descripción, dirección y
+# coordenadas son públicas por diseño (DEC-125-12).
+HELP_REQUEST_MIN_HOURS = 1
+HELP_REQUEST_MAX_HOURS = 72
+
+
+class HelpRequestInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    description: str = Field(min_length=10, max_length=1000)
+    address: str = Field(min_length=5, max_length=300)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    duration_hours: int = Field(
+        ge=HELP_REQUEST_MIN_HOURS, le=HELP_REQUEST_MAX_HOURS
+    )
+
+    # CHG-107: descarta descripciones que evidentemente no son texto
+    # escrito (repetición, palabras pegadas, vocabulario nulo).
+    @model_validator(mode="after")
+    def _description_is_readable(self):
+        try:
+            validate_community_text(self.description, "description")
+        except TextQualityError as error:
+            raise ValueError(str(error)) from error
+        return self
+
+
+class HelpRequestReceipt(ApiModel):
+    id: UUID
+    public_code: str
+    status: Literal["active"]
+    received_at: datetime
+    expires_at: datetime
+
+
+class ActiveHelpRequest(ApiModel):
+    id: UUID
+    description: str
+    address: str
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    created_at: datetime
+    expires_at: datetime
+    attenders_count: int = Field(ge=0)
+    attended_by_me: bool
+    photo_url: str | None = None
+
+
+class HelpRequestPage(ApiModel):
+    items: list[ActiveHelpRequest] = Field(max_length=50)
+    total: int = Field(ge=0)
+    generated_at: datetime
+
+
+class HelpRequestAttendReceipt(ApiModel):
+    id: UUID
+    attenders_count: int = Field(ge=1)
+    attending: bool
+
+
 class MyReportNovelty(ApiModel):
     """Novedad que OTRA persona aportó sobre un caso propio."""
 

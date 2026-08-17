@@ -82,6 +82,11 @@ from .models import (
     VolunteerAlert,
     VolunteerAlertInput,
     VolunteerAlertPage,
+    ActiveHelpRequest,
+    HelpRequestAttendReceipt,
+    HelpRequestInput,
+    HelpRequestPage,
+    HelpRequestReceipt,
 )
 from .photos import (
     MalwareScanner,
@@ -183,6 +188,11 @@ BUILDING_REPORT_LEGAL_TEXT_VERSION = "chg-035/legal-v1"
 def generate_public_tracking_code(now: datetime) -> str:
     """Código público aleatorio y no secuencial (CHG-035)."""
     return f"BR-{now.year}-{secrets.token_hex(4).upper()}"
+
+
+def generate_help_request_code(now: datetime) -> str:
+    """Código público de solicitud de ayuda (CHG-125)."""
+    return f"HR-{now.year}-{secrets.token_hex(4).upper()}"
 
 
 # CHG-036 — Campos del detalle administrativo por tipo:
@@ -2807,6 +2817,250 @@ def create_app(
                 "La alerta no existe, no es tuya o ya fue resuelta.",
             )
         return volunteer_alert_model(row)
+
+    # CHG-125 — «Necesitamos ayuda»: creación pública (anónima o con
+    # cuenta), listado vigente con conteo de atención, atención
+    # idempotente y fotografía pública. La expiración la imponen las
+    # consultas del repositorio (DEC-125-02).
+
+    def active_help_request_model(row: dict) -> ActiveHelpRequest:
+        return ActiveHelpRequest(
+            id=row["id"],
+            description=row["description"],
+            address=row["address"],
+            latitude=row["latitude"],
+            longitude=row["longitude"],
+            created_at=row["created_at"],
+            expires_at=row["expires_at"],
+            attenders_count=row["attenders_count"],
+            attended_by_me=bool(row["attended_by_me"]),
+            photo_url=(
+                f"/api/v1/public/help-requests/{row['id']}/photo"
+                if row.get("has_photo")
+                else None
+            ),
+        )
+
+    @application.post(
+        "/internal/v1/help-requests",
+        status_code=201,
+        response_model=HelpRequestReceipt,
+        response_model_by_alias=True,
+        tags=["HelpRequests"],
+    )
+    async def create_help_request(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        _actor_kind, reporter_account_id = actor
+
+        oversized = check_declared_length(request)
+        if oversized is not None:
+            return oversized
+
+        try:
+            form = await request.form()
+        except Exception:
+            return problem(
+                422,
+                "Formulario inválido",
+                "No fue posible interpretar el envío multipart.",
+            )
+
+        raw_payload = await read_payload_part(form)
+        if isinstance(raw_payload, JSONResponse):
+            return raw_payload
+        try:
+            payload = HelpRequestInput.model_validate_json(raw_payload)
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+
+        prepared = await prepare_photo_parts(
+            form,
+            0,
+            1,
+            "La solicitud admite máximo una fotografía del lugar.",
+        )
+        if isinstance(prepared, JSONResponse):
+            return prepared
+
+        received_at = datetime.now(UTC)
+        request_id = uuid4()
+        saved_keys: list[str] = []
+
+        def cleanup() -> None:
+            for key in saved_keys:
+                object_storage.delete(key)
+
+        try:
+            stored = store_photos(
+                f"help-requests/{request_id}", prepared, saved_keys
+            )
+        except PhotoProcessingError:
+            cleanup()
+            return problem(
+                415,
+                "Fotografía no procesable",
+                "La fotografía no pudo validarse como imagen segura.",
+            )
+        except StorageUnavailableError:
+            cleanup()
+            return problem(
+                503,
+                "Almacenamiento no disponible",
+                "No fue posible resguardar la fotografía; la solicitud "
+                "no fue registrada.",
+            )
+        photo = stored[0] if stored else None
+
+        try:
+            row, created = await data.create_help_request(
+                idempotency_key=idempotency_key,
+                public_code=generate_help_request_code(received_at),
+                reporter_account_id=reporter_account_id,
+                description=payload.description.strip(),
+                address=payload.address.strip(),
+                latitude=payload.latitude,
+                longitude=payload.longitude,
+                duration_hours=payload.duration_hours,
+                photo_storage_key=(
+                    photo.storage_key if photo else None
+                ),
+                photo_derived_storage_key=(
+                    photo.derived_storage_key if photo else None
+                ),
+                photo_content_type=(
+                    photo.content_type if photo else None
+                ),
+            )
+        except asyncpg.PostgresError:
+            cleanup()
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible registrar la solicitud; ningún dato "
+                "quedó publicado.",
+            )
+
+        if not created:
+            # Reintento idempotente: los archivos de este intento sobran.
+            cleanup()
+
+        return HelpRequestReceipt(
+            id=row["id"],
+            public_code=row["public_code"],
+            status="active",
+            received_at=row["created_at"],
+            expires_at=row["expires_at"],
+        )
+
+    @application.get(
+        "/internal/v1/help-requests",
+        response_model=HelpRequestPage,
+        response_model_by_alias=True,
+        tags=["HelpRequests"],
+    )
+    async def list_active_help_requests(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        if limit not in (10, 25, 50):
+            return problem(
+                422,
+                "Tamaño de página inválido",
+                "El tamaño de página debe ser 10, 25 o 50.",
+            )
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        _actor_kind, account_id = actor
+        rows, total = await data.list_active_help_requests(
+            limit, offset, account_id
+        )
+        return HelpRequestPage(
+            items=[active_help_request_model(row) for row in rows],
+            total=total,
+            generated_at=datetime.now(UTC),
+        )
+
+    @application.post(
+        "/internal/v1/help-requests/{request_id}/attend",
+        response_model=HelpRequestAttendReceipt,
+        response_model_by_alias=True,
+        tags=["HelpRequests"],
+    )
+    async def attend_help_request(
+        request_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401,
+                "Sesión requerida",
+                "Atender una solicitud exige una cuenta autenticada "
+                "resuelta por el gateway.",
+            )
+        row = await data.attend_help_request(request_id, account_id)
+        if row is None:
+            return problem(
+                404,
+                "Solicitud no disponible",
+                "La solicitud no existe o ya expiró.",
+            )
+        return HelpRequestAttendReceipt(
+            id=row["id"],
+            attenders_count=row["attenders_count"],
+            attending=True,
+        )
+
+    @application.get(
+        "/internal/v1/public/help-requests/{request_id}/photo",
+        tags=["HelpRequests"],
+    )
+    async def serve_help_request_photo(
+        request_id: UUID,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        photo = await data.get_help_request_photo(request_id)
+        if photo is None:
+            return problem(
+                404,
+                "Fotografía no disponible",
+                "La solicitud no tiene fotografía o ya expiró.",
+            )
+        try:
+            content = object_storage.load(photo["object_key"])
+        except StorageUnavailableError:
+            content = None
+        if content is None:
+            return problem(
+                503,
+                "Fotografía no disponible",
+                "No fue posible leer la fotografía en este momento.",
+            )
+
+        from fastapi.responses import Response as RawResponse
+
+        return RawResponse(
+            content=content,
+            media_type=photo["content_type"],
+            # Pública y cacheable por poco tiempo: al expirar la
+            # solicitud la copia vieja no debe sobrevivir mucho.
+            headers={"Cache-Control": "public, max-age=300"},
+        )
 
     # CHG-036 — Consola de superadministración (rutas internas).
     # El gateway es quien autentica la cookie; aquí se revalida el rol

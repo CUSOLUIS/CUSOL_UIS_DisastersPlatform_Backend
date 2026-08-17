@@ -570,6 +570,36 @@ class AdminOverview(ApiModel):
     generated_at: datetime
 
 
+# CHG-126 — Métricas del sistema para la consola admin. Memoria, CPU
+# y carga son del host; el disco es el del sistema de archivos del
+# contenedor (respaldado por el disco del host); la red es la del
+# namespace del gateway.
+class SystemMetricsSample(ApiModel):
+    sampled_at: datetime
+    cpu_percent: float = Field(ge=0, le=100)
+    load_1m: float = Field(ge=0)
+    load_5m: float = Field(ge=0)
+    load_15m: float = Field(ge=0)
+    memory_total_bytes: int = Field(ge=0)
+    memory_used_bytes: int = Field(ge=0)
+    memory_available_bytes: int = Field(ge=0)
+    swap_total_bytes: int = Field(ge=0)
+    swap_used_bytes: int = Field(ge=0)
+    disk_total_bytes: int = Field(ge=0)
+    disk_used_bytes: int = Field(ge=0)
+    disk_free_bytes: int = Field(ge=0)
+    network_rx_bytes_per_second: float = Field(ge=0)
+    network_tx_bytes_per_second: float = Field(ge=0)
+    uptime_seconds: float = Field(ge=0)
+
+
+class AdminSystemMetrics(ApiModel):
+    interval_seconds: float = Field(gt=0)
+    latest: SystemMetricsSample
+    series: list[SystemMetricsSample] = Field(max_length=1000)
+    generated_at: datetime
+
+
 class AdminSubmissionSummary(ApiModel):
     id: UUID
     kind: AdminSubmissionKind
@@ -739,6 +769,40 @@ class VolunteerAlertPage(ApiModel):
     items: list[VolunteerAlert] = Field(max_length=100)
     total: int = Field(ge=0)
     generated_at: datetime
+
+
+# CHG-125 — «Necesitamos ayuda» (espejo del disaster-service).
+class HelpRequestReceipt(ApiModel):
+    id: UUID
+    public_code: str
+    status: Literal["active"]
+    received_at: datetime
+    expires_at: datetime
+
+
+class ActiveHelpRequest(ApiModel):
+    id: UUID
+    description: str
+    address: str
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    created_at: datetime
+    expires_at: datetime
+    attenders_count: int = Field(ge=0)
+    attended_by_me: bool
+    photo_url: str | None = None
+
+
+class HelpRequestPage(ApiModel):
+    items: list[ActiveHelpRequest] = Field(max_length=50)
+    total: int = Field(ge=0)
+    generated_at: datetime
+
+
+class HelpRequestAttendReceipt(ApiModel):
+    id: UUID
+    attenders_count: int = Field(ge=1)
+    attending: bool
 
 
 class MyReportNovelty(ApiModel):

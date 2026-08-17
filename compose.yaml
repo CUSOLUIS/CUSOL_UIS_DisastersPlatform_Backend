@@ -259,6 +259,8 @@ services:
       EXPO_PUBLIC_ADMIN_DATA_MODE: ${ADMIN_DATA_MODE:-demo}
       # CHG-069: "Mi espacio" contra la API real; `demo` solo sin backend.
       EXPO_PUBLIC_MY_SPACE_DATA_MODE: ${MY_SPACE_DATA_MODE:-api}
+      # CHG-125: solicitudes «Necesitamos ayuda» contra la API real.
+      EXPO_PUBLIC_HELP_REQUESTS_DATA_MODE: ${HELP_REQUESTS_DATA_MODE:-api}
     volumes:
       - ../CUSOL_UIS_DisastersPlatform_Frontend:/app
       - frontend-node-modules:/app/node_modules

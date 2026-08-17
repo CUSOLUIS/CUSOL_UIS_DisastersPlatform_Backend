@@ -33,6 +33,12 @@ class Settings:
     # CHG-035: límite separado para el ingreso anónimo de reportes de
     # edificio sin verificar.
     building_reports_rate_limit_per_minute: int = 5
+    # CHG-125: solicitudes «Necesitamos ayuda» — alta pública por
+    # origen, lectura por origen (el dashboard sondea cada 30 s) y
+    # atención por cuenta autenticada.
+    help_request_rate_limit_per_minute: int = 5
+    help_request_read_rate_limit_per_minute: int = 60
+    help_attend_rate_limit_per_minute: int = 30
     # CHG-036: límites administrativos por cuenta autenticada.
     admin_rate_limit_per_minute: int = 240
     admin_evidence_rate_limit_per_minute: int = 30
@@ -52,6 +58,10 @@ class Settings:
     # (`--build-arg GIT_REVISION`); sin él la imagen no sabe de dónde
     # viene y lo dice, en vez de fingir una revisión.
     git_revision: str = "unknown"
+    # CHG-126: métricas del sistema para la consola admin — una
+    # muestra cada 5 s, con 180 en memoria (15 min de historia).
+    system_metrics_sample_seconds: float = 5.0
+    system_metrics_history_samples: int = 180
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -117,6 +127,17 @@ class Settings:
                     "BUILDING_REPORTS_RATE_LIMIT_PER_MINUTE", "5"
                 )
             ),
+            help_request_rate_limit_per_minute=int(
+                os.getenv("HELP_REQUEST_RATE_LIMIT_PER_MINUTE", "5")
+            ),
+            help_request_read_rate_limit_per_minute=int(
+                os.getenv(
+                    "HELP_REQUEST_READ_RATE_LIMIT_PER_MINUTE", "60"
+                )
+            ),
+            help_attend_rate_limit_per_minute=int(
+                os.getenv("HELP_ATTEND_RATE_LIMIT_PER_MINUTE", "30")
+            ),
             admin_rate_limit_per_minute=int(
                 os.getenv("ADMIN_RATE_LIMIT_PER_MINUTE", "240")
             ),
@@ -143,4 +164,10 @@ class Settings:
             ),
             git_revision=os.getenv("GIT_REVISION", "unknown").strip()
             or "unknown",
+            system_metrics_sample_seconds=float(
+                os.getenv("SYSTEM_METRICS_SAMPLE_SECONDS", "5")
+            ),
+            system_metrics_history_samples=int(
+                os.getenv("SYSTEM_METRICS_HISTORY_SAMPLES", "180")
+            ),
         )

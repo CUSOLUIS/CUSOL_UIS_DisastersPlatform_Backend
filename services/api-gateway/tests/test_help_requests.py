@@ -1,0 +1,413 @@
+"""CHG-125 — Gateway de «Necesitamos ayuda».
+
+La creación y el listado son públicos (con cuenta opcional que viaja en
+headers internos); atender exige sesión válida contra identity-service;
+la fotografía se reenvía tal cual. Nunca se reenvían cookies al
+servicio interno.
+"""
+
+import json
+
+import httpx
+import pytest
+
+from app.config import Settings
+from app.main import create_app
+
+DISASTER_URL = "http://disaster-service:8001"
+IDENTITY_URL = "http://identity-service:8002"
+PATH = "/api/v1/help-requests"
+IDEMPOTENCY = {"Idempotency-Key": "clave-idempotente-0125"}
+REQUEST_ID = "77777777-7777-4777-8777-777777777701"
+
+RECEIPT = {
+    "id": REQUEST_ID,
+    "publicCode": "HR-2026-AAAA1111",
+    "status": "active",
+    "receivedAt": "2026-08-16T12:00:00Z",
+    "expiresAt": "2026-08-16T18:00:00Z",
+}
+
+PAGE = {
+    "items": [
+        {
+            "id": REQUEST_ID,
+            "description": "Necesitamos ayuda urgente con rescate.",
+            "address": "Calle 10 #5-20, Bucaramanga",
+            "latitude": 7.12,
+            "longitude": -73.12,
+            "createdAt": "2026-08-16T12:00:00Z",
+            "expiresAt": "2026-08-16T18:00:00Z",
+            "attendersCount": 2,
+            "attendedByMe": False,
+            "photoUrl": None,
+        }
+    ],
+    "total": 1,
+    "generatedAt": "2026-08-16T12:05:00Z",
+}
+
+ATTEND_RECEIPT = {
+    "id": REQUEST_ID,
+    "attendersCount": 3,
+    "attending": True,
+}
+
+USER_ACCOUNT = {
+    "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+    "displayName": "Usuaria Normal",
+    "email": "user@cusol.local",
+    "assignedRole": "user",
+    "status": "active",
+    "sessionExpiresAt": "2026-08-16T20:00:00Z",
+}
+
+
+def gateway_settings(**overrides) -> Settings:
+    values = {
+        "disaster_service_url": DISASTER_URL,
+        "identity_service_url": IDENTITY_URL,
+        "upstream_timeout_seconds": 1,
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+def identity_handler(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/internal/v1/auth/me":
+        if request.headers.get("x-session-token") == "token-user":
+            return httpx.Response(200, json=USER_ACCOUNT)
+        return httpx.Response(
+            401,
+            json={
+                "type": "session-required",
+                "title": "Sesión requerida",
+                "status": 401,
+                "detail": "La sesión está ausente, vencida o revocada.",
+            },
+        )
+    raise AssertionError(f"ruta identity inesperada: {request.url.path}")
+
+
+def make_clients(disaster_handler, identity=identity_handler):
+    upstream = httpx.AsyncClient(
+        transport=httpx.MockTransport(disaster_handler),
+        base_url=DISASTER_URL,
+    )
+    identity_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(identity), base_url=IDENTITY_URL
+    )
+    return upstream, identity_client
+
+
+async def request_gateway(app, method, path, **kwargs) -> httpx.Response:
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            return await client.request(method, path, **kwargs)
+
+
+@pytest.mark.anyio
+async def test_create_streams_multipart_and_hides_cookies():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["content_type"] = request.headers.get("content-type", "")
+        seen["idempotency"] = request.headers.get("idempotency-key")
+        seen["actor"] = request.headers.get("x-actor-kind")
+        seen["cookie"] = request.headers.get("cookie")
+        seen["body"] = await request.aread()
+        return httpx.Response(201, json=RECEIPT)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        PATH,
+        headers={**IDEMPOTENCY, "Cookie": "cusol_session=privada"},
+        files=[
+            (
+                "payload",
+                (None, '{"cualquier":"json"}', "application/json"),
+            ),
+            ("photos", ("foto.jpg", b"\xff\xd8\xff bytes", "image/jpeg")),
+        ],
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 201
+    assert response.json() == RECEIPT
+    assert seen["path"] == "/internal/v1/help-requests"
+    assert seen["content_type"].startswith("multipart/form-data")
+    assert b'{"cualquier":"json"}' in seen["body"]
+    assert seen["idempotency"] == IDEMPOTENCY["Idempotency-Key"]
+    assert seen["actor"] == "anonymous"
+    assert seen["cookie"] is None
+
+
+@pytest.mark.anyio
+async def test_create_requires_idempotency_key():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(201, json=RECEIPT)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app, "POST", PATH, content=b"", headers={}
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 422
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_create_forwards_optional_account():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["actor"] = request.headers.get("x-actor-kind")
+        seen["account"] = request.headers.get("x-account-id")
+        await request.aread()
+        return httpx.Response(201, json=RECEIPT)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        PATH,
+        headers=IDEMPOTENCY,
+        cookies={"cusol_session": "token-user"},
+        content=b"x",
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 201
+    assert seen["actor"] == "authenticated"
+    assert seen["account"] == USER_ACCOUNT["id"]
+
+
+@pytest.mark.anyio
+async def test_create_has_its_own_rate_limit():
+    upstream, identity = make_clients(
+        lambda _: httpx.Response(201, json=RECEIPT)
+    )
+    app = create_app(
+        gateway_settings(help_request_rate_limit_per_minute=1),
+        upstream,
+        identity,
+    )
+
+    first = await request_gateway(
+        app, "POST", PATH, headers=IDEMPOTENCY, content=b"x"
+    )
+    second = await request_gateway(
+        app, "POST", PATH, headers=IDEMPOTENCY, content=b"x"
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert first.status_code == 201
+    assert second.status_code == 429
+
+
+@pytest.mark.anyio
+async def test_list_forwards_pagination_and_actor():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["params"] = dict(request.url.params)
+        seen["actor"] = request.headers.get("x-actor-kind")
+        return httpx.Response(200, json=PAGE)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app, "GET", PATH, params={"limit": 10, "offset": 20}
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert seen["path"] == "/internal/v1/help-requests"
+    assert seen["params"] == {"limit": "10", "offset": "20"}
+    assert seen["actor"] == "anonymous"
+
+
+@pytest.mark.anyio
+async def test_list_rejects_unknown_page_size():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json=PAGE)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app, "GET", PATH, params={"limit": 7}
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 422
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_attend_requires_session():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json=ATTEND_RECEIPT)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app, "POST", f"{PATH}/{REQUEST_ID}/attend"
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 401
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_attend_forwards_account_and_returns_count():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["actor"] = request.headers.get("x-actor-kind")
+        seen["account"] = request.headers.get("x-account-id")
+        seen["cookie"] = request.headers.get("cookie")
+        return httpx.Response(200, json=ATTEND_RECEIPT)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        f"{PATH}/{REQUEST_ID}/attend",
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert response.json() == ATTEND_RECEIPT
+    assert seen["path"] == (
+        f"/internal/v1/help-requests/{REQUEST_ID}/attend"
+    )
+    assert seen["actor"] == "authenticated"
+    assert seen["account"] == USER_ACCOUNT["id"]
+    assert seen["cookie"] is None
+
+
+@pytest.mark.anyio
+async def test_attend_passes_through_not_found():
+    def handler(_request: httpx.Request):
+        return httpx.Response(
+            404,
+            headers={"content-type": "application/problem+json"},
+            content=json.dumps(
+                {
+                    "type": "about:blank",
+                    "title": "Solicitud no disponible",
+                    "status": 404,
+                    "detail": "La solicitud no existe o ya expiró.",
+                }
+            ),
+        )
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        f"{PATH}/{REQUEST_ID}/attend",
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == (
+        "La solicitud no existe o ya expiró."
+    )
+
+
+@pytest.mark.anyio
+async def test_photo_passthrough_preserves_content_type():
+    def handler(request: httpx.Request):
+        assert request.url.path == (
+            f"/internal/v1/public/help-requests/{REQUEST_ID}/photo"
+        )
+        return httpx.Response(
+            200,
+            content=b"\xff\xd8\xffjpegbytes",
+            headers={
+                "content-type": "image/jpeg",
+                "cache-control": "public, max-age=300",
+            },
+        )
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app, "GET", f"/api/v1/public/help-requests/{REQUEST_ID}/photo"
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert response.content == b"\xff\xd8\xffjpegbytes"
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["cache-control"] == "public, max-age=300"
+
+
+@pytest.mark.anyio
+async def test_upstream_failure_is_503():
+    def handler(_request: httpx.Request):
+        raise httpx.ConnectError("sin conexión")
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    created = await request_gateway(
+        app, "POST", PATH, headers=IDEMPOTENCY, content=b"x"
+    )
+    listed = await request_gateway(app, "GET", PATH)
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert created.status_code == 503
+    assert listed.status_code == 503
+    assert created.json()["title"] == (
+        "Servicio de solicitudes no disponible"
+    )

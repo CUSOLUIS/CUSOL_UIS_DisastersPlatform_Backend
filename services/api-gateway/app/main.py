@@ -1,7 +1,8 @@
+import asyncio
 import base64
 import hashlib
 import json
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 from uuid import UUID
@@ -36,6 +37,7 @@ from .models import (
     AdminSubmissionDetail,
     AdminSubmissionKind,
     AdminSubmissionPage,
+    AdminSystemMetrics,
     AidLocationAvailability,
     AuthenticatedAccount,
     ChangeSignal,
@@ -63,8 +65,12 @@ from .models import (
     SessionEnvelope,
     UnverifiedBuildingReportReceipt,
     VerificationStatus,
+    HelpRequestAttendReceipt,
+    HelpRequestPage,
+    HelpRequestReceipt,
 )
 from .ratelimit import SlidingWindowRateLimiter
+from .system_metrics import SystemMetricsSampler
 
 
 SESSION_COOKIE = "cusol_session"
@@ -104,6 +110,23 @@ def create_app(
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_environment()
 
+    # CHG-126: métricas del sistema para la consola admin. El anillo
+    # vive en el proceso; la tarea de fondo lo alimenta cada pocos
+    # segundos para que las gráficas tengan historia al primer clic.
+    metrics_sampler = SystemMetricsSampler(
+        history=resolved_settings.system_metrics_history_samples
+    )
+
+    async def run_metrics_sampler() -> None:
+        while True:
+            # La lectura de /proc es bloqueante pero mínima; se manda a
+            # un hilo para no ocupar el loop si el disco está lento.
+            with suppress(OSError, ValueError, IndexError):
+                await asyncio.to_thread(metrics_sampler.sample)
+            await asyncio.sleep(
+                resolved_settings.system_metrics_sample_seconds
+            )
+
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         async with AsyncExitStack() as stack:
@@ -133,7 +156,13 @@ def create_app(
                         )
                     )
                 )
-            yield
+            sampler_task = asyncio.create_task(run_metrics_sampler())
+            try:
+                yield
+            finally:
+                sampler_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await sampler_task
 
     application = FastAPI(
         title="CUSOL UIS Disasters API Gateway",
@@ -190,6 +219,16 @@ def create_app(
         resolved_settings.account_contribution_rate_limit_per_minute
     )
     # CHG-035: límite separado para reportes de edificio sin verificar.
+    # CHG-125: solicitudes «Necesitamos ayuda».
+    help_request_limiter = SlidingWindowRateLimiter(
+        resolved_settings.help_request_rate_limit_per_minute
+    )
+    help_request_read_limiter = SlidingWindowRateLimiter(
+        resolved_settings.help_request_read_rate_limit_per_minute
+    )
+    help_attend_limiter = SlidingWindowRateLimiter(
+        resolved_settings.help_attend_rate_limit_per_minute
+    )
     building_reports_limiter = SlidingWindowRateLimiter(
         resolved_settings.building_reports_rate_limit_per_minute
     )
@@ -1508,6 +1547,49 @@ def create_app(
         except (httpx.HTTPError, httpx.TimeoutException, ValueError):
             return admin_unavailable()
 
+    # CHG-126 — Métricas del sistema donde corre el gateway (el VPS en
+    # producción). Solo super_admin; la serie sale del anillo del
+    # muestreador de fondo y, si aún no hay muestras, se toma una al
+    # vuelo para no responder vacío.
+    @application.get(
+        "/api/v1/admin/system-metrics",
+        response_model=AdminSystemMetrics,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            503: {"description": "Métricas no disponibles"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_system_metrics(
+        request: Request,
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not metrics_sampler.samples:
+            try:
+                await asyncio.to_thread(metrics_sampler.sample)
+            except (OSError, ValueError, IndexError):
+                return problem_response(
+                    "No fue posible leer las métricas del sistema "
+                    "operativo.",
+                    title="Métricas no disponibles",
+                )
+        series = list(metrics_sampler.samples)
+        return AdminSystemMetrics(
+            interval_seconds=(
+                resolved_settings.system_metrics_sample_seconds
+            ),
+            latest=series[-1],
+            series=series,
+            generated_at=datetime.now(UTC),
+        )
+
     @application.get(
         "/api/v1/admin/submissions",
         response_model=AdminSubmissionPage,
@@ -2139,6 +2221,234 @@ def create_app(
                 "No fue posible recibir el reporte en este momento; "
                 "ningún dato quedó registrado.",
                 title="Servicio de reportes no disponible",
+            )
+
+    # CHG-125 — «Necesitamos ayuda»: solicitudes públicas de
+    # emergencia con vigencia; la expiración vive en el
+    # disaster-service (DEC-125-02).
+
+    @application.post(
+        "/api/v1/help-requests",
+        status_code=201,
+        response_model=HelpRequestReceipt,
+        response_model_by_alias=True,
+        responses={
+            413: {"description": "Carga demasiado grande"},
+            415: {"description": "Fotografía no permitida"},
+            422: {"description": "Datos o vigencia inválidos"},
+            429: {"description": "Límite de solicitudes excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HelpRequests"],
+    )
+    async def create_help_request(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        if not help_request_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de solicitudes por minuto."
+            )
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        declared = request.headers.get("content-length")
+        if declared is not None and declared.isdigit():
+            if int(declared) > resolved_settings.max_report_body_bytes:
+                return problem_response(
+                    "El envío supera el máximo total permitido.",
+                    title="Carga demasiado grande",
+                    status_code=413,
+                    problem_type="payload-too-large",
+                )
+        # Canal público: la cuenta es opcional y jamás se exige sesión.
+        account = await resolve_optional_account(request, identity)
+        headers = {
+            "content-type": request.headers.get("content-type", ""),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": (
+                "authenticated" if account is not None else "anonymous"
+            ),
+        }
+        if account is not None:
+            headers["x-account-id"] = str(account.id)
+        try:
+            response = await upstream.post(
+                "/internal/v1/help-requests",
+                content=request.stream(),
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=201,
+                content=HelpRequestReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible recibir la solicitud en este momento; "
+                "ningún dato quedó registrado.",
+                title="Servicio de solicitudes no disponible",
+            )
+
+    @application.get(
+        "/api/v1/help-requests",
+        response_model=HelpRequestPage,
+        response_model_by_alias=True,
+        responses={
+            422: {"description": "Paginación inválida"},
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HelpRequests"],
+    )
+    async def list_active_help_requests(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        if not help_request_read_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        if limit not in (10, 25, 50):
+            return problem_response(
+                "El tamaño de página debe ser 10, 25 o 50.",
+                title="Tamaño de página inválido",
+                status_code=422,
+                problem_type="invalid-parameters",
+            )
+        # Con sesión válida el listado marca attendedByMe; sin sesión
+        # sigue siendo el mismo canal público.
+        account = await resolve_optional_account(request, identity)
+        headers = {
+            "x-actor-kind": (
+                "authenticated" if account is not None else "anonymous"
+            ),
+        }
+        if account is not None:
+            headers["x-account-id"] = str(account.id)
+        try:
+            response = await upstream.get(
+                "/internal/v1/help-requests",
+                params={"limit": limit, "offset": offset},
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return HelpRequestPage.model_validate(response.json())
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar las solicitudes en este "
+                "momento.",
+                title="Servicio de solicitudes no disponible",
+            )
+
+    @application.post(
+        "/api/v1/help-requests/{request_id}/attend",
+        response_model=HelpRequestAttendReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            404: {"description": "Solicitud inexistente o expirada"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HelpRequests"],
+    )
+    async def attend_help_request(
+        request_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not help_attend_limiter.allow(str(account.id)):
+            return rate_limited_response(
+                "Se superó el límite de acciones por minuto."
+            )
+        try:
+            response = await upstream.post(
+                f"/internal/v1/help-requests/{request_id}/attend",
+                headers={
+                    "x-actor-kind": "authenticated",
+                    "x-account-id": str(account.id),
+                },
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return HelpRequestAttendReceipt.model_validate(
+                response.json()
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible registrar la atención en este momento.",
+                title="Servicio de solicitudes no disponible",
+            )
+
+    # CHG-125 — Fotografía pública de la solicitud: se reenvía tal
+    # cual, con su tipo de contenido y su cabecera de caché (patrón
+    # CHG-105).
+    @application.get(
+        "/api/v1/public/help-requests/{request_id}/photo",
+        responses={
+            404: {"description": "Sin fotografía o solicitud expirada"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HelpRequests"],
+    )
+    async def serve_help_request_photo(
+        request_id: str,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        try:
+            response = await upstream.get(
+                f"/internal/v1/public/help-requests/{request_id}/photo"
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return Response(
+                content=response.content,
+                media_type=response.headers.get(
+                    "content-type", "application/octet-stream"
+                ),
+                headers={
+                    "Cache-Control": response.headers.get(
+                        "cache-control", "public, max-age=300"
+                    )
+                },
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible obtener la fotografía en este momento.",
+                title="Servicio de solicitudes no disponible",
             )
 
     # CHG-082 — Señal de cambios para el refresco en vivo de la

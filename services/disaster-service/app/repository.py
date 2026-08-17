@@ -815,7 +815,15 @@ class PostgresDisasterRepository:
                  FROM disaster_service.people),
                 (SELECT COUNT(*) FROM disaster_service.aid_locations),
                 (SELECT COALESCE(MAX(updated_at)::text, '')
-                 FROM disaster_service.aid_locations)
+                 FROM disaster_service.aid_locations),
+                -- CHG-125: altas y atenciones de solicitudes de ayuda
+                -- también refrescan portada y mapa en vivo.
+                (SELECT COUNT(*)
+                 FROM disaster_service.help_requests),
+                (SELECT COALESCE(MAX(created_at)::text, '')
+                 FROM disaster_service.help_requests),
+                (SELECT COUNT(*)
+                 FROM disaster_service.help_request_attenders)
             ))
             """
         )
@@ -3435,6 +3443,168 @@ class PostgresDisasterRepository:
         result = dict(row)
         result.pop("map_point_id", None)
         return result
+
+    # CHG-125 — «Necesitamos ayuda»: la vigencia manda. Ninguna
+    # consulta devuelve solicitudes con expires_at vencido; nada se
+    # borra ni cambia de estado al expirar (DEC-125-02).
+
+    async def create_help_request(
+        self,
+        *,
+        idempotency_key: str,
+        public_code: str,
+        reporter_account_id: UUID | None,
+        description: str,
+        address: str,
+        latitude: float,
+        longitude: float,
+        duration_hours: int,
+        photo_storage_key: str | None,
+        photo_derived_storage_key: str | None,
+        photo_content_type: str | None,
+    ) -> tuple[dict, bool]:
+        """Inserta la solicitud calculando expires_at en servidor.
+
+        El reintento con la misma Idempotency-Key devuelve la fila
+        original con created=False (mismo pacto que los reportes).
+        """
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO disaster_service.help_requests (
+                idempotency_key, public_code, reporter_account_id,
+                description, address, latitude, longitude,
+                duration_hours, photo_storage_key,
+                photo_derived_storage_key, photo_content_type,
+                expires_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                NOW() + make_interval(hours => $8)
+            )
+            ON CONFLICT (idempotency_key) DO NOTHING
+            RETURNING id, public_code, created_at, expires_at
+            """,
+            idempotency_key,
+            public_code,
+            reporter_account_id,
+            description,
+            address,
+            latitude,
+            longitude,
+            duration_hours,
+            photo_storage_key,
+            photo_derived_storage_key,
+            photo_content_type,
+        )
+        if row is not None:
+            return dict(row), True
+        existing = await self._pool.fetchrow(
+            """
+            SELECT id, public_code, created_at, expires_at
+            FROM disaster_service.help_requests
+            WHERE idempotency_key = $1
+            """,
+            idempotency_key,
+        )
+        return dict(existing), False
+
+    async def list_active_help_requests(
+        self,
+        limit: int,
+        offset: int,
+        account_id: UUID | None,
+    ) -> tuple[list[dict], int]:
+        rows = await self._pool.fetch(
+            """
+            SELECT
+                hr.id,
+                hr.description,
+                hr.address,
+                hr.latitude,
+                hr.longitude,
+                hr.created_at,
+                hr.expires_at,
+                (SELECT COUNT(*)
+                 FROM disaster_service.help_request_attenders a
+                 WHERE a.help_request_id = hr.id) AS attenders_count,
+                ($3::uuid IS NOT NULL AND EXISTS (
+                    SELECT 1
+                    FROM disaster_service.help_request_attenders a
+                    WHERE a.help_request_id = hr.id
+                      AND a.account_id = $3
+                )) AS attended_by_me,
+                hr.photo_derived_storage_key IS NOT NULL AS has_photo
+            FROM disaster_service.help_requests hr
+            WHERE hr.expires_at > NOW()
+            ORDER BY hr.created_at DESC, hr.id DESC
+            LIMIT $1 OFFSET $2
+            """,
+            limit,
+            offset,
+            account_id,
+        )
+        total = await self._pool.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM disaster_service.help_requests
+            WHERE expires_at > NOW()
+            """
+        )
+        return [dict(row) for row in rows], int(total)
+
+    async def attend_help_request(
+        self, request_id: UUID, account_id: UUID
+    ) -> dict | None:
+        """Registra la atención de forma idempotente (DEC-125-03)."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                active = await connection.fetchval(
+                    """
+                    SELECT 1
+                    FROM disaster_service.help_requests
+                    WHERE id = $1 AND expires_at > NOW()
+                    """,
+                    request_id,
+                )
+                if active is None:
+                    return None
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.help_request_attenders (
+                            help_request_id, account_id
+                        )
+                    VALUES ($1, $2)
+                    ON CONFLICT (help_request_id, account_id)
+                    DO NOTHING
+                    """,
+                    request_id,
+                    account_id,
+                )
+                count = await connection.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM disaster_service.help_request_attenders
+                    WHERE help_request_id = $1
+                    """,
+                    request_id,
+                )
+        return {"id": request_id, "attenders_count": int(count)}
+
+    async def get_help_request_photo(
+        self, request_id: UUID
+    ) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT photo_derived_storage_key AS object_key,
+                   photo_content_type AS content_type
+            FROM disaster_service.help_requests
+            WHERE id = $1
+              AND expires_at > NOW()
+              AND photo_derived_storage_key IS NOT NULL
+            """,
+            request_id,
+        )
+        return None if row is None else dict(row)
 
     # CHG-036 — Consola de superadministración (bandeja unificada,
     # mutaciones con versión y auditoría append-only).
