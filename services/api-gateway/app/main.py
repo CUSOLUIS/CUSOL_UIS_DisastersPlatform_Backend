@@ -11,6 +11,7 @@ import httpx
 from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from .config import Settings
 from .models import (
@@ -38,6 +39,8 @@ from .models import (
     AdminSubmissionKind,
     AdminHelpRequestDeleteReceipt,
     AdminHelpRequestPage,
+    AdminPlatformResetInput,
+    AdminPlatformResetReceipt,
     AdminSubmissionPage,
     AdminSystemMetrics,
     AidLocationAvailability,
@@ -1682,6 +1685,77 @@ def create_app(
             "DELETE",
             "/internal/v1/admin/help-requests",
             AdminHelpRequestDeleteReceipt,
+        )
+
+    # CHG-139 — Reinicio absoluto: la operación más destructiva de la
+    # plataforma. Exige super_admin, Origin válido y la frase de
+    # confirmación exacta escrita por la persona. Orquesta dos pasos:
+    # (1) disaster-service vacía datos+fotos+auditoría y deja el acto
+    # como primer evento nuevo; (2) identity-service borra todas las
+    # cuentas menos la de quien lo ordenó (su sesión sobrevive).
+    @application.post(
+        "/api/v1/admin/platform-reset",
+        response_model=AdminPlatformResetReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            422: {"description": "Frase de confirmación ausente"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_platform_reset(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        try:
+            AdminPlatformResetInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError:
+            return problem_response(
+                "Escribe la frase de confirmación exacta para "
+                "reiniciar la plataforma.",
+                title="Confirmación requerida",
+                status_code=422,
+                problem_type="confirmation-required",
+            )
+        headers = actor_headers(account)
+        try:
+            data_response = await upstream.request(
+                "POST",
+                "/internal/v1/admin/platform-reset",
+                headers=headers,
+            )
+            data_response.raise_for_status()
+            accounts_response = await identity.request(
+                "POST",
+                "/internal/v1/admin/platform-reset",
+                headers=headers,
+            )
+            accounts_response.raise_for_status()
+        except httpx.HTTPError:
+            return problem_response(
+                "El reinicio no se completó en su totalidad; consulta "
+                "la consola y reintenta.",
+                title="Reinicio incompleto",
+            )
+        return AdminPlatformResetReceipt(
+            tables_cleared=data_response.json().get("tablesCleared", 0),
+            accounts_deleted=accounts_response.json().get(
+                "accountsDeleted", 0
+            ),
+            generated_at=datetime.now(UTC),
         )
 
     @application.get(

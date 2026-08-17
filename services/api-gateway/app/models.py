@@ -699,7 +699,9 @@ class AdminAuditEvent(ApiModel):
     actor_display_name: str = Field(min_length=1, max_length=161)
     action: str = Field(min_length=1, max_length=80)
     resource_kind: str = Field(min_length=1, max_length=80)
-    resource_id: UUID
+    # CHG-139: los actos globales (vaciado de solicitudes CHG-138,
+    # reinicio de plataforma) no señalan un recurso concreto.
+    resource_id: UUID | None = None
     result: AdminAuditResult
     reason_summary: str | None = Field(default=None, max_length=500)
     occurred_at: datetime
@@ -832,6 +834,28 @@ class AdminHelpRequestPage(ApiModel):
 
 class AdminHelpRequestDeleteReceipt(ApiModel):
     deleted: int = Field(ge=0)
+
+
+# CHG-139 — Reinicio absoluto de la plataforma.
+PLATFORM_RESET_CONFIRMATION = "REINICIAR TODO"
+
+
+class AdminPlatformResetInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    # La frase exacta que la persona debe escribir en la consola.
+    confirm: Literal["REINICIAR TODO"]
+
+
+class AdminPlatformResetReceipt(ApiModel):
+    tables_cleared: int = Field(ge=0)
+    accounts_deleted: int = Field(ge=0)
+    generated_at: datetime
 
 
 class MyReportNovelty(ApiModel):

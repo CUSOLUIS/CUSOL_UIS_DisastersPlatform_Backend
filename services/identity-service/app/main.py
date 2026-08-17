@@ -733,6 +733,25 @@ def create_app(
             return account_not_found()
         return Response(status_code=204)
 
+    # CHG-139 — Reinicio absoluto: borra todas las cuentas excepto la
+    # del super admin que lo ordena. La auditoría del acto la escribe
+    # el disaster-service (dueño del evento de reinicio); aquí solo se
+    # ejecuta y se reporta el conteo.
+    @application.post(
+        "/internal/v1/admin/platform-reset",
+        tags=["Administration"],
+    )
+    async def admin_platform_reset(
+        request: Request,
+        data: Annotated[IdentityRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, _actor_display = actor
+        deleted = await data.admin_reset_accounts(actor_account_id)
+        return {"accountsDeleted": deleted}
+
     return application
 
 

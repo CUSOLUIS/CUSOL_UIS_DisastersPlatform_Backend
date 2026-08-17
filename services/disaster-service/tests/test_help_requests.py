@@ -774,3 +774,46 @@ async def test_admin_purge_empties_everything():
     # El público ve la plataforma limpia.
     listing = await request_app(app, "GET", "/internal/v1/help-requests")
     assert listing.json()["total"] == 0
+
+
+# CHG-139 — Reinicio absoluto de los datos de emergencia: exige rol
+# super_admin, vacía el almacenamiento y deja el acto como primer
+# evento de la auditoría nueva.
+@pytest.mark.anyio
+async def test_platform_reset_wipes_data_storage_and_audits():
+    repository = FakeHelpRequestRepository()
+    repository.seed()
+
+    async def admin_reset_platform():
+        repository.rows.clear()
+        repository.attenders.clear()
+        return 21
+
+    repository.admin_reset_platform = admin_reset_platform
+    storage = FakeStorage()
+    app = help_app(repository=repository, storage=storage)
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/admin/platform-reset",
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"tablesCleared": 21}
+    assert repository.rows == {}
+    assert storage.wiped is True
+    assert ("platform_reset", "success") in repository.audit
+
+
+@pytest.mark.anyio
+async def test_platform_reset_requires_super_admin():
+    app = help_app()
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/admin/platform-reset",
+        headers={**ADMIN_HEADERS, "X-Actor-Role": "moderator"},
+    )
+    assert response.status_code == 403

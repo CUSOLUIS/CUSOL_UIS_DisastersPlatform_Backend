@@ -3161,6 +3161,36 @@ def create_app(
         )
         return AdminHelpRequestDeleteReceipt(deleted=deleted)
 
+    # CHG-139 — Reinicio absoluto de los datos de emergencia: TRUNCATE
+    # de todo el esquema (incluida la auditoría) + vaciado del
+    # almacenamiento de fotos. El acto queda como PRIMER evento de la
+    # auditoría nueva. Las cuentas las reinicia identity-service (el
+    # gateway orquesta ambos).
+    @application.post(
+        "/internal/v1/admin/platform-reset",
+        tags=["Administration"],
+    )
+    async def admin_platform_reset(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display = actor
+        tables_cleared = await data.admin_reset_platform()
+        object_storage.wipe()
+        await data.admin_write_audit(
+            actor_account_id,
+            actor_display,
+            "platform_reset",
+            "platform",
+            None,
+            "success",
+            changed_fields=[f"tables:{tables_cleared}"],
+        )
+        return {"tablesCleared": tables_cleared}
+
     # CHG-036 — Consola de superadministración (rutas internas).
     # El gateway es quien autentica la cookie; aquí se revalida el rol
     # recibido por encabezados internos como defensa en profundidad.

@@ -3684,6 +3684,32 @@ class PostgresDisasterRepository:
         ]
         return len(rows), keys
 
+    # CHG-139 — Reinicio absoluto: TRUNCATE de todos los datos de
+    # emergencia (esquema disaster_service) y de la auditoría
+    # (administration). Dinámico a propósito: las tablas futuras entran
+    # solas al reinicio sin mantener una lista a mano.
+    async def admin_reset_platform(self) -> int:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                tables = await connection.fetch(
+                    """
+                    SELECT schemaname, tablename
+                    FROM pg_tables
+                    WHERE schemaname IN (
+                        'disaster_service', 'administration'
+                    )
+                    """
+                )
+                if tables:
+                    names = ", ".join(
+                        f'{row["schemaname"]}."{row["tablename"]}"'
+                        for row in tables
+                    )
+                    await connection.execute(
+                        f"TRUNCATE {names} RESTART IDENTITY CASCADE"
+                    )
+                return len(tables)
+
     # CHG-036 — Consola de superadministración (bandeja unificada,
     # mutaciones con versión y auditoría append-only).
 

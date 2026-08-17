@@ -522,6 +522,29 @@ class PostgresIdentityRepository:
                 )
         return "ok", audit_id
 
+    # CHG-139 — Reinicio absoluto de la plataforma: borra TODAS las
+    # cuentas menos la del super admin que lo ordena (los tokens y
+    # sesiones ajenos caen por FK CASCADE) y limpia los tokens de
+    # verificación restantes. Devuelve cuántas cuentas se eliminaron.
+    async def admin_reset_accounts(self, keep_account_id) -> int:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                deleted = await connection.fetchval(
+                    """
+                    WITH removed AS (
+                        DELETE FROM identity_service.accounts
+                        WHERE id <> $1
+                        RETURNING 1
+                    )
+                    SELECT COUNT(*) FROM removed
+                    """,
+                    keep_account_id,
+                )
+                await connection.execute(
+                    "DELETE FROM identity_service.email_verification_tokens"
+                )
+                return int(deleted)
+
     async def admin_revoke_sessions(
         self,
         account_id: UUID,

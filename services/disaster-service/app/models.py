@@ -1220,7 +1220,9 @@ class AdminAuditEvent(ApiModel):
     actor_display_name: str = Field(min_length=1, max_length=161)
     action: str = Field(min_length=1, max_length=80)
     resource_kind: str = Field(min_length=1, max_length=80)
-    resource_id: UUID
+    # CHG-139: los actos globales (vaciado de solicitudes CHG-138,
+    # reinicio de plataforma) no señalan un recurso concreto.
+    resource_id: UUID | None = None
     result: AdminAuditResult
     reason_summary: str | None = Field(default=None, max_length=500)
     occurred_at: datetime

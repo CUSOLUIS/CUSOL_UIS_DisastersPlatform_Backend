@@ -548,3 +548,75 @@ async def test_admin_delete_and_purge_forward():
         ("DELETE", f"/internal/v1/admin/help-requests/{REQUEST_ID}"),
         ("DELETE", "/internal/v1/admin/help-requests"),
     ]
+
+
+# CHG-139 — Reinicio absoluto: exige la frase exacta, orquesta datos y
+# cuentas, y reporta el conteo combinado.
+@pytest.mark.anyio
+async def test_platform_reset_requires_confirmation_phrase():
+    async def handler(request: httpx.Request):
+        raise AssertionError("sin frase no debe llegar a los servicios")
+
+    upstream, identity = make_clients(handler, admin_identity_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/admin/platform-reset",
+        cookies={"cusol_session": "token-admin"},
+        json={"confirm": "reiniciar"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_platform_reset_orchestrates_both_services():
+    calls = []
+
+    async def disaster_handler(request: httpx.Request):
+        calls.append(("disaster", request.url.path))
+        return httpx.Response(200, json={"tablesCleared": 21})
+
+    def identity_with_reset(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/internal/v1/admin/platform-reset":
+            calls.append(("identity", request.url.path))
+            assert request.headers.get("x-actor-role") == "super_admin"
+            return httpx.Response(200, json={"accountsDeleted": 7})
+        return admin_identity_handler(request)
+
+    upstream, identity = make_clients(disaster_handler, identity_with_reset)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/admin/platform-reset",
+        cookies={"cusol_session": "token-admin"},
+        json={"confirm": "REINICIAR TODO"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tablesCleared"] == 21
+    assert body["accountsDeleted"] == 7
+    assert ("disaster", "/internal/v1/admin/platform-reset") in calls
+    assert ("identity", "/internal/v1/admin/platform-reset") in calls
+
+
+@pytest.mark.anyio
+async def test_platform_reset_requires_super_admin():
+    async def handler(request: httpx.Request):
+        raise AssertionError("no debe llegar al servicio interno")
+
+    upstream, identity = make_clients(handler, admin_identity_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    as_user = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/admin/platform-reset",
+        cookies={"cusol_session": "token-user"},
+        json={"confirm": "REINICIAR TODO"},
+    )
+    assert as_user.status_code == 403

@@ -325,3 +325,41 @@ async def test_admin_revoke_sessions_is_204_and_audited():
     assert revoked.status_code == 204
     assert repository.revoked == [TARGET_ID]
     assert missing.status_code == 404
+
+
+# CHG-139 — Reinicio absoluto: conserva la cuenta del super admin que
+# lo ordena y borra el resto; exige rol super_admin.
+@pytest.mark.anyio
+async def test_platform_reset_keeps_acting_admin():
+    repository = FakeAdminIdentityRepository()
+    seen = {}
+
+    async def admin_reset_accounts(keep_account_id):
+        seen["keep"] = keep_account_id
+        return 7
+
+    repository.admin_reset_accounts = admin_reset_accounts
+    app = admin_app(repository)
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/admin/platform-reset",
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"accountsDeleted": 7}
+    assert seen["keep"] == ACTOR_ID
+
+
+@pytest.mark.anyio
+async def test_platform_reset_requires_super_admin():
+    app = admin_app()
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/admin/platform-reset",
+        headers={**ADMIN_HEADERS, "X-Actor-Role": "moderator"},
+    )
+    assert response.status_code == 403

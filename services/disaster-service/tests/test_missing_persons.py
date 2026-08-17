@@ -119,6 +119,8 @@ class FakeStorage:
         self.fail = fail
         self.objects: dict[str, bytes] = {}
         self.deleted: list[str] = []
+        # CHG-139: bandera del vaciado absoluto.
+        self.wiped = False
 
     def save(self, key: str, data: bytes) -> None:
         if self.fail:
@@ -128,6 +130,10 @@ class FakeStorage:
     def delete(self, key: str) -> None:
         self.deleted.append(key)
         self.objects.pop(key, None)
+
+    def wipe(self) -> None:
+        self.wiped = True
+        self.objects.clear()
 
     def load(self, key: str) -> bytes | None:
         if self.fail:

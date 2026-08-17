@@ -6,6 +6,7 @@ La interfaz permite sustituir el backend local por un servicio de
 objetos gestionado sin tocar el resto del código.
 """
 
+import shutil
 from pathlib import Path
 from typing import Protocol
 
@@ -14,6 +15,10 @@ class ObjectStorage(Protocol):
     def save(self, key: str, data: bytes) -> None: ...
 
     def delete(self, key: str) -> None: ...
+
+    def wipe(self) -> None:
+        """CHG-139: vacía TODO el almacenamiento (reinicio absoluto)."""
+        ...
 
     def load(self, key: str) -> bytes | None:
         """Bytes del objeto, o None si no existe."""
@@ -52,6 +57,18 @@ class LocalObjectStorage:
         try:
             self._path(key).unlink(missing_ok=True)
         except OSError:  # la limpieza no debe ocultar el error original
+            pass
+
+    def wipe(self) -> None:
+        # CHG-139: reinicio absoluto — se vacía el contenido del volumen
+        # sin tocar el directorio base (lo posee el contenedor).
+        try:
+            for child in self._base.iterdir():
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+        except OSError:
             pass
 
     def load(self, key: str) -> bytes | None:
