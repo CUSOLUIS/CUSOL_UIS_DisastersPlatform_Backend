@@ -3609,6 +3609,81 @@ class PostgresDisasterRepository:
         )
         return None if row is None else dict(row)
 
+    # CHG-138 — Gestión de solicitudes de ayuda desde la consola: la
+    # superadministración ve TODO (activas y expiradas) y puede borrar
+    # una a una o vaciarlas por completo. El borrado físico es una
+    # decisión explícita del operador (excepción deliberada a
+    # DEC-125-02, que rige solo la expiración automática); queda
+    # auditado y devuelve las claves de foto para limpiar el storage.
+
+    async def admin_list_help_requests(
+        self, limit: int, offset: int
+    ) -> tuple[list[dict], int]:
+        rows = await self._pool.fetch(
+            """
+            SELECT
+                hr.id,
+                hr.public_code,
+                hr.description,
+                hr.address,
+                hr.latitude,
+                hr.longitude,
+                hr.notification_radius_km,
+                hr.created_at,
+                hr.expires_at,
+                hr.expires_at <= NOW() AS expired,
+                (SELECT COUNT(*)
+                 FROM disaster_service.help_request_attenders a
+                 WHERE a.help_request_id = hr.id) AS attenders_count,
+                hr.photo_derived_storage_key IS NOT NULL AS has_photo
+            FROM disaster_service.help_requests hr
+            ORDER BY hr.created_at DESC, hr.id DESC
+            LIMIT $1 OFFSET $2
+            """,
+            limit,
+            offset,
+        )
+        total = await self._pool.fetchval(
+            "SELECT COUNT(*) FROM disaster_service.help_requests"
+        )
+        return [dict(row) for row in rows], int(total)
+
+    async def admin_delete_help_request(
+        self, request_id: UUID
+    ) -> dict | None:
+        """Borra una solicitud (los atendedores caen por FK CASCADE).
+
+        Devuelve las claves de foto de la fila borrada, o None si no
+        existía.
+        """
+        row = await self._pool.fetchrow(
+            """
+            DELETE FROM disaster_service.help_requests
+            WHERE id = $1
+            RETURNING photo_storage_key, photo_derived_storage_key
+            """,
+            request_id,
+        )
+        return None if row is None else dict(row)
+
+    async def admin_purge_help_requests(self) -> tuple[int, list[str]]:
+        rows = await self._pool.fetch(
+            """
+            DELETE FROM disaster_service.help_requests
+            RETURNING photo_storage_key, photo_derived_storage_key
+            """
+        )
+        keys = [
+            key
+            for row in rows
+            for key in (
+                row["photo_storage_key"],
+                row["photo_derived_storage_key"],
+            )
+            if key
+        ]
+        return len(rows), keys
+
     # CHG-036 — Consola de superadministración (bandeja unificada,
     # mutaciones con versión y auditoría append-only).
 

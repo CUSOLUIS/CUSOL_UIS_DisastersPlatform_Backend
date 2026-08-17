@@ -83,6 +83,9 @@ from .models import (
     VolunteerAlertInput,
     VolunteerAlertPage,
     ActiveHelpRequest,
+    AdminHelpRequest,
+    AdminHelpRequestDeleteReceipt,
+    AdminHelpRequestPage,
     HelpRequestAttendReceipt,
     HelpRequestInput,
     HelpRequestPage,
@@ -3063,6 +3066,100 @@ def create_app(
             # solicitud la copia vieja no debe sobrevivir mucho.
             headers={"Cache-Control": "public, max-age=300"},
         )
+
+    # CHG-138 — Gestión de solicitudes de ayuda desde la consola: se ve
+    # TODO lo que llega (activas y expiradas) y se borra una a una o se
+    # vacía por completo. Borrado físico = decisión explícita del
+    # operador (excepción deliberada a DEC-125-02); cada operación
+    # queda en la auditoría y limpia las fotos del storage.
+
+    @application.get(
+        "/internal/v1/admin/help-requests",
+        response_model=AdminHelpRequestPage,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_list_help_requests(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        rows, total = await data.admin_list_help_requests(limit, offset)
+        return AdminHelpRequestPage(
+            items=[AdminHelpRequest(**row) for row in rows],
+            total=total,
+            generated_at=datetime.now(UTC),
+        )
+
+    @application.delete(
+        "/internal/v1/admin/help-requests/{request_id}",
+        response_model=AdminHelpRequestDeleteReceipt,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_delete_help_request(
+        request_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display = actor
+        row = await data.admin_delete_help_request(request_id)
+        if row is None:
+            return problem(
+                404,
+                "Solicitud no encontrada",
+                "La solicitud no existe o ya fue eliminada.",
+            )
+        for key in (
+            row.get("photo_storage_key"),
+            row.get("photo_derived_storage_key"),
+        ):
+            if key:
+                object_storage.delete(key)
+        await data.admin_write_audit(
+            actor_account_id,
+            actor_display,
+            "help_request_deleted",
+            "help_request",
+            request_id,
+            "success",
+        )
+        return AdminHelpRequestDeleteReceipt(deleted=1)
+
+    @application.delete(
+        "/internal/v1/admin/help-requests",
+        response_model=AdminHelpRequestDeleteReceipt,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_purge_help_requests(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display = actor
+        deleted, photo_keys = await data.admin_purge_help_requests()
+        for key in photo_keys:
+            object_storage.delete(key)
+        await data.admin_write_audit(
+            actor_account_id,
+            actor_display,
+            "help_requests_purged",
+            "help_request",
+            None,
+            "success",
+            changed_fields=[f"deleted:{deleted}"],
+        )
+        return AdminHelpRequestDeleteReceipt(deleted=deleted)
 
     # CHG-036 — Consola de superadministración (rutas internas).
     # El gateway es quien autentica la cookie; aquí se revalida el rol

@@ -36,6 +36,8 @@ from .models import (
     AdminOverview,
     AdminSubmissionDetail,
     AdminSubmissionKind,
+    AdminHelpRequestDeleteReceipt,
+    AdminHelpRequestPage,
     AdminSubmissionPage,
     AdminSystemMetrics,
     AidLocationAvailability,
@@ -1588,6 +1590,98 @@ def create_app(
             latest=series[-1],
             series=series,
             generated_at=datetime.now(UTC),
+        )
+
+    # CHG-138 — Gestión de solicitudes de ayuda desde la consola: ver
+    # todo lo que llega (activas y expiradas), borrar una a una o
+    # vaciarlas. Solo super_admin; las mutaciones validan Origin (CSRF).
+
+    @application.get(
+        "/api/v1/admin/help-requests",
+        response_model=AdminHelpRequestPage,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_list_help_requests(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        return await admin_forward(
+            upstream,
+            "GET",
+            "/internal/v1/admin/help-requests",
+            account,
+            AdminHelpRequestPage,
+            params=[("limit", str(limit)), ("offset", str(offset))],
+        )
+
+    @application.delete(
+        "/api/v1/admin/help-requests/{request_id}",
+        response_model=AdminHelpRequestDeleteReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Solicitud no encontrada"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_delete_help_request(
+        request_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "DELETE",
+            f"/internal/v1/admin/help-requests/{request_id}",
+            AdminHelpRequestDeleteReceipt,
+        )
+
+    @application.delete(
+        "/api/v1/admin/help-requests",
+        response_model=AdminHelpRequestDeleteReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_purge_help_requests(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "DELETE",
+            "/internal/v1/admin/help-requests",
+            AdminHelpRequestDeleteReceipt,
         )
 
     @application.get(

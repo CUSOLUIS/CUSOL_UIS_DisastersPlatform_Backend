@@ -808,6 +808,32 @@ class HelpRequestAttendReceipt(ApiModel):
     attending: bool
 
 
+# CHG-138 — Gestión admin de solicitudes (espejo del disaster-service).
+class AdminHelpRequest(ApiModel):
+    id: UUID
+    public_code: str
+    description: str
+    address: str
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    notification_radius_km: int | None = Field(default=None, ge=1, le=100)
+    created_at: datetime
+    expires_at: datetime
+    expired: bool
+    attenders_count: int = Field(ge=0)
+    has_photo: bool
+
+
+class AdminHelpRequestPage(ApiModel):
+    items: list[AdminHelpRequest] = Field(max_length=200)
+    total: int = Field(ge=0)
+    generated_at: datetime
+
+
+class AdminHelpRequestDeleteReceipt(ApiModel):
+    deleted: int = Field(ge=0)
+
+
 class MyReportNovelty(ApiModel):
     claimed_outcome: Literal["found", "deceased"]
     moderation_status: AdminModerationStatus

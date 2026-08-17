@@ -411,3 +411,140 @@ async def test_upstream_failure_is_503():
     assert created.json()["title"] == (
         "Servicio de solicitudes no disponible"
     )
+
+
+# CHG-138 — Gestión admin: ver todo, borrar una a una o vaciar. Solo
+# super_admin (401 sin sesión, 403 con rol menor); el gateway reenvía
+# con headers de actor y jamás las cookies.
+
+SUPER_ADMIN_ACCOUNT = {
+    "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa9",
+    "displayName": "Admin CUSOL",
+    "email": "admin@cusol.local",
+    "assignedRole": "super_admin",
+    "status": "active",
+    "sessionExpiresAt": "2026-08-16T20:00:00Z",
+}
+
+ADMIN_PAGE = {
+    "items": [
+        {
+            "id": REQUEST_ID,
+            "publicCode": "HR-2026-AAAA1111",
+            "description": "Necesitamos ayuda urgente con rescate.",
+            "address": "Calle 10 #5-20, Bucaramanga",
+            "latitude": 7.12,
+            "longitude": -73.12,
+            "notificationRadiusKm": 10,
+            "createdAt": "2026-08-16T12:00:00Z",
+            "expiresAt": "2026-08-16T18:00:00Z",
+            "expired": True,
+            "attendersCount": 2,
+            "hasPhoto": False,
+        }
+    ],
+    "total": 1,
+    "generatedAt": "2026-08-16T12:05:00Z",
+}
+
+
+def admin_identity_handler(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/internal/v1/auth/me":
+        token = request.headers.get("x-session-token")
+        if token == "token-admin":
+            return httpx.Response(200, json=SUPER_ADMIN_ACCOUNT)
+        if token == "token-user":
+            return httpx.Response(200, json=USER_ACCOUNT)
+        return httpx.Response(
+            401,
+            json={
+                "type": "session-required",
+                "title": "Sesión requerida",
+                "status": 401,
+                "detail": "La sesión está ausente, vencida o revocada.",
+            },
+        )
+    raise AssertionError(f"ruta identity inesperada: {request.url.path}")
+
+
+@pytest.mark.anyio
+async def test_admin_help_requests_require_session_and_role():
+    async def handler(request: httpx.Request):
+        raise AssertionError("no debe llegar al servicio interno")
+
+    upstream, identity = make_clients(handler, admin_identity_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    anonymous = await request_gateway(
+        app, "GET", "/api/v1/admin/help-requests"
+    )
+    assert anonymous.status_code == 401
+
+    as_user = await request_gateway(
+        app,
+        "GET",
+        "/api/v1/admin/help-requests",
+        cookies={"cusol_session": "token-user"},
+    )
+    assert as_user.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_admin_list_forwards_with_actor_headers():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["role"] = request.headers.get("x-actor-role")
+        seen["cookie"] = request.headers.get("cookie")
+        return httpx.Response(200, json=ADMIN_PAGE)
+
+    upstream, identity = make_clients(handler, admin_identity_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "GET",
+        "/api/v1/admin/help-requests?limit=50",
+        cookies={"cusol_session": "token-admin"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["expired"] is True
+    assert seen["path"] == "/internal/v1/admin/help-requests"
+    assert seen["role"] == "super_admin"
+    assert seen["cookie"] is None
+
+
+@pytest.mark.anyio
+async def test_admin_delete_and_purge_forward():
+    calls = []
+
+    async def handler(request: httpx.Request):
+        calls.append((request.method, request.url.path))
+        return httpx.Response(200, json={"deleted": 1})
+
+    upstream, identity = make_clients(handler, admin_identity_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    one = await request_gateway(
+        app,
+        "DELETE",
+        f"/api/v1/admin/help-requests/{REQUEST_ID}",
+        cookies={"cusol_session": "token-admin"},
+    )
+    assert one.status_code == 200
+    assert one.json() == {"deleted": 1}
+
+    purge = await request_gateway(
+        app,
+        "DELETE",
+        "/api/v1/admin/help-requests",
+        cookies={"cusol_session": "token-admin"},
+    )
+    assert purge.status_code == 200
+
+    assert calls == [
+        ("DELETE", f"/internal/v1/admin/help-requests/{REQUEST_ID}"),
+        ("DELETE", "/internal/v1/admin/help-requests"),
+    ]

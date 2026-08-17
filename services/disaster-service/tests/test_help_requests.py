@@ -35,6 +35,8 @@ class FakeHelpRequestRepository:
         self.rows: dict[UUID, dict] = {}
         self.attenders: set[tuple[UUID, UUID]] = set()
         self.by_key: dict[str, UUID] = {}
+        # CHG-138: (acción, resultado) de la auditoría admin.
+        self.audit: list[tuple[str, str]] = []
 
     async def ping(self):
         return True
@@ -107,6 +109,73 @@ class FakeHelpRequestRepository:
             },
             True,
         )
+
+    # CHG-138 — gestión desde la consola: todo, borrar una, vaciar.
+    async def admin_list_help_requests(self, limit, offset):
+        rows = sorted(
+            self.rows.values(),
+            key=lambda row: row["created_at"],
+            reverse=True,
+        )
+        page = [
+            {
+                "id": row["id"],
+                "public_code": row["public_code"],
+                "description": row["description"],
+                "address": row["address"],
+                "latitude": row["latitude"],
+                "longitude": row["longitude"],
+                "notification_radius_km": row.get(
+                    "notification_radius_km"
+                ),
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+                "expired": row["expires_at"] <= datetime.now(UTC),
+                "attenders_count": sum(
+                    1
+                    for (request_id, _) in self.attenders
+                    if request_id == row["id"]
+                ),
+                "has_photo": row["photo_derived_storage_key"]
+                is not None,
+            }
+            for row in rows[offset : offset + limit]
+        ]
+        return page, len(rows)
+
+    async def admin_delete_help_request(self, request_id):
+        row = self.rows.pop(request_id, None)
+        if row is None:
+            return None
+        self.attenders = {
+            entry for entry in self.attenders if entry[0] != request_id
+        }
+        return {
+            "photo_storage_key": row.get("photo_storage_key"),
+            "photo_derived_storage_key": row.get(
+                "photo_derived_storage_key"
+            ),
+        }
+
+    async def admin_purge_help_requests(self):
+        keys = [
+            key
+            for row in self.rows.values()
+            for key in (
+                row.get("photo_storage_key"),
+                row.get("photo_derived_storage_key"),
+            )
+            if key
+        ]
+        deleted = len(self.rows)
+        self.rows.clear()
+        self.attenders.clear()
+        return deleted, keys
+
+    async def admin_write_audit(self, *args, **kwargs):
+        # (acción, resultado) — suficiente para auditar en pruebas.
+        self.audit.append((args[2], args[5]))
+        return uuid4()
 
     async def list_active_help_requests(self, limit, offset, account_id):
         active = sorted(
@@ -599,3 +668,109 @@ async def test_photo_served_with_content_type():
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/jpeg"
     assert response.headers["cache-control"] == "public, max-age=300"
+
+
+# CHG-138 — Gestión desde la consola de superadministración: ver TODO
+# (activas y expiradas), borrar una a una o vaciar. Solo super_admin;
+# cada operación queda auditada y limpia las fotos del storage.
+
+ADMIN_HEADERS = {
+    "X-Actor-Role": "super_admin",
+    "X-Actor-Account-Id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+    "X-Actor-Display": "QWRtaW4gQ1VTT0w=",
+}
+
+
+@pytest.mark.anyio
+async def test_admin_list_requires_super_admin():
+    app = help_app()
+    response = await request_app(
+        app,
+        "GET",
+        "/internal/v1/admin/help-requests",
+        headers={**ADMIN_HEADERS, "X-Actor-Role": "moderator"},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_admin_list_includes_expired_with_flag():
+    repository = FakeHelpRequestRepository()
+    active_id = repository.seed()
+    expired_id = repository.seed(expired=True)
+    app = help_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "GET",
+        "/internal/v1/admin/help-requests",
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    by_id = {item["id"]: item for item in body["items"]}
+    assert by_id[str(active_id)]["expired"] is False
+    assert by_id[str(expired_id)]["expired"] is True
+    assert by_id[str(active_id)]["publicCode"].startswith("HR-")
+
+
+@pytest.mark.anyio
+async def test_admin_delete_one_cleans_photos_and_audits():
+    repository = FakeHelpRequestRepository()
+    storage = FakeStorage()
+    request_id = repository.seed(photo=True)
+    photo_key = repository.rows[request_id][
+        "photo_derived_storage_key"
+    ]
+    app = help_app(repository=repository, storage=storage)
+
+    response = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/admin/help-requests/{request_id}",
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": 1}
+    assert request_id not in repository.rows
+    assert photo_key in storage.deleted
+    assert ("help_request_deleted", "success") in repository.audit
+
+    missing = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/admin/help-requests/{uuid4()}",
+        headers=ADMIN_HEADERS,
+    )
+    assert missing.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_admin_purge_empties_everything():
+    repository = FakeHelpRequestRepository()
+    storage = FakeStorage()
+    repository.seed()
+    repository.seed(expired=True)
+    with_photo = repository.seed(photo=True)
+    photo_key = repository.rows[with_photo]["photo_derived_storage_key"]
+    app = help_app(repository=repository, storage=storage)
+
+    response = await request_app(
+        app,
+        "DELETE",
+        "/internal/v1/admin/help-requests",
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": 3}
+    assert repository.rows == {}
+    assert photo_key in storage.deleted
+    assert ("help_requests_purged", "success") in repository.audit
+
+    # El público ve la plataforma limpia.
+    listing = await request_app(app, "GET", "/internal/v1/help-requests")
+    assert listing.json()["total"] == 0
