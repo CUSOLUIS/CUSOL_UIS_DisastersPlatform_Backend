@@ -223,6 +223,47 @@ async def test_create_anonymous_without_photo():
     assert row["photo_derived_storage_key"] is None
 
 
+# CHG-127 — la dirección escrita basta: sin coordenadas se crea igual y
+# el listado las proyecta como null (sin marcador en el mapa).
+@pytest.mark.anyio
+async def test_create_without_coordinates():
+    repository = FakeHelpRequestRepository()
+    app = help_app(repository=repository)
+
+    payload = valid_payload()
+    del payload["latitude"]
+    del payload["longitude"]
+    response = await post_help_request(app, payload=payload)
+
+    assert response.status_code == 201
+    row = next(iter(repository.rows.values()))
+    assert row["latitude"] is None
+    assert row["longitude"] is None
+
+    listing = await request_app(app, "GET", "/internal/v1/help-requests")
+    assert listing.status_code == 200
+    item = listing.json()["items"][0]
+    assert item["latitude"] is None
+    assert item["longitude"] is None
+
+
+# CHG-127 / DEC-127-01 — el par viaja completo o no viaja.
+@pytest.mark.anyio
+@pytest.mark.parametrize("kept", ["latitude", "longitude"])
+async def test_create_rejects_lone_coordinate(kept):
+    app = help_app()
+
+    payload = valid_payload()
+    removed = "longitude" if kept == "latitude" else "latitude"
+    del payload[removed]
+    response = await post_help_request(app, payload=payload)
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith(
+        "application/problem+json"
+    )
+
+
 @pytest.mark.anyio
 async def test_create_with_optional_photo_stores_derived_copy():
     repository = FakeHelpRequestRepository()

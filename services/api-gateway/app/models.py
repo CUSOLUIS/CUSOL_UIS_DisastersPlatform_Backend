@@ -784,8 +784,9 @@ class ActiveHelpRequest(ApiModel):
     id: UUID
     description: str
     address: str
-    latitude: float = Field(ge=-90, le=90)
-    longitude: float = Field(ge=-180, le=180)
+    # CHG-127: null cuando la solicitud llegó solo con dirección.
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
     created_at: datetime
     expires_at: datetime
     attenders_count: int = Field(ge=0)

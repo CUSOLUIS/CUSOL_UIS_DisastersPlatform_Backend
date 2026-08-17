@@ -1326,11 +1326,22 @@ class HelpRequestInput(ApiModel):
 
     description: str = Field(min_length=10, max_length=1000)
     address: str = Field(min_length=5, max_length=300)
-    latitude: float = Field(ge=-90, le=90)
-    longitude: float = Field(ge=-180, le=180)
+    # CHG-127: la dirección escrita basta; las coordenadas son
+    # opcionales, pero si viajan van las dos (DEC-127-01).
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
     duration_hours: int = Field(
         ge=HELP_REQUEST_MIN_HOURS, le=HELP_REQUEST_MAX_HOURS
     )
+
+    @model_validator(mode="after")
+    def _coordinates_pair(self):
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError(
+                "latitude y longitude deben enviarse juntas o ambas "
+                "ausentes"
+            )
+        return self
 
     # CHG-107: descarta descripciones que evidentemente no son texto
     # escrito (repetición, palabras pegadas, vocabulario nulo).
@@ -1355,8 +1366,9 @@ class ActiveHelpRequest(ApiModel):
     id: UUID
     description: str
     address: str
-    latitude: float = Field(ge=-90, le=90)
-    longitude: float = Field(ge=-180, le=180)
+    # CHG-127: null cuando la solicitud llegó solo con dirección.
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
     created_at: datetime
     expires_at: datetime
     attenders_count: int = Field(ge=0)
