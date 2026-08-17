@@ -68,8 +68,17 @@ def has_overlong_word(value: str) -> bool:
     )
 
 
-def validate_community_text(value: str, field: str) -> str:
-    """Devuelve el texto recortado o explica por qué no sirve."""
+def validate_community_text(
+    value: str, field: str, min_distinct_words: int = MIN_DISTINCT_WORDS
+) -> str:
+    """Devuelve el texto recortado o explica por qué no sirve.
+
+    CHG-146: `min_distinct_words` es parametrizable. El reporte de
+    persona conserva 5; la solicitud de ayuda (CHG-125), que es terse
+    por naturaleza («Necesito ayuda urgente aquí»), usa un mínimo menor
+    sin dejar de descartar basura (repetición, cadenas pegadas, 1-2
+    palabras).
+    """
     texto = value.strip()
 
     if has_excessive_repetition(texto):
@@ -84,9 +93,9 @@ def validate_community_text(value: str, field: str) -> str:
             "larga; describe lo que observaste."
         )
 
-    if distinct_words(texto) < MIN_DISTINCT_WORDS:
+    if distinct_words(texto) < min_distinct_words:
         raise TextQualityError(
-            f"{field} necesita al menos {MIN_DISTINCT_WORDS} palabras "
+            f"{field} necesita al menos {min_distinct_words} palabras "
             "distintas que describan lo que observaste."
         )
 

@@ -1318,6 +1318,11 @@ HELP_REQUEST_MIN_HOURS = 1
 # CHG-130: la vigencia se expresa en horas (1-72) o días (1-30); el
 # cliente convierte días a horas y el tope del contrato es 30 días.
 HELP_REQUEST_MAX_HOURS = 720
+# CHG-146: la descripción de una solicitud de ayuda es breve por
+# naturaleza («Necesito ayuda urgente aquí», «Atrapados bajo
+# escombros»). El reporte de persona pide 5 palabras distintas; aquí 3
+# basta para descartar basura sin rechazar emergencias reales.
+HELP_REQUEST_MIN_DISTINCT_WORDS = 3
 
 
 class HelpRequestInput(ApiModel):
@@ -1372,10 +1377,16 @@ class HelpRequestInput(ApiModel):
 
     # CHG-107: descarta descripciones que evidentemente no son texto
     # escrito (repetición, palabras pegadas, vocabulario nulo).
+    # CHG-146: umbral de palabras distintas menor — la solicitud de
+    # ayuda es breve por naturaleza.
     @model_validator(mode="after")
     def _description_is_readable(self):
         try:
-            validate_community_text(self.description, "description")
+            validate_community_text(
+                self.description,
+                "description",
+                min_distinct_words=HELP_REQUEST_MIN_DISTINCT_WORDS,
+            )
         except TextQualityError as error:
             raise ValueError(str(error)) from error
         return self

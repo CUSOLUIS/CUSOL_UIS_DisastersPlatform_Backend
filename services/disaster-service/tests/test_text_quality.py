@@ -55,3 +55,24 @@ def test_exige_un_minimo_de_palabras_distintas():
     if distinct_words(pocas) < MIN_DISTINCT_WORDS:
         with pytest.raises(TextQualityError):
             validate_community_text(pocas, "campo")
+
+
+# CHG-146: el umbral de palabras distintas es parametrizable. La
+# solicitud de ayuda lo baja a 3 (descripciones de emergencia breves).
+def test_umbral_de_palabras_parametrizable_para_solicitud_de_ayuda():
+    # «Necesito ayuda urgente aquí» (4 palabras) se rechazaba con 5 y
+    # debe pasar con 3.
+    breve = "Necesito ayuda urgente aqui"
+    assert distinct_words(breve) == 4
+    with pytest.raises(TextQualityError):
+        validate_community_text(breve, "description")
+    assert validate_community_text(breve, "description", min_distinct_words=3)
+
+
+def test_umbral_menor_sigue_descartando_basura():
+    # Con 3 palabras distintas, 1-2 palabras y el spam de caracteres
+    # siguen cayendo.
+    with pytest.raises(TextQualityError):
+        validate_community_text("ayuda ayuda ayuda", "description", min_distinct_words=3)
+    with pytest.raises(TextQualityError):
+        validate_community_text("a" * 30, "description", min_distinct_words=3)

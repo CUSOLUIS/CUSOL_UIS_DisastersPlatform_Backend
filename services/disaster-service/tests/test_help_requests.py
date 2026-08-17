@@ -430,6 +430,32 @@ async def test_create_rejects_junk_description():
     assert response.status_code == 422
 
 
+# CHG-146: una descripción de emergencia breve pero real (3-4 palabras)
+# se aceptaba antes solo con 5; ahora la solicitud de ayuda pide 3.
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "description",
+    ["Necesito ayuda urgente aqui", "Atrapados bajo escombros"],
+)
+async def test_create_accepts_short_emergency_description(description):
+    app = help_app()
+    response = await post_help_request(
+        app, payload=valid_payload(description=description)
+    )
+    assert response.status_code == 201
+
+
+# CHG-146: 1-2 palabras siguen siendo demasiado pobres.
+@pytest.mark.anyio
+@pytest.mark.parametrize("description", ["ayuda ayuda ayuda", "Necesito ayuda"])
+async def test_create_rejects_too_few_words(description):
+    app = help_app()
+    response = await post_help_request(
+        app, payload=valid_payload(description=description)
+    )
+    assert response.status_code == 422
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("hours", [0, 721, -4])
 async def test_create_rejects_out_of_range_duration(hours):
