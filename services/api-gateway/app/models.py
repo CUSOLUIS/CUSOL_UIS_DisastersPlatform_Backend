@@ -826,11 +826,29 @@ class AdminHelpRequest(ApiModel):
     expires_at: datetime
     expired: bool
     attenders_count: int = Field(ge=0)
+    # CHG-148: voluntarios anónimos con datos privados que ver.
+    volunteers_count: int = Field(default=0, ge=0)
     has_photo: bool
 
 
 class AdminHelpRequestPage(ApiModel):
     items: list[AdminHelpRequest] = Field(max_length=200)
+    total: int = Field(ge=0)
+    generated_at: datetime
+
+
+# CHG-148 — Voluntario anónimo visto por el super_admin (espejo).
+class AdminHelpRequestVolunteer(ApiModel):
+    id: UUID
+    name: str
+    phone: str | None = None
+    email: str | None = None
+    has_photo: bool
+    created_at: datetime
+
+
+class AdminHelpRequestVolunteerPage(ApiModel):
+    items: list[AdminHelpRequestVolunteer] = Field(max_length=1000)
     total: int = Field(ge=0)
     generated_at: datetime
 

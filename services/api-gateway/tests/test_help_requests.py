@@ -685,3 +685,70 @@ async def test_volunteer_requires_idempotency_key():
 
     assert response.status_code == 422
     assert calls == []
+
+
+# CHG-148 — Voluntarios de una solicitud: solo super_admin; el gateway
+# reenvía con las cabeceras del actor y devuelve la PII descifrada.
+VOLUNTEERS_PAGE = {
+    "items": [
+        {
+            "id": "88888888-8888-4888-8888-888888888801",
+            "name": "Camilo Vega",
+            "phone": "+57 301 000 0000",
+            "email": None,
+            "hasPhoto": False,
+            "createdAt": "2026-08-18T10:00:00Z",
+        }
+    ],
+    "total": 1,
+    "generatedAt": "2026-08-18T10:05:00Z",
+}
+
+
+@pytest.mark.anyio
+async def test_admin_volunteers_require_session_and_role():
+    async def handler(request: httpx.Request):
+        raise AssertionError("no debe llegar al servicio interno")
+
+    upstream, identity = make_clients(handler, admin_identity_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    anonymous = await request_gateway(
+        app, "GET", f"/api/v1/admin/help-requests/{REQUEST_ID}/volunteers"
+    )
+    assert anonymous.status_code == 401
+
+    as_user = await request_gateway(
+        app,
+        "GET",
+        f"/api/v1/admin/help-requests/{REQUEST_ID}/volunteers",
+        cookies={"cusol_session": "token-user"},
+    )
+    assert as_user.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_admin_volunteers_forwards_and_returns_pii():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["role"] = request.headers.get("x-actor-role")
+        return httpx.Response(200, json=VOLUNTEERS_PAGE)
+
+    upstream, identity = make_clients(handler, admin_identity_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "GET",
+        f"/api/v1/admin/help-requests/{REQUEST_ID}/volunteers",
+        cookies={"cusol_session": "token-admin"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["name"] == "Camilo Vega"
+    assert seen["path"] == (
+        f"/internal/v1/admin/help-requests/{REQUEST_ID}/volunteers"
+    )
+    assert seen["role"] == "super_admin"

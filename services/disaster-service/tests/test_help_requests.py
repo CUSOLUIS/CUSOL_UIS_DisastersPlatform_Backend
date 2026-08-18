@@ -133,10 +133,11 @@ class FakeHelpRequestRepository:
                 "created_at": row["created_at"],
                 "expires_at": row["expires_at"],
                 "expired": row["expires_at"] <= datetime.now(UTC),
-                "attenders_count": sum(
+                "attenders_count": self._attenders_count(row["id"]),
+                "volunteers_count": sum(
                     1
-                    for (request_id, _) in self.attenders
-                    if request_id == row["id"]
+                    for v in self.volunteers
+                    if v["help_request_id"] == row["id"]
                 ),
                 "has_photo": row["photo_derived_storage_key"]
                 is not None,
@@ -144,6 +145,23 @@ class FakeHelpRequestRepository:
             for row in rows[offset : offset + limit]
         ]
         return page, len(rows)
+
+    async def admin_list_help_request_volunteers(self, request_id):
+        return [
+            {
+                "id": uuid4(),
+                "name_encrypted": v.get("name_encrypted"),
+                "phone_encrypted": v.get("phone_encrypted"),
+                "email_encrypted": v.get("email_encrypted"),
+                "has_photo": v.get("photo_derived_storage_key") is not None,
+                "created_at": datetime.now(UTC),
+            }
+            for v in self.volunteers
+            if v["help_request_id"] == request_id
+        ]
+
+    async def get_help_request_volunteer_photo(self, volunteer_id):
+        return None
 
     async def admin_delete_help_request(self, request_id):
         row = self.rows.pop(request_id, None)
@@ -968,6 +986,59 @@ async def test_platform_reset_requires_super_admin():
         app,
         "POST",
         "/internal/v1/admin/platform-reset",
+        headers={**ADMIN_HEADERS, "X-Actor-Role": "moderator"},
+    )
+    assert response.status_code == 403
+
+
+# CHG-148 — El super_admin ve los voluntarios anónimos con su PII
+# descifrada; el conteo aparece en el listado admin.
+@pytest.mark.anyio
+async def test_admin_lists_volunteers_decrypted():
+    repository = FakeHelpRequestRepository()
+    request_id = repository.seed()
+    app = help_app(repository=repository)
+
+    await post_volunteer(
+        app,
+        request_id,
+        payload=volunteer_payload(name="Camilo Vega", phone="+57 301 000 0000"),
+    )
+
+    listing = await request_app(
+        app,
+        "GET",
+        "/internal/v1/admin/help-requests",
+        headers=ADMIN_HEADERS,
+    )
+    item = next(
+        x for x in listing.json()["items"] if x["id"] == str(request_id)
+    )
+    assert item["volunteersCount"] == 1
+
+    volunteers = await request_app(
+        app,
+        "GET",
+        f"/internal/v1/admin/help-requests/{request_id}/volunteers",
+        headers=ADMIN_HEADERS,
+    )
+    assert volunteers.status_code == 200
+    body = volunteers.json()
+    assert body["total"] == 1
+    assert body["items"][0]["name"] == "Camilo Vega"
+    assert body["items"][0]["phone"] == "+57 301 000 0000"
+
+
+@pytest.mark.anyio
+async def test_admin_volunteers_requires_super_admin():
+    repository = FakeHelpRequestRepository()
+    request_id = repository.seed()
+    app = help_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "GET",
+        f"/internal/v1/admin/help-requests/{request_id}/volunteers",
         headers={**ADMIN_HEADERS, "X-Actor-Role": "moderator"},
     )
     assert response.status_code == 403

@@ -39,6 +39,7 @@ from .models import (
     AdminSubmissionKind,
     AdminHelpRequestDeleteReceipt,
     AdminHelpRequestPage,
+    AdminHelpRequestVolunteerPage,
     AdminPlatformResetInput,
     AdminPlatformResetReceipt,
     AdminSubmissionPage,
@@ -1630,6 +1631,82 @@ def create_app(
             AdminHelpRequestPage,
             params=[("limit", str(limit)), ("offset", str(offset))],
         )
+
+    # CHG-148 — Voluntarios anónimos de una solicitud (super_admin): la
+    # PII descifrada solo para la consola.
+    @application.get(
+        "/api/v1/admin/help-requests/{request_id}/volunteers",
+        response_model=AdminHelpRequestVolunteerPage,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_list_help_request_volunteers(
+        request_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        return await admin_forward(
+            upstream,
+            "GET",
+            f"/internal/v1/admin/help-requests/{request_id}/volunteers",
+            account,
+            AdminHelpRequestVolunteerPage,
+        )
+
+    # CHG-148 — Fotografía privada del voluntario (super_admin): nunca
+    # cacheada; se reenvía tal cual desde el servicio interno.
+    @application.get(
+        "/api/v1/admin/help-request-volunteers/{volunteer_id}/photo",
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            404: {"description": "Sin fotografía"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_serve_volunteer_photo(
+        volunteer_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        try:
+            response = await upstream.get(
+                f"/internal/v1/admin/help-request-volunteers/{volunteer_id}/photo",
+                headers=actor_headers(account),
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return Response(
+                content=response.content,
+                media_type=response.headers.get(
+                    "content-type", "application/octet-stream"
+                ),
+                headers={"Cache-Control": "no-store"},
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible obtener la fotografía en este momento.",
+                title="Servicio de solicitudes no disponible",
+            )
 
     @application.delete(
         "/api/v1/admin/help-requests/{request_id}",

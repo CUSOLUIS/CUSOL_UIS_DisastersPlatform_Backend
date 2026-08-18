@@ -86,6 +86,8 @@ from .models import (
     AdminHelpRequest,
     AdminHelpRequestDeleteReceipt,
     AdminHelpRequestPage,
+    AdminHelpRequestVolunteer,
+    AdminHelpRequestVolunteerPage,
     HelpRequestAttendReceipt,
     HelpRequestInput,
     HelpRequestVolunteerInput,
@@ -3313,6 +3315,79 @@ def create_app(
             changed_fields=[f"tables:{tables_cleared}"],
         )
         return {"tablesCleared": tables_cleared}
+
+    # CHG-148 — Voluntarios anónimos de una solicitud, SOLO para el
+    # super_admin: la PII se descifra aquí y nunca sale de la consola.
+    @application.get(
+        "/internal/v1/admin/help-requests/{request_id}/volunteers",
+        response_model=AdminHelpRequestVolunteerPage,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_list_help_request_volunteers(
+        request_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        rows = await data.admin_list_help_request_volunteers(request_id)
+        items = [
+            AdminHelpRequestVolunteer(
+                id=row["id"],
+                name=decrypt_text(row["name_encrypted"]) or "",
+                phone=decrypt_text(row["phone_encrypted"]),
+                email=decrypt_text(row["email_encrypted"]),
+                has_photo=row["has_photo"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+        return AdminHelpRequestVolunteerPage(
+            items=items,
+            total=len(items),
+            generated_at=datetime.now(UTC),
+        )
+
+    @application.get(
+        "/internal/v1/admin/help-request-volunteers/{volunteer_id}/photo",
+        tags=["Administration"],
+    )
+    async def admin_serve_volunteer_photo(
+        volunteer_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        photo = await data.get_help_request_volunteer_photo(volunteer_id)
+        if photo is None:
+            return problem(
+                404,
+                "Fotografía no disponible",
+                "El voluntario no adjuntó fotografía.",
+            )
+        try:
+            content = object_storage.load(photo["object_key"])
+        except StorageUnavailableError:
+            content = None
+        if content is None:
+            return problem(
+                503,
+                "Fotografía no disponible",
+                "No fue posible leer la fotografía en este momento.",
+            )
+
+        from fastapi.responses import Response as RawResponse
+
+        return RawResponse(
+            content=content,
+            media_type=photo["content_type"],
+            # Privada: nunca cachear la PII del voluntario.
+            headers={"Cache-Control": "no-store"},
+        )
 
     # CHG-036 — Consola de superadministración (rutas internas).
     # El gateway es quien autentica la cookie; aquí se revalida el rol

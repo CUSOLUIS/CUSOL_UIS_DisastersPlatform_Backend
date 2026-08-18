@@ -3715,6 +3715,10 @@ class PostgresDisasterRepository:
                  + (SELECT COUNT(*)
                     FROM disaster_service.help_request_volunteers v
                     WHERE v.help_request_id = hr.id)) AS attenders_count,
+                -- CHG-148: voluntarios anónimos con datos que ver.
+                (SELECT COUNT(*)
+                 FROM disaster_service.help_request_volunteers v
+                 WHERE v.help_request_id = hr.id) AS volunteers_count,
                 hr.photo_derived_storage_key IS NOT NULL AS has_photo
             FROM disaster_service.help_requests hr
             ORDER BY hr.created_at DESC, hr.id DESC
@@ -3727,6 +3731,43 @@ class PostgresDisasterRepository:
             "SELECT COUNT(*) FROM disaster_service.help_requests"
         )
         return [dict(row) for row in rows], int(total)
+
+    async def admin_list_help_request_volunteers(
+        self, request_id: UUID
+    ) -> list[dict]:
+        """CHG-148: voluntarios anónimos de una solicitud, con la PII aún
+        cifrada (el servicio la descifra para el super_admin)."""
+        rows = await self._pool.fetch(
+            """
+            SELECT
+                id,
+                name_encrypted,
+                phone_encrypted,
+                email_encrypted,
+                photo_derived_storage_key IS NOT NULL AS has_photo,
+                created_at
+            FROM disaster_service.help_request_volunteers
+            WHERE help_request_id = $1
+            ORDER BY created_at DESC, id DESC
+            """,
+            request_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def get_help_request_volunteer_photo(
+        self, volunteer_id: UUID
+    ) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT photo_derived_storage_key AS object_key,
+                   photo_content_type AS content_type
+            FROM disaster_service.help_request_volunteers
+            WHERE id = $1
+              AND photo_derived_storage_key IS NOT NULL
+            """,
+            volunteer_id,
+        )
+        return None if row is None else dict(row)
 
     async def admin_delete_help_request(
         self, request_id: UUID
