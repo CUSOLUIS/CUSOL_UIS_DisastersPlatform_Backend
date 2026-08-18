@@ -62,6 +62,18 @@ class Settings:
     # muestra cada 5 s, con 180 en memoria (15 min de historia).
     system_metrics_sample_seconds: float = 5.0
     system_metrics_history_samples: int = 180
+    # CHG-147: proxy de geocodificación. Nominatim exige User-Agent
+    # identificable y uso moderado; la caché corta absorbe los
+    # reintentos y el arrastre del muñequito sin repetir consultas.
+    geocode_base_url: str = "https://nominatim.openstreetmap.org"
+    geocode_user_agent: str = (
+        "CUSOL-UIS-DisastersPlatform/0.1 "
+        "(+https://cusoldisasterplatform.com)"
+    )
+    geocode_timeout_seconds: float = 6.0
+    geocode_rate_limit_per_minute: int = 30
+    geocode_cache_seconds: float = 600.0
+    geocode_cache_max_entries: int = 512
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -169,5 +181,25 @@ class Settings:
             ),
             system_metrics_history_samples=int(
                 os.getenv("SYSTEM_METRICS_HISTORY_SAMPLES", "180")
+            ),
+            geocode_base_url=os.getenv(
+                "GEOCODE_BASE_URL", "https://nominatim.openstreetmap.org"
+            ).rstrip("/"),
+            geocode_user_agent=os.getenv(
+                "GEOCODE_USER_AGENT",
+                "CUSOL-UIS-DisastersPlatform/0.1 "
+                "(+https://cusoldisasterplatform.com)",
+            ).strip(),
+            geocode_timeout_seconds=float(
+                os.getenv("GEOCODE_TIMEOUT_SECONDS", "6")
+            ),
+            geocode_rate_limit_per_minute=int(
+                os.getenv("GEOCODE_RATE_LIMIT_PER_MINUTE", "30")
+            ),
+            geocode_cache_seconds=float(
+                os.getenv("GEOCODE_CACHE_SECONDS", "600")
+            ),
+            geocode_cache_max_entries=int(
+                os.getenv("GEOCODE_CACHE_MAX_ENTRIES", "512")
             ),
         )

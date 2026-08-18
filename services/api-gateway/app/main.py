@@ -71,6 +71,9 @@ from .models import (
     PersonDuplicateCheckResponse,
     OperationalMapOverview,
     PeopleRecordPage,
+    GeocodeCandidate,
+    GeocodeCandidateList,
+    GeocodeResolvedAddress,
     PlatformVersion,
     PublicPersonStatus,
     ServiceVersion,
@@ -80,6 +83,11 @@ from .models import (
     HelpRequestAttendReceipt,
     HelpRequestPage,
     HelpRequestReceipt,
+)
+from .geocoding import (
+    TtlCache,
+    shape_reverse_payload,
+    shape_search_payload,
 )
 from .ratelimit import SlidingWindowRateLimiter
 from .system_metrics import SystemMetricsSampler
@@ -119,6 +127,7 @@ def create_app(
     settings: Settings | None = None,
     client: httpx.AsyncClient | None = None,
     identity_client: httpx.AsyncClient | None = None,
+    geocode_client: httpx.AsyncClient | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_environment()
 
@@ -165,6 +174,28 @@ def create_app(
                             timeout=(
                                 resolved_settings.upstream_timeout_seconds
                             ),
+                        )
+                    )
+                )
+            if geocode_client is not None:
+                application.state.geocode_client = geocode_client
+            else:
+                # CHG-147: cliente propio hacia el geocodificador; sale
+                # a Internet, con User-Agent identificable como pide la
+                # política de uso de Nominatim.
+                application.state.geocode_client = (
+                    await stack.enter_async_context(
+                        httpx.AsyncClient(
+                            base_url=resolved_settings.geocode_base_url,
+                            timeout=(
+                                resolved_settings.geocode_timeout_seconds
+                            ),
+                            headers={
+                                "User-Agent": (
+                                    resolved_settings.geocode_user_agent
+                                ),
+                                "Accept": "application/json",
+                            },
                         )
                     )
                 )
@@ -262,12 +293,28 @@ def create_app(
     aid_offer_read_limiter = SlidingWindowRateLimiter(
         resolved_settings.aid_offer_read_rate_limit_per_minute
     )
+    # CHG-147: geocodificación por origen, con caché corta compartida
+    # entre orígenes (la misma dirección resuelta sirve para todos).
+    geocode_limiter = SlidingWindowRateLimiter(
+        resolved_settings.geocode_rate_limit_per_minute
+    )
+    geocode_search_cache = TtlCache(
+        resolved_settings.geocode_cache_seconds,
+        resolved_settings.geocode_cache_max_entries,
+    )
+    geocode_reverse_cache = TtlCache(
+        resolved_settings.geocode_cache_seconds,
+        resolved_settings.geocode_cache_max_entries,
+    )
 
     def get_client(request: Request) -> httpx.AsyncClient:
         return request.app.state.upstream_client
 
     def get_identity_client(request: Request) -> httpx.AsyncClient:
         return request.app.state.identity_client
+
+    def get_geocode_client(request: Request) -> httpx.AsyncClient:
+        return request.app.state.geocode_client
 
     def client_key(request: Request) -> str:
         return request.client.host if request.client else "unknown"
@@ -2987,6 +3034,122 @@ def create_app(
             revision=resolved_settings.git_revision,
             upstream=detras,
         )
+
+    # CHG-147: el navegador en producción no puede llamar directo a
+    # nominatim.org (CORS/política de uso); el gateway consulta
+    # server-side con User-Agent propio, caché corta y límite por
+    # origen, y devuelve el JSON reducido del contrato.
+    @application.get(
+        "/api/v1/geocode/search",
+        response_model=GeocodeCandidateList,
+        responses={
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Geocodificador no disponible"},
+        },
+        tags=["Geocoding"],
+    )
+    async def search_geocode(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_geocode_client)],
+        q: Annotated[str, Query(min_length=3, max_length=200)],
+    ):
+        if not geocode_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas de direcciones."
+            )
+        cache_key = " ".join(q.casefold().split())
+        cached = geocode_search_cache.get(cache_key)
+        if cached is not None:
+            return GeocodeCandidateList(candidates=cached)
+        try:
+            response = await upstream.get(
+                "/search",
+                params={
+                    "format": "jsonv2",
+                    "countrycodes": "co",
+                    "limit": 5,
+                    "addressdetails": 0,
+                    "q": q,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError):
+            return problem_response(
+                "El servicio de direcciones no está disponible. "
+                "Intenta de nuevo.",
+                title="Geocodificador no disponible",
+                status_code=503,
+                problem_type="geocoder-unavailable",
+            )
+        candidates = [
+            GeocodeCandidate.model_validate(row)
+            for row in shape_search_payload(payload)
+        ]
+        geocode_search_cache.put(cache_key, candidates)
+        return GeocodeCandidateList(candidates=candidates)
+
+    @application.get(
+        "/api/v1/geocode/reverse",
+        response_model=GeocodeResolvedAddress,
+        responses={
+            404: {"description": "Punto sin dirección conocida"},
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Geocodificador no disponible"},
+        },
+        tags=["Geocoding"],
+    )
+    async def reverse_geocode_point(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_geocode_client)],
+        lat: Annotated[float, Query(ge=-90, le=90)],
+        lon: Annotated[float, Query(ge=-180, le=180)],
+    ):
+        if not geocode_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas de direcciones."
+            )
+        # Redondear a ~11 m junta en la caché los micro-arrastres del
+        # muñequito sin cambiar la dirección resultante (zoom=17).
+        cache_key = f"{lat:.4f},{lon:.4f}"
+        cache_miss = object()
+        cached = geocode_reverse_cache.get(cache_key, cache_miss)
+        if cached is not cache_miss:
+            resolved = cached
+        else:
+            try:
+                response = await upstream.get(
+                    "/reverse",
+                    params={
+                        "format": "jsonv2",
+                        "addressdetails": 1,
+                        "zoom": 17,
+                        "lat": lat,
+                        "lon": lon,
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except (httpx.HTTPError, ValueError):
+                return problem_response(
+                    "El servicio de direcciones no está disponible. "
+                    "Intenta de nuevo.",
+                    title="Geocodificador no disponible",
+                    status_code=503,
+                    problem_type="geocoder-unavailable",
+                )
+            resolved = shape_reverse_payload(payload)
+            # Los puntos sin dirección también se recuerdan: repetir el
+            # toque en medio del mar no debe reconsultar a Nominatim.
+            geocode_reverse_cache.put(cache_key, resolved)
+        if resolved is None:
+            return problem_response(
+                "El punto no corresponde a una dirección conocida.",
+                title="Punto sin dirección",
+                status_code=404,
+                problem_type="geocode-not-found",
+            )
+        return GeocodeResolvedAddress.model_validate(resolved)
 
     @application.get(
         "/api/v1/humanitarian-directory/search",

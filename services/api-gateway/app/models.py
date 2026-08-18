@@ -998,3 +998,24 @@ class PlatformVersion(BaseModel):
     service: str
     revision: str
     upstream: ServiceVersion | None = None
+
+
+class GeocodeCandidate(BaseModel):
+    # CHG-147: candidata de la búsqueda directa por el proxy del
+    # gateway; el label es el display_name completo de Nominatim.
+    label: str
+    latitude: float
+    longitude: float
+
+
+class GeocodeCandidateList(BaseModel):
+    candidates: list[GeocodeCandidate]
+
+
+class GeocodeResolvedAddress(BaseModel):
+    # CHG-147: dirección aproximada del punto (geocodificación
+    # inversa); municipio y departamento pueden faltar en zonas
+    # rurales y el cliente lo tolera.
+    label: str
+    municipality: str | None = None
+    department: str | None = None
