@@ -33,6 +33,8 @@ from .models import (
     AdminField,
     AdminModerationStatus,
     AdminMutationReceipt,
+    AdminSubmissionDeleteReceipt,
+    AdminSubmissionTheme,
     AdminPeoplePage,
     AdminPeopleVisibility,
     AdminPersonRecord,
@@ -45,6 +47,10 @@ from .models import (
     AdminVersionedReasonInput,
     AidLocationAvailability,
     AidLocationInput,
+    DamagedHomeReportInput,
+    DamagedHomeReportReceipt,
+    HumanitarianTransportInput,
+    HumanitarianTransportReceipt,
     AidLocationParentCandidate,
     AidLocationParentCandidatesResponse,
     AidLocationRatingInput,
@@ -1076,6 +1082,8 @@ def create_app(
             # CHG-153: logística (contadores del backend).
             "receiver_center": 0,
             "distribution_point": 0,
+            # CHG-162: hogares en malas condiciones.
+            "damaged_home": 0,
         }
         for item in items:
             by_category[item.category] += 1
@@ -1092,6 +1100,7 @@ def create_app(
                 volunteers_needed=by_category["volunteers_needed"],
                 receiver_center=by_category["receiver_center"],
                 distribution_point=by_category["distribution_point"],
+                damaged_home=by_category["damaged_home"],
             ),
             items=items,
             generated_at=datetime.now(UTC),
@@ -2081,6 +2090,141 @@ def create_app(
             ],
             total=len(rows),
         )
+
+    # CHG-161 — Alta de un transporte humanitario (mula o lancha).
+    # Siempre autenticado: el gateway resuelve la sesión y este
+    # servicio exige la cuenta en los encabezados de actor.
+    @application.post(
+        "/internal/v1/humanitarian-transports",
+        status_code=201,
+        response_model=HumanitarianTransportReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_humanitarian_transport(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401,
+                "Sesión requerida",
+                "El registro de transportes exige una cuenta.",
+            )
+        try:
+            payload = HumanitarianTransportInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        try:
+            result = await data.create_humanitarian_transport(
+                idempotency_key=idempotency_key,
+                kind=payload.kind,
+                origin_municipality=payload.origin_municipality,
+                destination_municipality=(
+                    payload.destination_municipality
+                ),
+                origin_location_id=payload.origin_location_id,
+                destination_location_id=(
+                    payload.destination_location_id
+                ),
+                supplies_summary=(
+                    payload.supplies_summary.strip()
+                    if payload.supplies_summary
+                    and payload.supplies_summary.strip()
+                    else None
+                ),
+                account_id=account_id,
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible registrar el transporte.",
+            )
+        if isinstance(result, str):
+            messages = {
+                "origin_not_found": "El centro de origen no existe.",
+                "origin_wrong_kind": (
+                    "El origen debe ser un centro de acopio local."
+                ),
+                "origin_wrong_city": (
+                    "El centro de origen no está en la ciudad de "
+                    "origen indicada."
+                ),
+                "origin_unavailable": (
+                    "El centro de origen no está disponible."
+                ),
+                "destination_not_found": (
+                    "El centro de destino no existe."
+                ),
+                "destination_wrong_kind": (
+                    "El destino debe ser un centro de acopio receptor."
+                ),
+                "destination_wrong_city": (
+                    "El centro de destino no está en la ciudad de "
+                    "destino indicada."
+                ),
+                "destination_unavailable": (
+                    "El centro de destino no está disponible."
+                ),
+            }
+            return problem(
+                422, "Transporte inválido", messages[result]
+            )
+        return HumanitarianTransportReceipt(**result)
+
+    # CHG-162 — Alta de «Mi casita partida» (anónimo permitido).
+    @application.post(
+        "/internal/v1/damaged-home-reports",
+        status_code=201,
+        response_model=DamagedHomeReportReceipt,
+        response_model_by_alias=True,
+        tags=["BuildingReports"],
+    )
+    async def create_damaged_home_report(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        _actor_kind, account_id = actor
+        try:
+            payload = DamagedHomeReportInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        try:
+            result = await data.create_damaged_home_report(
+                idempotency_key=idempotency_key,
+                description=payload.description.strip(),
+                department=payload.department.strip(),
+                municipality=payload.municipality.strip(),
+                address=payload.address.strip(),
+                latitude=payload.latitude,
+                longitude=payload.longitude,
+                account_id=account_id,
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible registrar el informe del hogar.",
+            )
+        return DamagedHomeReportReceipt(**result)
 
     # CHG-153 — Alta de un punto logístico (JSON). La dependencia y la
     # ciudad se validan en el servicio (no se confía en el cliente).
@@ -3963,6 +4107,8 @@ def create_app(
             str | None, Query(min_length=2, max_length=100)
         ] = None,
         kind: Annotated[AdminSubmissionKind | None, Query()] = None,
+        # CHG-159: filtro por tema (mapa tema→tipos en admin_rules).
+        theme: Annotated[AdminSubmissionTheme | None, Query()] = None,
         status: Annotated[AdminModerationStatus | None, Query()] = None,
         received_from: Annotated[
             datetime | None, Query(alias="receivedFrom")
@@ -3983,7 +4129,8 @@ def create_app(
                 "El tamaño de página debe ser 10, 25 o 50.",
             )
         rows, total = await data.admin_list_submissions(
-            q, kind, status, received_from, received_to, limit, offset
+            q, kind, status, received_from, received_to, limit, offset,
+            theme=theme,
         )
         return AdminSubmissionPage(
             items=[summary_model(row) for row in rows],
@@ -4295,6 +4442,43 @@ def create_app(
         audit_event_id, _version = result
         return await mutation_receipt(
             data, submission_id, audit_event_id
+        )
+
+    # CHG-159 — borrado definitivo: solo legal desde archived/rejected
+    # (available_actions); la fila fuente desaparece con su evidencia.
+    @application.delete(
+        "/internal/v1/admin/submissions/{submission_id}/permanent",
+        response_model=AdminSubmissionDeleteReceipt,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_delete_submission_permanently(
+        submission_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        try:
+            payload = AdminVersionedReasonInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        result = await apply_submission_mutation(
+            request,
+            data,
+            submission_id,
+            payload.expected_version,
+            "delete",
+            payload.reason,
+            "delete",
+        )
+        if isinstance(result, JSONResponse):
+            return result
+        audit_event_id, _version = result
+        return AdminSubmissionDeleteReceipt(
+            id=submission_id,
+            audit_event_id=audit_event_id,
+            deleted_at=datetime.now(UTC),
         )
 
     @application.post(

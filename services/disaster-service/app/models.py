@@ -150,6 +150,8 @@ OperationalMapCategory = Literal[
     # collection_center de arriba).
     "receiver_center",
     "distribution_point",
+    # CHG-162 — hogares en malas condiciones («Mi casita partida»).
+    "damaged_home",
 ]
 CoordinatePrecision = Literal["exact", "approximate", "municipality"]
 DataClassification = Literal["demonstrative", "operational"]
@@ -186,6 +188,8 @@ class OperationalMapSummary(ApiModel):
     # CHG-153: logística humanitaria (los contadores vienen del backend).
     receiver_center: int = Field(default=0, ge=0)
     distribution_point: int = Field(default=0, ge=0)
+    # CHG-162: hogares en malas condiciones.
+    damaged_home: int = Field(default=0, ge=0)
 
 
 class OperationalMapOverview(ApiModel):
@@ -1228,8 +1232,11 @@ AdminModerationStatus = Literal[
     "under_review", "needs_information", "accepted", "rejected", "archived"
 ]
 AdminActionName = Literal[
-    "accept", "reject", "request_changes", "archive", "restore"
+    "accept", "reject", "request_changes", "archive", "restore",
+    # CHG-159 — borrado definitivo.
+    "delete",
 ]
+AdminSubmissionTheme = Literal["personas", "infraestructura", "ayuda"]
 AdminFieldClassification = Literal["public", "private", "protected"]
 AdminAuditResult = Literal["success", "denied", "failed"]
 
@@ -1341,6 +1348,14 @@ class AdminMutationReceipt(ApiModel):
     version: int = Field(ge=1)
     audit_event_id: UUID
     updated_at: datetime
+
+
+class AdminSubmissionDeleteReceipt(ApiModel):
+    # CHG-159 — recibo del borrado definitivo: la fila ya no existe,
+    # así que no hay estado ni versión que devolver.
+    id: UUID
+    audit_event_id: UUID
+    deleted_at: datetime
 
 
 # CHG-154 — Gestión admin de registros de personas: ocultamiento
@@ -1728,3 +1743,67 @@ class ServiceVersion(BaseModel):
     # GIT_REVISION; nunca se inventa una revisión.
     service: str
     revision: str
+
+
+# CHG-161 — «La mulera» y «La lanchera»: transporte de insumos con
+# trazabilidad entre un acopio local (origen) y un receptor (destino).
+TransportKind = Literal["mule", "boat"]
+TransportStatus = Literal[
+    "registered", "in_transit", "arrived", "cancelled"
+]
+
+
+class HumanitarianTransportInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    kind: TransportKind
+    origin_municipality: str = Field(min_length=1, max_length=100)
+    destination_municipality: str = Field(min_length=1, max_length=100)
+    origin_location_id: UUID
+    destination_location_id: UUID
+    supplies_summary: str | None = Field(default=None, max_length=1000)
+
+
+class HumanitarianTransportReceipt(ApiModel):
+    id: UUID
+    kind: TransportKind
+    status: TransportStatus
+    origin_location_id: UUID
+    destination_location_id: UUID
+    created_at: datetime
+
+
+# CHG-162 — «Mi casita partida»: informe de hogar en malas condiciones.
+class DamagedHomeReportInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    description: str = Field(min_length=10, max_length=1000)
+    department: str = Field(min_length=1, max_length=100)
+    municipality: str = Field(min_length=1, max_length=100)
+    address: str = Field(min_length=3, max_length=300)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+
+    @model_validator(mode="after")
+    def _coordinates_pair(self):
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError(
+                "latitude y longitude deben enviarse juntas o ambas "
+                "ausentes"
+            )
+        return self
+
+
+class DamagedHomeReportReceipt(ApiModel):
+    id: UUID
+    created_at: datetime

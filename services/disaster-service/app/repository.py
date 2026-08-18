@@ -32,6 +32,7 @@ from .models import (
     UnverifiedBuildingReportReceipt,
     VerificationStatus,
 )
+from . import admin as admin_rules
 from . import moderation, offers
 
 # CHG-075: hora local de Colombia (sin horario de verano) para fijar
@@ -80,6 +81,33 @@ _LOGISTICS_MAP_PROJECTION_SQL = """
           OR a.parent_id IS NOT NULL
       )
     ORDER BY a.updated_at DESC
+    LIMIT $1
+"""
+
+# CHG-162 — «Mi casita partida»: hogares en malas condiciones visibles
+# y con coordenadas, proyectados al mapa con categoría propia. La
+# fuente es sintética (reporte ciudadano) porque la tabla no guarda
+# fuente institucional.
+_DAMAGED_HOMES_MAP_SQL = """
+    SELECT
+        r.id,
+        'damaged_home' AS category,
+        'Hogar en malas condiciones' AS title,
+        r.municipality || ', ' || r.department AS location_label,
+        r.latitude,
+        r.longitude,
+        'unverified' AS verification_status,
+        NULL::uuid AS related_disaster_id,
+        r.description,
+        'operational' AS data_classification,
+        r.updated_at,
+        'Reporte ciudadano' AS source_name,
+        'citizen' AS source_type,
+        NULL::text AS source_url
+    FROM disaster_service.damaged_home_reports r
+    WHERE r.visible
+      AND r.latitude IS NOT NULL
+    ORDER BY r.updated_at DESC
     LIMIT $1
 """
 
@@ -1153,6 +1181,149 @@ class PostgresDisasterRepository:
             """
         )
 
+    # CHG-161 — Alta de un transporte humanitario (mula o lancha) con
+    # trazabilidad: valida tipo, ciudad y disponibilidad de los centros
+    # de origen (acopio local) y destino (receptor).
+    async def create_humanitarian_transport(
+        self,
+        *,
+        idempotency_key: str,
+        kind: str,
+        origin_municipality: str,
+        destination_municipality: str,
+        origin_location_id: UUID,
+        destination_location_id: UUID,
+        supplies_summary: str | None,
+        account_id: UUID,
+    ) -> dict | str:
+        async def _center(location_id: UUID) -> dict | None:
+            row = await self._pool.fetchrow(
+                """
+                SELECT kind::text AS kind, municipality,
+                       publication_status, operational_status
+                FROM disaster_service.aid_locations
+                WHERE id = $1
+                """,
+                location_id,
+            )
+            return dict(row) if row else None
+
+        def _same_city(left: str, right: str) -> bool:
+            import unicodedata
+
+            def normalize(value: str) -> str:
+                stripped = unicodedata.normalize("NFD", value)
+                return "".join(
+                    ch for ch in stripped
+                    if unicodedata.category(ch) != "Mn"
+                ).casefold().strip()
+
+            return normalize(left) == normalize(right)
+
+        origin = await _center(origin_location_id)
+        if origin is None:
+            return "origin_not_found"
+        if origin["kind"] != "collection_center":
+            return "origin_wrong_kind"
+        if not _same_city(origin["municipality"], origin_municipality):
+            return "origin_wrong_city"
+        if (
+            origin["publication_status"] != "published"
+            or origin["operational_status"] == "inactive"
+        ):
+            return "origin_unavailable"
+
+        destination = await _center(destination_location_id)
+        if destination is None:
+            return "destination_not_found"
+        if destination["kind"] != "receiver_center":
+            return "destination_wrong_kind"
+        if not _same_city(
+            destination["municipality"], destination_municipality
+        ):
+            return "destination_wrong_city"
+        if (
+            destination["publication_status"] != "published"
+            or destination["operational_status"] == "inactive"
+        ):
+            return "destination_unavailable"
+
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO disaster_service.humanitarian_transports (
+                idempotency_key, kind, account_id,
+                origin_municipality, destination_municipality,
+                origin_location_id, destination_location_id,
+                supplies_summary
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (idempotency_key) DO NOTHING
+            RETURNING id, kind, status, origin_location_id,
+                      destination_location_id, created_at
+            """,
+            idempotency_key,
+            kind,
+            account_id,
+            origin_municipality.strip(),
+            destination_municipality.strip(),
+            origin_location_id,
+            destination_location_id,
+            supplies_summary,
+        )
+        if row is None:
+            # Reintento idempotente: devolver el alta original.
+            row = await self._pool.fetchrow(
+                """
+                SELECT id, kind, status, origin_location_id,
+                       destination_location_id, created_at
+                FROM disaster_service.humanitarian_transports
+                WHERE idempotency_key = $1
+                """,
+                idempotency_key,
+            )
+        return dict(row)
+
+    # CHG-162 — Alta de «Mi casita partida» (publicación inmediata).
+    async def create_damaged_home_report(
+        self,
+        *,
+        idempotency_key: str,
+        description: str,
+        department: str,
+        municipality: str,
+        address: str,
+        latitude: float | None,
+        longitude: float | None,
+        account_id: UUID | None,
+    ) -> dict:
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO disaster_service.damaged_home_reports (
+                idempotency_key, account_id, description, department,
+                municipality, address, latitude, longitude
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (idempotency_key) DO NOTHING
+            RETURNING id, created_at
+            """,
+            idempotency_key,
+            account_id,
+            description,
+            department,
+            municipality,
+            address,
+            latitude,
+            longitude,
+        )
+        if row is None:
+            row = await self._pool.fetchrow(
+                """
+                SELECT id, created_at
+                FROM disaster_service.damaged_home_reports
+                WHERE idempotency_key = $1
+                """,
+                idempotency_key,
+            )
+        return dict(row)
+
     async def operational_map_overview(
         self,
         limit: int,
@@ -1199,6 +1370,11 @@ class PostgresDisasterRepository:
             _LOGISTICS_MAP_PROJECTION_SQL,
             limit,
         )
+        # CHG-162: hogares en malas condiciones visibles y ubicables.
+        damaged_homes = await self._pool.fetch(
+            _DAMAGED_HOMES_MAP_SQL,
+            limit,
+        )
 
         def _row_point(row: dict, precision: str) -> OperationalMapPoint:
             return OperationalMapPoint(
@@ -1221,12 +1397,14 @@ class PostgresDisasterRepository:
                 updated_at=row["updated_at"],
             )
 
-        merged = [_row_point(row, "exact") for row in rows] + [
-            _row_point(row, "exact") for row in logistics
-        ]
+        merged = (
+            [_row_point(row, "exact") for row in rows]
+            + [_row_point(row, "exact") for row in logistics]
+            + [_row_point(row, "exact") for row in damaged_homes]
+        )
         merged.sort(key=lambda point: point.updated_at, reverse=True)
         points = merged[:limit]
-        all_rows = list(rows) + list(logistics)
+        all_rows = list(rows) + list(logistics) + list(damaged_homes)
         operational = bool(all_rows) and all(
             row["data_classification"] == "operational" for row in all_rows
         )
@@ -4418,9 +4596,16 @@ class PostgresDisasterRepository:
         received_to: datetime | None,
         limit: int,
         offset: int,
+        theme: str | None = None,
     ) -> tuple[list[dict], int]:
         clauses: list[str] = []
         values: list[object] = []
+        # CHG-159: tema → conjunto de tipos; un `kind` explícito manda.
+        if kind is None and theme is not None:
+            theme_kinds = admin_rules.THEME_KINDS.get(theme)
+            if theme_kinds:
+                values.append(list(theme_kinds))
+                clauses.append(f"kind = ANY(${len(values)})")
         if q is not None:
             values.append(q.strip())
             position = len(values)
@@ -4637,6 +4822,61 @@ class PostgresDisasterRepository:
         """
         meta = _ADMIN_TABLES[kind]
         table = meta["table"]
+
+        if action == "delete":
+            # CHG-159: borrado definitivo — solo se llega aquí desde
+            # archived/rejected (available_actions), donde los efectos
+            # de ocultamiento del dominio ya corrieron: es limpieza
+            # pura de la fila fuente y su evidencia cae por
+            # ON DELETE CASCADE. Los binarios externos de fotos quedan
+            # para el purgado previsto en CHG-154.
+            async with self._pool.acquire() as connection:
+                async with connection.transaction():
+                    deleted = await connection.fetchrow(
+                        f"""
+                        DELETE FROM {table}
+                        WHERE id = $1 AND version = $2
+                        RETURNING id
+                        """,
+                        submission_id,
+                        expected_version,
+                    )
+                    if deleted is None:
+                        exists = await connection.fetchval(
+                            f"SELECT 1 FROM {table} WHERE id = $1",
+                            submission_id,
+                        )
+                        outcome = (
+                            "conflict" if exists else "not_found"
+                        )
+                        if outcome == "conflict":
+                            await self._admin_audit(
+                                connection,
+                                actor_account_id,
+                                actor_display_name,
+                                "submission_delete",
+                                kind,
+                                submission_id,
+                                "failed",
+                                None,
+                                [],
+                                correlation_id,
+                            )
+                        return outcome, None, None
+                    audit_event_id = await self._admin_audit(
+                        connection,
+                        actor_account_id,
+                        actor_display_name,
+                        "submission_deleted",
+                        kind,
+                        submission_id,
+                        "success",
+                        reason_encrypted,
+                        [],
+                        correlation_id,
+                    )
+            return "ok", audit_event_id, None
+
         sets: list[str] = [
             "version = version + 1",
             "updated_at = NOW()",

@@ -451,3 +451,92 @@ async def test_admin_accounts_flow_via_identity():
     assert updated.status_code == 200
     assert updated.json()["assignedRole"] == "moderator"
     assert revoked.status_code == 204
+
+
+# --- CHG-159: tema de la bandeja y borrado definitivo ---
+
+
+@pytest.mark.anyio
+async def test_admin_submissions_forward_theme_filter():
+    seen = {}
+
+    def disaster_handler(request: httpx.Request):
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(200, json=SUBMISSION_PAGE)
+
+    upstream, identity = make_clients(disaster_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "GET",
+        "/api/v1/admin/submissions?theme=ayuda&limit=25",
+        headers=ADMIN_COOKIE,
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert seen["params"]["theme"] == "ayuda"
+
+
+@pytest.mark.anyio
+async def test_admin_permanent_delete_forwards_and_returns_receipt():
+    seen = {}
+    receipt = {
+        "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1",
+        "auditEventId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd1",
+        "deletedAt": "2026-08-18T21:00:00Z",
+    }
+
+    def disaster_handler(request: httpx.Request):
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["body"] = request.content.decode()
+        return httpx.Response(200, json=receipt)
+
+    upstream, identity = make_clients(disaster_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "DELETE",
+        "/api/v1/admin/submissions/"
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1/permanent",
+        headers=ADMIN_COOKIE,
+        json={
+            "expectedVersion": 3,
+            "reason": "Duplicada; borrado definitivo autorizado.",
+        },
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert response.json() == receipt
+    assert seen["method"] == "DELETE"
+    assert seen["path"].endswith(
+        "/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1/permanent"
+    )
+    assert "expectedVersion" in seen["body"]
+
+
+@pytest.mark.anyio
+async def test_admin_permanent_delete_requires_super_admin():
+    upstream, identity = make_clients(
+        lambda _: httpx.Response(200, json={})
+    )
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "DELETE",
+        "/api/v1/admin/submissions/"
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1/permanent",
+        headers=USER_COOKIE,
+        json={"expectedVersion": 1, "reason": "Sin rol suficiente."},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 403

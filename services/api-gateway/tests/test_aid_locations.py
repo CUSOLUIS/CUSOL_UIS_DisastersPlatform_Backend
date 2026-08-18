@@ -587,3 +587,114 @@ async def test_report_upstream_failure_is_503():
     await identity.aclose()
 
     assert response.status_code == 503
+
+
+# --- CHG-161/162: transportes y «Mi casita partida» ---
+
+
+TRANSPORT_RECEIPT = {
+    "id": "99999999-9999-4999-8999-999999999901",
+    "kind": "boat",
+    "status": "registered",
+    "originLocationId": "88888888-8888-4888-8888-888888888801",
+    "destinationLocationId": "88888888-8888-4888-8888-888888888802",
+    "createdAt": "2026-08-18T21:00:00Z",
+}
+
+TRANSPORT_BODY = {
+    "kind": "boat",
+    "originMunicipality": "Bucaramanga",
+    "destinationMunicipality": "El Playón",
+    "originLocationId": "88888888-8888-4888-8888-888888888801",
+    "destinationLocationId": "88888888-8888-4888-8888-888888888802",
+}
+
+
+@pytest.mark.anyio
+async def test_transport_requires_session():
+    upstream, identity = make_clients(
+        lambda _: httpx.Response(201, json=TRANSPORT_RECEIPT)
+    )
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/transports",
+        headers=IDEMPOTENCY,
+        json=TRANSPORT_BODY,
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_transport_forwards_authenticated_account():
+    seen = {}
+
+    def disaster_handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["actor"] = request.headers.get("x-actor-kind")
+        seen["account"] = request.headers.get("x-account-id")
+        seen["idempotency"] = request.headers.get("idempotency-key")
+        return httpx.Response(201, json=TRANSPORT_RECEIPT)
+
+    upstream, identity = make_clients(disaster_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/transports",
+        headers={**IDEMPOTENCY, "Cookie": "cusol_session=token-user"},
+        json=TRANSPORT_BODY,
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 201
+    assert response.json() == TRANSPORT_RECEIPT
+    assert seen["path"] == "/internal/v1/humanitarian-transports"
+    assert seen["actor"] == "authenticated"
+    assert seen["account"] == USER_ACCOUNT["id"]
+    assert seen["idempotency"] == IDEMPOTENCY["Idempotency-Key"]
+
+
+@pytest.mark.anyio
+async def test_damaged_home_allows_anonymous_and_forwards():
+    seen = {}
+
+    def disaster_handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["actor"] = request.headers.get("x-actor-kind")
+        return httpx.Response(
+            201,
+            json={
+                "id": "99999999-9999-4999-8999-999999999902",
+                "createdAt": "2026-08-18T21:00:00Z",
+            },
+        )
+
+    upstream, identity = make_clients(disaster_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/damaged-homes",
+        headers=IDEMPOTENCY,
+        json={
+            "description": "La casa perdió el techo y un muro.",
+            "department": "Santander",
+            "municipality": "Bucaramanga",
+            "address": "Calle 10 # 4-20",
+        },
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 201
+    assert seen["path"] == "/internal/v1/damaged-home-reports"
+    assert seen["actor"] == "anonymous"

@@ -31,8 +31,24 @@ AdminModerationStatus = Literal[
     "under_review", "needs_information", "accepted", "rejected", "archived"
 ]
 AdminAction = Literal[
-    "accept", "reject", "request_changes", "archive", "restore"
+    "accept", "reject", "request_changes", "archive", "restore",
+    # CHG-159 — borrado definitivo, solo desde archived/rejected.
+    "delete",
 ]
+
+# CHG-159 — temas de la bandeja (mismos ejes que el mapa público).
+AdminSubmissionTheme = Literal["personas", "infraestructura", "ayuda"]
+THEME_KINDS: dict[str, tuple[str, ...]] = {
+    "personas": ("missing_person_report", "person_status_report"),
+    "infraestructura": ("unverified_building_report",),
+    "ayuda": (
+        "aid_location_rating",
+        "collection_center_registration",
+        "collection_point_registration",
+        "community_meal_offer",
+        "temporary_shelter_offer",
+    ),
+}
 
 # Tipos con expediente persistido hoy; los registros de centros/puntos
 # se incorporarán cuando exista su flujo de captura.
@@ -73,9 +89,14 @@ def available_actions(
     needs_information: bool,
     archived_at: datetime | None,
 ) -> list[AdminAction]:
-    """Acciones legales desde el estado actual; nada más se acepta."""
+    """Acciones legales desde el estado actual; nada más se acepta.
+
+    CHG-159: `delete` (borrado definitivo) solo desde `archived` o
+    `rejected` — allí los efectos de ocultamiento del dominio ya
+    corrieron y el borrado es una limpieza pura de la fila fuente.
+    """
     if archived_at is not None:
-        return ["restore"]
+        return ["restore", "delete"]
     if domain_status == "withdrawn":
         # Retirado por el dominio: solo puede archivarse formalmente.
         return ["archive"]
@@ -84,6 +105,8 @@ def available_actions(
         return ["accept", "reject", "request_changes", "archive"]
     if status == "needs_information":
         return ["accept", "reject", "archive"]
+    if status == "rejected":
+        return ["archive", "delete"]
     return ["archive"]
 
 

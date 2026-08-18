@@ -127,11 +127,13 @@ class FakeAdminRepository:
         return self.detail
 
     async def admin_list_submissions(
-        self, q, kind, status, received_from, received_to, limit, offset
+        self, q, kind, status, received_from, received_to, limit,
+        offset, theme=None,
     ):
         self.list_args = {
             "q": q,
             "kind": kind,
+            "theme": theme,
             "status": status,
             "received_from": received_from,
             "received_to": received_to,
@@ -202,6 +204,10 @@ class FakeAdminRepository:
         if action == "accept":
             self.summary["domain_status"] = "accepted"
             self.summary["admin_status"] = "accepted"
+        # CHG-159: el borrado definitivo hace desaparecer la fila.
+        if action == "delete":
+            self.summary = None
+            return "ok", uuid4(), None
         return "ok", uuid4(), self.summary["version"]
 
     async def admin_get_evidence(self, submission_id, evidence_id):
@@ -734,9 +740,13 @@ def test_available_actions_by_state():
     assert admin_rules.available_actions("accepted", False, None) == [
         "archive"
     ]
+    # CHG-159: el borrado definitivo solo desde archived/rejected.
     assert admin_rules.available_actions(
         "accepted", False, RECEIVED_AT
-    ) == ["restore"]
+    ) == ["restore", "delete"]
+    assert admin_rules.available_actions("rejected", False, None) == [
+        "archive", "delete"
+    ]
     assert admin_rules.available_actions("withdrawn", False, None) == [
         "archive"
     ]
@@ -875,3 +885,112 @@ async def test_archive_does_not_notify():
 
     assert response.status_code == 200
     assert notifier.notified == []
+
+
+# --- CHG-159: tema de la bandeja y borrado definitivo ---
+
+
+@pytest.mark.anyio
+async def test_admin_list_passes_theme_filter():
+    repository = FakeAdminRepository()
+    app = admin_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "GET",
+        "/internal/v1/admin/submissions?theme=ayuda&limit=10&offset=0",
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert repository.list_args["theme"] == "ayuda"
+
+
+def test_theme_kinds_cover_every_kind_once():
+    # Los tres temas cubren exactamente los tipos del contrato,
+    # sin solapamientos.
+    themed = [
+        kind
+        for kinds in admin_rules.THEME_KINDS.values()
+        for kind in kinds
+    ]
+    assert sorted(themed) == sorted(set(themed))
+    assert set(themed) == {
+        "missing_person_report",
+        "person_status_report",
+        "unverified_building_report",
+        "aid_location_rating",
+        "collection_center_registration",
+        "collection_point_registration",
+        "community_meal_offer",
+        "temporary_shelter_offer",
+    }
+
+
+@pytest.mark.anyio
+async def test_admin_permanent_delete_requires_archived_or_rejected():
+    repository = FakeAdminRepository()
+    app = admin_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/admin/submissions/{SUBMISSION_ID}/permanent",
+        headers=ADMIN_HEADERS,
+        json={
+            "expectedVersion": 1,
+            "reason": "Intento de borrar en revisión.",
+        },
+    )
+
+    assert response.status_code == 409
+    assert repository.mutations == []
+
+
+@pytest.mark.anyio
+async def test_admin_permanent_delete_from_archived_returns_receipt():
+    repository = FakeAdminRepository()
+    repository.summary = summary_row(
+        archived_at=RECEIVED_AT, admin_status="archived"
+    )
+    app = admin_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/admin/submissions/{SUBMISSION_ID}/permanent",
+        headers=ADMIN_HEADERS,
+        json={
+            "expectedVersion": 1,
+            "reason": "Solicitud duplicada, retirada definitiva.",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == str(SUBMISSION_ID)
+    assert "auditEventId" in body and "deletedAt" in body
+    assert repository.mutations[-1]["action"] == "delete"
+
+
+@pytest.mark.anyio
+async def test_admin_permanent_delete_from_rejected_is_legal():
+    repository = FakeAdminRepository()
+    repository.summary = summary_row(
+        domain_status="rejected", admin_status="rejected"
+    )
+    app = admin_app(repository=repository)
+
+    response = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/admin/submissions/{SUBMISSION_ID}/permanent",
+        headers=ADMIN_HEADERS,
+        json={
+            "expectedVersion": 1,
+            "reason": "Rechazada y sin valor probatorio.",
+        },
+    )
+
+    assert response.status_code == 200
+    assert repository.mutations[-1]["action"] == "delete"

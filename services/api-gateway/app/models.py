@@ -106,6 +106,8 @@ OperationalMapCategory = Literal[
     # CHG-153 — logística humanitaria.
     "receiver_center",
     "distribution_point",
+    # CHG-162 — hogares en malas condiciones.
+    "damaged_home",
 ]
 CoordinatePrecision = Literal["exact", "approximate", "municipality"]
 DataClassification = Literal["demonstrative", "operational"]
@@ -196,6 +198,8 @@ class OperationalMapSummary(ApiModel):
     # CHG-153: logística (contadores del backend).
     receiver_center: int = Field(ge=0, default=0)
     distribution_point: int = Field(ge=0, default=0)
+    # CHG-162: hogares en malas condiciones.
+    damaged_home: int = Field(ge=0, default=0)
 
 
 class OperationalMapOverview(ApiModel):
@@ -589,8 +593,11 @@ AdminModerationStatus = Literal[
     "under_review", "needs_information", "accepted", "rejected", "archived"
 ]
 AdminActionName = Literal[
-    "accept", "reject", "request_changes", "archive", "restore"
+    "accept", "reject", "request_changes", "archive", "restore",
+    # CHG-159 — borrado definitivo.
+    "delete",
 ]
+AdminSubmissionTheme = Literal["personas", "infraestructura", "ayuda"]
 AdminAuditResult = Literal["success", "denied", "failed"]
 
 
@@ -709,6 +716,13 @@ class AdminMutationReceipt(ApiModel):
     version: int = Field(ge=1)
     audit_event_id: UUID
     updated_at: datetime
+
+
+class AdminSubmissionDeleteReceipt(ApiModel):
+    # CHG-159 — recibo del borrado definitivo.
+    id: UUID
+    audit_event_id: UUID
+    deleted_at: datetime
 
 
 # CHG-154 — Gestión admin de registros de personas (espejo del
@@ -1022,3 +1036,25 @@ class GeocodeResolvedAddress(ApiModel):
     address_line: str | None = None
     municipality: str | None = None
     department: str | None = None
+
+
+# CHG-161 — transporte humanitario («La mulera» / «La lanchera»).
+TransportKind = Literal["mule", "boat"]
+TransportStatus = Literal[
+    "registered", "in_transit", "arrived", "cancelled"
+]
+
+
+class HumanitarianTransportReceipt(ApiModel):
+    id: UUID
+    kind: TransportKind
+    status: TransportStatus
+    origin_location_id: UUID
+    destination_location_id: UUID
+    created_at: datetime
+
+
+# CHG-162 — «Mi casita partida».
+class DamagedHomeReportReceipt(ApiModel):
+    id: UUID
+    created_at: datetime

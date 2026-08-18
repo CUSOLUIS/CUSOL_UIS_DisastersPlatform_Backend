@@ -34,6 +34,10 @@ from .models import (
     AdminEvidenceAccessGrant,
     AdminModerationStatus,
     AdminMutationReceipt,
+    AdminSubmissionDeleteReceipt,
+    DamagedHomeReportReceipt,
+    HumanitarianTransportReceipt,
+    AdminSubmissionTheme,
     AdminOverview,
     AdminPeoplePage,
     AdminPeopleVisibility,
@@ -1910,6 +1914,8 @@ def create_app(
             str | None, Query(min_length=2, max_length=100)
         ] = None,
         kind: Annotated[AdminSubmissionKind | None, Query()] = None,
+        # CHG-159: filtro por tema de la bandeja.
+        theme: Annotated[AdminSubmissionTheme | None, Query()] = None,
         status: Annotated[AdminModerationStatus | None, Query()] = None,
         received_from: Annotated[
             datetime | None, Query(alias="receivedFrom")
@@ -1931,6 +1937,8 @@ def create_app(
             params.append(("q", q))
         if kind is not None:
             params.append(("kind", kind))
+        if theme is not None:
+            params.append(("theme", theme))
         if status is not None:
             params.append(("status", status))
         if received_from is not None:
@@ -2202,6 +2210,39 @@ def create_app(
             "DELETE",
             f"/internal/v1/admin/submissions/{submission_id}",
             AdminMutationReceipt,
+        )
+
+    # CHG-159 — borrado definitivo de una solicitud (solo desde
+    # archived/rejected; 409 en cualquier otro estado).
+    @application.delete(
+        "/api/v1/admin/submissions/{submission_id}/permanent",
+        response_model=AdminSubmissionDeleteReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Expediente no disponible"},
+            409: {"description": "Conflicto de versión o transición"},
+            422: {"description": "Motivo inválido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_delete_submission_permanently(
+        submission_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "DELETE",
+            f"/internal/v1/admin/submissions/{submission_id}/permanent",
+            AdminSubmissionDeleteReceipt,
         )
 
     # CHG-107: la retirada rápida de la fotografía pública (CHG-105)
@@ -3748,6 +3789,162 @@ def create_app(
         except (httpx.HTTPError, httpx.TimeoutException, ValueError):
             return problem_response(
                 "No fue posible registrar el punto en este momento.",
+                title="Servicio no disponible",
+            )
+
+    # CHG-161 — Alta de un transporte humanitario («La mulera» /
+    # «La lanchera»). SOLO con sesión: la trazabilidad exige un
+    # responsable con cuenta.
+    @application.post(
+        "/api/v1/transports",
+        status_code=201,
+        response_model=HumanitarianTransportReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Origen no permitido"},
+            422: {"description": "Datos, tipo o ciudad inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_humanitarian_transport(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not account_contribution_limiter.allow(
+            f"account:{account.id}"
+        ):
+            return rate_limited_response(
+                "Se superó el límite de registros por minuto."
+            )
+        headers = {
+            "content-type": request.headers.get(
+                "content-type", "application/json"
+            ),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": "authenticated",
+            "x-account-id": str(account.id),
+        }
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                "/internal/v1/humanitarian-transports",
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=201,
+                content=HumanitarianTransportReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible registrar el transporte en este momento.",
+                title="Servicio no disponible",
+            )
+
+    # CHG-162 — Alta de «Mi casita partida» (anónimo permitido, como
+    # los demás reportes ciudadanos).
+    @application.post(
+        "/api/v1/damaged-homes",
+        status_code=201,
+        response_model=DamagedHomeReportReceipt,
+        response_model_by_alias=True,
+        responses={
+            413: {"description": "Carga demasiado grande"},
+            422: {"description": "Informe inválido"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["BuildingReports"],
+    )
+    async def create_damaged_home_report(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        account = await resolve_optional_account(request, identity)
+        if account is not None:
+            if not account_contribution_limiter.allow(
+                f"account:{account.id}"
+            ):
+                return rate_limited_response(
+                    "Se superó el límite de registros por minuto."
+                )
+        elif not anonymous_contribution_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de registros por minuto."
+            )
+        headers = {
+            "content-type": request.headers.get(
+                "content-type", "application/json"
+            ),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": (
+                "authenticated" if account is not None else "anonymous"
+            ),
+        }
+        if account is not None:
+            headers["x-account-id"] = str(account.id)
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                "/internal/v1/damaged-home-reports",
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=201,
+                content=DamagedHomeReportReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible registrar el informe en este momento.",
                 title="Servicio no disponible",
             )
 

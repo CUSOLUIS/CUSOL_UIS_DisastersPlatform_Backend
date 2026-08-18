@@ -278,6 +278,7 @@ async def test_operational_map_contract_summary_and_order():
         "volunteersNeeded": 0,
         "receiverCenter": 0,
         "distributionPoint": 0,
+        "damagedHome": 0,
     }
     assert body["dataClassification"] == "demonstrative"
     assert "generatedAt" in body
@@ -314,6 +315,7 @@ async def test_operational_map_empty_set_is_valid():
         "volunteersNeeded": 0,
         "receiverCenter": 0,
         "distributionPoint": 0,
+        "damagedHome": 0,
     }
     assert body["dataClassification"] == "demonstrative"
 
@@ -352,6 +354,7 @@ async def test_operational_map_limit_bounds():
         "volunteersNeeded": 0,
         "receiverCenter": 0,
         "distributionPoint": 0,
+        "damagedHome": 0,
     }
     assert maximum.status_code == 200
     assert below.status_code == 422
