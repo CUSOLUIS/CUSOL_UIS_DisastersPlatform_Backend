@@ -1012,10 +1012,13 @@ class GeocodeCandidateList(BaseModel):
     candidates: list[GeocodeCandidate]
 
 
-class GeocodeResolvedAddress(BaseModel):
+class GeocodeResolvedAddress(ApiModel):
     # CHG-147: dirección aproximada del punto (geocodificación
     # inversa); municipio y departamento pueden faltar en zonas
     # rurales y el cliente lo tolera.
     label: str
+    # CHG-156: dirección corta (vía, barrio, comuna) sin la cola
+    # administrativa, para el campo Dirección de los formularios.
+    address_line: str | None = None
     municipality: str | None = None
     department: str | None = None

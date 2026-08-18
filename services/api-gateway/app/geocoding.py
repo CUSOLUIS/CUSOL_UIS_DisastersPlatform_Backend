@@ -82,6 +82,37 @@ def _first_string(address: dict[str, Any], *keys: str) -> str | None:
     return None
 
 
+# CHG-156: piezas administrativas del display_name; la dirección corta
+# termina donde empieza la primera de ellas.
+_ADMINISTRATIVE_KEYS = (
+    "municipality",
+    "city",
+    "town",
+    "village",
+    "county",
+    "state_district",
+    "state",
+    "region",
+    "postcode",
+    "country",
+)
+
+
+def _short_address_line(label: str, address: dict[str, Any]) -> str | None:
+    administrative = {
+        value.casefold()
+        for key in _ADMINISTRATIVE_KEYS
+        if isinstance((value := address.get(key)), str) and value.strip()
+    }
+    kept: list[str] = []
+    for part in label.split(", "):
+        if part.strip().casefold() in administrative:
+            break
+        kept.append(part)
+    line = ", ".join(kept).strip()
+    return line or None
+
+
 def shape_reverse_payload(payload: Any) -> dict[str, Any] | None:
     """Reduce la respuesta de /reverse; None si el punto no tiene dirección."""
     if not isinstance(payload, dict):
@@ -94,9 +125,13 @@ def shape_reverse_payload(payload: Any) -> dict[str, Any] | None:
         address = {}
     return {
         "label": label,
-        # Mismos alias que usaba el frontend contra Nominatim (CHG-086).
+        # CHG-156: dirección corta (vía, barrio, comuna) para el campo
+        # Dirección; el label completo se conserva por compatibilidad.
+        "address_line": _short_address_line(label, address),
+        # CHG-156: en Colombia el municipio real es `county`
+        # (admin_level 6); `city` suele ser "Perímetro Urbano X".
         "municipality": _first_string(
-            address, "city", "town", "municipality", "village"
+            address, "county", "municipality", "city", "town", "village"
         ),
         "department": _first_string(address, "state", "region"),
     }

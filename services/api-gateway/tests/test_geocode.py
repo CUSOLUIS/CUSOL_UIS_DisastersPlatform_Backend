@@ -164,6 +164,8 @@ async def test_reverse_resolves_label_municipality_department():
     assert response.status_code == 200
     assert response.json() == {
         "label": REVERSE_PAYLOAD["display_name"],
+        # CHG-156: la dirección corta termina donde empieza el municipio.
+        "addressLine": "Carrera 27, La Salle",
         "municipality": "Bucaramanga",
         "department": "Santander",
     }
@@ -175,7 +177,11 @@ async def test_reverse_resolves_label_municipality_department():
 async def test_reverse_falls_back_to_town_and_region():
     payload = {
         "display_name": "Vereda El Roble, Colombia",
-        "address": {"town": "El Playón", "region": "Santander"},
+        "address": {
+            "town": "El Playón",
+            "region": "Santander",
+            "country": "Colombia",
+        },
     }
     app = app_with_geocode(lambda _: httpx.Response(200, json=payload))
 
@@ -184,6 +190,44 @@ async def test_reverse_falls_back_to_town_and_region():
     assert response.status_code == 200
     assert response.json()["municipality"] == "El Playón"
     assert response.json()["department"] == "Santander"
+    assert response.json()["addressLine"] == "Vereda El Roble"
+
+
+@pytest.mark.anyio
+async def test_reverse_prefers_county_and_cuts_urban_perimeter():
+    # CHG-156: caso Bucaramanga real — `city` es el polígono "Perímetro
+    # Urbano" y el municipio verdadero viene en `county`; la dirección
+    # corta conserva vía, barrio y comuna.
+    payload = {
+        "display_name": (
+            "Avenida Calle 36, Centro, Comuna 15 - Centro, "
+            "Perímetro Urbano Bucaramanga, Bucaramanga, Metropolitana, "
+            "Santander, RAP Gran Santander, 680006, Colombia"
+        ),
+        "address": {
+            "road": "Avenida Calle 36",
+            "neighbourhood": "Centro",
+            "suburb": "Comuna 15 - Centro",
+            "city": "Perímetro Urbano Bucaramanga",
+            "county": "Bucaramanga",
+            "state_district": "Metropolitana",
+            "state": "Santander",
+            "region": "RAP Gran Santander",
+            "postcode": "680006",
+            "country": "Colombia",
+        },
+    }
+    app = app_with_geocode(lambda _: httpx.Response(200, json=payload))
+
+    response = await get(
+        app, "/api/v1/geocode/reverse?lat=7.11935&lon=-73.12274"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["addressLine"] == "Avenida Calle 36, Centro, Comuna 15 - Centro"
+    assert body["municipality"] == "Bucaramanga"
+    assert body["department"] == "Santander"
 
 
 @pytest.mark.anyio
