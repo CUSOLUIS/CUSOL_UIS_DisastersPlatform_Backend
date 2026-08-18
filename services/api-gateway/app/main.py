@@ -35,6 +35,9 @@ from .models import (
     AdminModerationStatus,
     AdminMutationReceipt,
     AdminOverview,
+    AdminPeoplePage,
+    AdminPeopleVisibility,
+    AdminPersonRecord,
     AdminSubmissionDetail,
     AdminSubmissionKind,
     AdminHelpRequestDeleteReceipt,
@@ -45,6 +48,9 @@ from .models import (
     AdminSubmissionPage,
     AdminSystemMetrics,
     AidLocationAvailability,
+    AidLocationParentCandidatesResponse,
+    AidLocationReceipt,
+    AidLocationReportReceipt,
     AuthenticatedAccount,
     ChangeSignal,
     CommunityContributionReceipt,
@@ -1950,6 +1956,145 @@ def create_app(
             success_status=success_status,
         )
 
+    # CHG-154 — Gestión de registros de personas: listar (con ocultos),
+    # ocultar (reversible, nada se borra), restaurar y editar. Solo
+    # super_admin; las mutaciones validan Origin (CSRF).
+    @application.get(
+        "/api/v1/admin/people",
+        response_model=AdminPeoplePage,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            422: {"description": "Filtros inválidos"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_list_people(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+        statuses: Annotated[list[HumanStatus] | None, Query()] = None,
+        q: Annotated[
+            str | None, Query(min_length=2, max_length=100)
+        ] = None,
+        visibility: Annotated[AdminPeopleVisibility, Query()] = "visible",
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        params: list[tuple[str, str]] = [
+            ("visibility", visibility),
+            ("limit", str(limit)),
+            ("offset", str(offset)),
+        ]
+        for status in statuses or []:
+            params.append(("statuses", status))
+        if q is not None:
+            params.append(("q", q))
+        return await admin_forward(
+            upstream,
+            "GET",
+            "/internal/v1/admin/people",
+            account,
+            AdminPeoplePage,
+            params=params,
+        )
+
+    @application.patch(
+        "/api/v1/admin/people/{person_id}",
+        response_model=AdminPersonRecord,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Registro no disponible"},
+            409: {"description": "Estado gobernado por novedades"},
+            422: {"description": "Campos inválidos"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_update_person(
+        person_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "PATCH",
+            f"/internal/v1/admin/people/{person_id}",
+            AdminPersonRecord,
+        )
+
+    @application.post(
+        "/api/v1/admin/people/{person_id}/hide",
+        response_model=AdminPersonRecord,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Registro no disponible"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_hide_person(
+        person_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "POST",
+            f"/internal/v1/admin/people/{person_id}/hide",
+            AdminPersonRecord,
+        )
+
+    @application.post(
+        "/api/v1/admin/people/{person_id}/restore",
+        response_model=AdminPersonRecord,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Registro no disponible"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_restore_person(
+        person_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "POST",
+            f"/internal/v1/admin/people/{person_id}/restore",
+            AdminPersonRecord,
+        )
+
     @application.patch(
         "/api/v1/admin/submissions/{submission_id}",
         response_model=AdminSubmissionDetail,
@@ -3362,6 +3507,265 @@ def create_app(
             "No fue posible recibir la valoración en este momento; "
             "ningún dato quedó registrado.",
             account_id=account.id,
+        )
+
+    # CHG-153 — Alta de un punto logístico. Canal público: cuenta
+    # opcional (anónimos y registrados), Idempotency-Key + rate-limit.
+    # La dependencia y la ciudad las valida el disaster-service.
+    @application.post(
+        "/api/v1/aid-locations",
+        status_code=201,
+        response_model=AidLocationReceipt,
+        response_model_by_alias=True,
+        responses={
+            413: {"description": "Carga demasiado grande"},
+            422: {"description": "Datos o dependencia inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_aid_location(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        account = await resolve_optional_account(request, identity)
+        if account is not None:
+            if not account_contribution_limiter.allow(
+                f"account:{account.id}"
+            ):
+                return rate_limited_response(
+                    "Se superó el límite de registros por minuto."
+                )
+        elif not anonymous_contribution_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de registros por minuto."
+            )
+        headers = {
+            "content-type": request.headers.get(
+                "content-type", "application/json"
+            ),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": (
+                "authenticated" if account is not None else "anonymous"
+            ),
+        }
+        if account is not None:
+            headers["x-account-id"] = str(account.id)
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                "/internal/v1/aid-locations", content=body, headers=headers
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=201,
+                content=AidLocationReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible registrar el punto en este momento.",
+                title="Servicio no disponible",
+            )
+
+    # CHG-153 — Candidatos a centro asociado para los formularios de
+    # alta de puntos dependientes. Público; comparte el limitador de
+    # búsquedas del directorio.
+    @application.get(
+        "/api/v1/aid-locations/parent-candidates",
+        response_model=AidLocationParentCandidatesResponse,
+        response_model_by_alias=True,
+        responses={
+            422: {"description": "Tipo sin dependencia"},
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Consulta no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_aid_location_parent_candidates(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        kind: Annotated[str, Query(min_length=1, max_length=40)],
+        municipality: Annotated[
+            str, Query(min_length=1, max_length=100)
+        ],
+    ):
+        if not directory_search_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        try:
+            response = await upstream.get(
+                "/internal/v1/aid-locations/parent-candidates",
+                params={"kind": kind, "municipality": municipality},
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                content=AidLocationParentCandidatesResponse.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible listar los centros asociados.",
+                title="Servicio no disponible",
+            )
+
+    # CHG-153 — Denuncia sobre un lugar de ayuda. El gateway resuelve la
+    # clave de denunciante (`x-denouncer-key`) para dedup y umbral: la
+    # cuenta si hay sesión, o el fingerprint/IP hasheado si es anónimo
+    # (P1: anónimos cuentan con antiabuso por fingerprint/IP).
+    def _denouncer_key_anonymous(request: Request) -> str:
+        fingerprint = request.headers.get(
+            "x-visitor-fingerprint", ""
+        ).strip()
+        seed = fingerprint or client_key(request)
+        digest = hashlib.sha256(seed.encode()).hexdigest()[:32]
+        return f"fp:{digest}"
+
+    async def _forward_aid_location_report(
+        location_id: UUID,
+        request: Request,
+        upstream: httpx.AsyncClient,
+        actor_kind: str,
+        denouncer_key: str,
+        account_id: UUID | None,
+    ) -> JSONResponse:
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        headers = {
+            "content-type": request.headers.get(
+                "content-type", "application/json"
+            ),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": actor_kind,
+            "x-denouncer-key": denouncer_key,
+        }
+        if account_id is not None:
+            headers["x-account-id"] = str(account_id)
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                f"/internal/v1/aid-locations/{location_id}/reports",
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=202,
+                content=AidLocationReportReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible registrar la denuncia en este momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.post(
+        "/api/v1/public/aid-locations/{location_id}/reports",
+        status_code=202,
+        response_model=AidLocationReportReceipt,
+        response_model_by_alias=True,
+        responses={
+            404: {"description": "Lugar inexistente"},
+            422: {"description": "Datos inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_anonymous_aid_location_report(
+        location_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        if not anonymous_contribution_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de denuncias por minuto."
+            )
+        return await _forward_aid_location_report(
+            location_id,
+            request,
+            upstream,
+            "anonymous",
+            _denouncer_key_anonymous(request),
+            None,
+        )
+
+    @application.post(
+        "/api/v1/me/aid-locations/{location_id}/reports",
+        status_code=202,
+        response_model=AidLocationReportReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Origen no permitido"},
+            404: {"description": "Lugar inexistente"},
+            422: {"description": "Datos inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_authenticated_aid_location_report(
+        location_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not account_contribution_limiter.allow(f"account:{account.id}"):
+            return rate_limited_response(
+                "Se superó el límite de denuncias por minuto."
+            )
+        return await _forward_aid_location_report(
+            location_id,
+            request,
+            upstream,
+            "authenticated",
+            f"account:{account.id}",
+            account.id,
         )
 
     return application

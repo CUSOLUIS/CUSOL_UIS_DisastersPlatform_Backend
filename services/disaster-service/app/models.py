@@ -145,6 +145,11 @@ OperationalMapCategory = Literal[
     "temporary_shelter",
     # CHG-069 — alertas ciudadanas de voluntariado.
     "volunteers_needed",
+    # CHG-153 — logística humanitaria: acopio receptor y distribución
+    # (recolección y acopio local reutilizan collection_point /
+    # collection_center de arriba).
+    "receiver_center",
+    "distribution_point",
 ]
 CoordinatePrecision = Literal["exact", "approximate", "municipality"]
 DataClassification = Literal["demonstrative", "operational"]
@@ -178,6 +183,9 @@ class OperationalMapSummary(ApiModel):
     temporary_shelter: int = Field(default=0, ge=0)
     # CHG-069: alertas de voluntariado activas.
     volunteers_needed: int = Field(default=0, ge=0)
+    # CHG-153: logística humanitaria (los contadores vienen del backend).
+    receiver_center: int = Field(default=0, ge=0)
+    distribution_point: int = Field(default=0, ge=0)
 
 
 class OperationalMapOverview(ApiModel):
@@ -530,9 +538,34 @@ HumanitarianDirectoryKind = Literal[
     "collection_point",
     "community_meal",
     "temporary_shelter",
+    # CHG-153 — logística: acopio receptor y distribución.
+    "receiver_center",
+    "distribution_point",
 ]
 PublicPersonStatus = Literal["missing", "found", "deceased"]
 AidLocationAvailability = Literal["active", "inactive", "unknown"]
+
+# CHG-153 — los cuatro tipos logísticos y sus dependencias.
+AidLocationKind = Literal[
+    "collection_center",  # acopio local (independiente)
+    "collection_point",  # recolección (depende de acopio local)
+    "receiver_center",  # acopio receptor (independiente)
+    "distribution_point",  # distribución (depende de acopio receptor)
+]
+AidLocationOperationalStatus = Literal[
+    "open",  # ABIERTO
+    "closed",  # CERRADO
+    "at_capacity",  # CAPACIDAD_COMPLETA
+    "under_observation",  # EN_OBSERVACION (umbral de denuncias)
+    "inactive",  # INACTIVO
+]
+# Punto dependiente -> tipo del centro padre que exige.
+AID_LOCATION_PARENT_KIND: dict[str, str] = {
+    "collection_point": "collection_center",
+    "distribution_point": "receiver_center",
+}
+# Umbral de denuncias válidas que pone un acopio EN_OBSERVACION (§12).
+AID_LOCATION_REPORT_THRESHOLD = 10
 AidSupplyCategory = Literal[
     "water", "food", "medicine", "clothing", "tools", "shelter", "other"
 ]
@@ -562,12 +595,19 @@ class AidLocationDirectoryCard(ApiModel):
     """Tarjeta pública de lugar de ayuda; el promedio usa únicamente
     valoraciones aceptadas."""
 
-    kind: Literal["collection_center", "collection_point"]
+    # CHG-153: los cuatro tipos logísticos.
+    kind: AidLocationKind
     id: UUID
     name: str = Field(min_length=1, max_length=180)
     location_label: str = Field(min_length=1, max_length=300)
     municipality: str = Field(min_length=1, max_length=100)
     department: str = Field(min_length=1, max_length=100)
+    # CHG-153: coordenadas (null si el lugar no las tiene) y estado
+    # operativo amigable; el centro asociado cuando es dependiente.
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    operational_status: AidLocationOperationalStatus = "open"
+    parent_id: UUID | None = None
     verification_status: VerificationStatus
     availability_status: AidLocationAvailability
     open_now: bool | None = None
@@ -577,6 +617,101 @@ class AidLocationDirectoryCard(ApiModel):
     source: SourceReference
     updated_at: datetime
     data_classification: DataClassification
+
+
+# CHG-153 — Alta de un punto logístico. La dependencia (centro asociado)
+# y el territorio se validan TAMBIÉN en el servicio (no se confía en el
+# cliente). Independientes (acopio local/receptor) NO llevan parent;
+# dependientes (recolección/distribución) lo EXIGEN.
+class AidLocationInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    kind: AidLocationKind
+    name: str = Field(min_length=2, max_length=180)
+    address: str = Field(min_length=3, max_length=300)
+    municipality: str = Field(min_length=1, max_length=100)
+    department: str = Field(min_length=1, max_length=100)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    description: str | None = Field(default=None, max_length=1000)
+    schedule: str | None = Field(default=None, max_length=200)
+    contact: str | None = Field(default=None, max_length=200)
+    parent_id: UUID | None = None
+    accepted_supplies: list[AidSupplyCategory] = Field(
+        default_factory=list, max_length=12
+    )
+    operational_status: AidLocationOperationalStatus = "open"
+
+    @model_validator(mode="after")
+    def _coordinates_pair(self):
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError(
+                "latitude y longitude deben enviarse juntas o ambas "
+                "ausentes"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _dependency_by_kind(self):
+        needs_parent = self.kind in AID_LOCATION_PARENT_KIND
+        if needs_parent and self.parent_id is None:
+            raise ValueError(
+                "este tipo exige un centro asociado (parentId)"
+            )
+        if not needs_parent and self.parent_id is not None:
+            raise ValueError(
+                "este tipo es independiente: no lleva centro asociado"
+            )
+        return self
+
+
+class AidLocationReceipt(ApiModel):
+    id: UUID
+    kind: AidLocationKind
+    operational_status: AidLocationOperationalStatus
+    created_at: datetime
+
+
+# CHG-153 — Candidatos a centro asociado para el alta de un punto
+# dependiente: solo del tipo padre correcto, publicados, no inactivos y
+# de la misma ciudad. El formulario los ofrece; el servicio revalida.
+class AidLocationParentCandidate(ApiModel):
+    id: UUID
+    name: str = Field(min_length=1, max_length=180)
+    address: str = Field(min_length=1, max_length=300)
+    municipality: str = Field(min_length=1, max_length=100)
+    department: str = Field(min_length=1, max_length=100)
+    operational_status: AidLocationOperationalStatus
+
+
+class AidLocationParentCandidatesResponse(ApiModel):
+    items: list[AidLocationParentCandidate]
+    total: int = Field(ge=0)
+
+
+# CHG-153 — Denuncia sobre un lugar de ayuda (§11-13). Dual anónimo/
+# autenticado; el motivo se cifra (solo super_admin). El umbral de 10
+# denunciantes distintos pone el acopio EN_OBSERVACION.
+class AidLocationReportInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class AidLocationReportReceipt(ApiModel):
+    location_id: UUID
+    reports_count: int = Field(ge=1)
+    under_observation: bool
 
 
 # CHG-044 — Ofertas comunitarias de comida y alojamiento (FEATURE-010).
@@ -1206,6 +1341,54 @@ class AdminMutationReceipt(ApiModel):
     version: int = Field(ge=1)
     audit_event_id: UUID
     updated_at: datetime
+
+
+# CHG-154 — Gestión admin de registros de personas: ocultamiento
+# reversible (nada se borra) y edición acotada. `hidden_at` presente ⇔
+# invisible en toda la plataforma, a la espera del futuro apartado de
+# borrado definitivo.
+AdminPeopleVisibility = Literal["visible", "hidden", "all"]
+
+
+class AdminPersonRecord(ApiModel):
+    id: UUID
+    display_name: str = Field(min_length=1)
+    status: HumanStatus
+    location: str = Field(min_length=1)
+    related_event: str = Field(min_length=1)
+    latitude: float | None = None
+    longitude: float | None = None
+    # Con caso ciudadano vinculado el estado lo derivan las novedades;
+    # la consola no lo edita a mano.
+    has_linked_case: bool
+    source: SourceReference
+    created_at: datetime
+    updated_at: datetime
+    hidden_at: datetime | None = None
+    hidden_by: str | None = None
+
+
+class AdminPeoplePage(ApiModel):
+    items: list[AdminPersonRecord]
+    total: int = Field(ge=0)
+
+
+class AdminPersonUpdateInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    display_name: str | None = Field(
+        default=None, min_length=2, max_length=160
+    )
+    location: str | None = Field(default=None, min_length=2, max_length=300)
+    related_event: str | None = Field(
+        default=None, min_length=2, max_length=200
+    )
+    status: HumanStatus | None = None
 
 
 class AdminEvidenceAccessGrant(ApiModel):

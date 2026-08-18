@@ -7,6 +7,8 @@ from uuid import UUID
 import asyncpg
 
 from .models import (
+    AID_LOCATION_PARENT_KIND,
+    AID_LOCATION_REPORT_THRESHOLD,
     AidLocationAvailability,
     AidLocationDirectoryCard,
     AidOfferOwnerSummary,
@@ -47,6 +49,50 @@ _COMBINED_ATTENDERS_COUNT_SQL = """
         + (SELECT COUNT(*)
            FROM disaster_service.help_request_volunteers
            WHERE help_request_id = $1)
+"""
+
+# CHG-153 — Proyección de los puntos logísticos al mapa. Solo con
+# coordenadas, publicados, no inactivos y NO huérfanos (un dependiente
+# exige su centro padre; los independientes siempre son válidos).
+_LOGISTICS_MAP_PROJECTION_SQL = """
+    SELECT
+        a.id,
+        a.kind::text AS category,
+        a.name AS title,
+        a.location_label,
+        a.latitude,
+        a.longitude,
+        a.verification_status,
+        NULL::uuid AS related_disaster_id,
+        a.description,
+        a.data_classification,
+        a.updated_at,
+        s.name AS source_name,
+        s.source_type,
+        s.url AS source_url
+    FROM disaster_service.aid_locations a
+    INNER JOIN disaster_service.sources s ON s.id = a.source_id
+    WHERE a.latitude IS NOT NULL
+      AND a.publication_status = 'published'
+      AND a.operational_status <> 'inactive'
+      AND (
+          a.kind IN ('collection_center', 'receiver_center')
+          OR a.parent_id IS NOT NULL
+      )
+    ORDER BY a.updated_at DESC
+    LIMIT $1
+"""
+
+# CHG-153 — Denunciantes DISTINTOS de un lugar (antiabuso del umbral):
+# denuncias vivas (no rechazadas ni archivadas), cada denunciante una
+# vez (la UNIQUE (location_id, denouncer_key) ya lo garantiza al
+# insertar; aquí se cuenta para el umbral de 10).
+_AID_LOCATION_REPORTERS_COUNT_SQL = """
+    SELECT COUNT(*)
+    FROM disaster_service.aid_location_reports
+    WHERE location_id = $1
+      AND archived_at IS NULL
+      AND moderation_status <> 'rejected'
 """
 
 
@@ -336,6 +382,28 @@ class DisasterRepository(Protocol):
         offset: int,
     ) -> tuple[list[PersonRecord], int]: ...
 
+    # CHG-154 — Gestión admin de registros de personas.
+    async def admin_list_people(
+        self,
+        statuses: list[str] | None,
+        search: str | None,
+        visibility: str,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict], int]: ...
+
+    async def admin_hide_person(
+        self, person_id: UUID, hidden_by: str
+    ) -> dict | None: ...
+
+    async def admin_restore_person(
+        self, person_id: UUID
+    ) -> dict | None: ...
+
+    async def admin_update_person(
+        self, person_id: UUID, fields: dict
+    ) -> dict | str | None: ...
+
     async def operational_map_overview(
         self,
         limit: int,
@@ -559,6 +627,8 @@ EVENT_MATCH_THRESHOLD = 0.85
 # CHG-092: fuente ciudadana compartida de los eventos creados desde
 # el formulario de reporte.
 CITIZEN_EVENT_SOURCE_NAME = "Reporte ciudadano CUSOL"
+# CHG-153: fuente ciudadana de los puntos logísticos registrados.
+CITIZEN_LOGISTICS_SOURCE_NAME = "Registro ciudadano de logística CUSOL"
 
 
 class PostgresDisasterRepository:
@@ -666,6 +736,7 @@ class PostgresDisasterRepository:
             """
             SELECT status, COUNT(*) AS quantity
             FROM disaster_service.people
+            WHERE hidden_at IS NULL
             GROUP BY status
             """
         )
@@ -693,6 +764,7 @@ class PostgresDisasterRepository:
                 s.url AS source_url
             FROM disaster_service.people p
             INNER JOIN disaster_service.sources s ON s.id = p.source_id
+            WHERE p.hidden_at IS NULL
             ORDER BY p.created_at DESC
             LIMIT $1
             """,
@@ -726,7 +798,8 @@ class PostgresDisasterRepository:
         # CHG-018: búsqueda solo sobre campos públicos del contrato
         # (nombre público, ubicación, evento y nombre de fuente); unaccent
         # y lower cubren tildes y mayúsculas. Orden estable para paginar.
-        clauses: list[str] = []
+        # CHG-154: los registros ocultos por el admin no son públicos.
+        clauses: list[str] = ["p.hidden_at IS NULL"]
         filter_values: list[object] = []
 
         if statuses:
@@ -804,6 +877,241 @@ class PostgresDisasterRepository:
         ]
         return records, int(total)
 
+    # CHG-154 — Gestión admin de registros de personas: listar (con
+    # ocultos), ocultar (reversible, nada se borra), restaurar y editar.
+
+    async def admin_list_people(
+        self,
+        statuses: list[str] | None,
+        search: str | None,
+        visibility: str,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict], int]:
+        clauses: list[str] = []
+        filter_values: list[object] = []
+        if visibility == "visible":
+            clauses.append("p.hidden_at IS NULL")
+        elif visibility == "hidden":
+            clauses.append("p.hidden_at IS NOT NULL")
+        if statuses:
+            filter_values.append(statuses)
+            clauses.append(
+                f"p.status::text = ANY(${len(filter_values)}::text[])"
+            )
+        if search:
+            filter_values.append(search)
+            position = len(filter_values)
+            clauses.append(
+                f"""(
+                lower(unaccent(p.display_name)) LIKE
+                    '%' || lower(unaccent(${position})) || '%'
+                OR lower(unaccent(p.location)) LIKE
+                    '%' || lower(unaccent(${position})) || '%'
+                OR lower(unaccent(p.related_event)) LIKE
+                    '%' || lower(unaccent(${position})) || '%'
+                OR lower(unaccent(s.name)) LIKE
+                    '%' || lower(unaccent(${position})) || '%'
+                )"""
+            )
+        where_clause = (
+            "WHERE " + " AND ".join(clauses) if clauses else ""
+        )
+        total = await self._pool.fetchval(
+            f"""
+            SELECT COUNT(*)
+            FROM disaster_service.people p
+            INNER JOIN disaster_service.sources s ON s.id = p.source_id
+            {where_clause}
+            """,
+            *filter_values,
+        )
+        query_values = [*filter_values, limit, offset]
+        rows = await self._pool.fetch(
+            f"""
+            {_ADMIN_PERSON_SELECT}
+            {where_clause}
+            ORDER BY p.created_at DESC, p.id DESC
+            LIMIT ${len(filter_values) + 1}
+            OFFSET ${len(filter_values) + 2}
+            """,
+            *query_values,
+        )
+        return [dict(row) for row in rows], int(total)
+
+    async def _admin_fetch_person(
+        self, connection, person_id: UUID
+    ) -> dict | None:
+        row = await connection.fetchrow(
+            f"{_ADMIN_PERSON_SELECT} WHERE p.id = $1", person_id
+        )
+        return dict(row) if row is not None else None
+
+    async def admin_hide_person(
+        self, person_id: UUID, hidden_by: str
+    ) -> dict | None:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                updated = await connection.fetchrow(
+                    """
+                    UPDATE disaster_service.people
+                    SET hidden_at = NOW(), hidden_by = $2,
+                        updated_at = NOW()
+                    WHERE id = $1 AND hidden_at IS NULL
+                    RETURNING missing_person_case_id
+                    """,
+                    person_id,
+                    hidden_by,
+                )
+                if updated is None:
+                    # Inexistente u oculto previamente: devolver el
+                    # estado actual hace la operación idempotente.
+                    return await self._admin_fetch_person(
+                        connection, person_id
+                    )
+                case_id = updated["missing_person_case_id"]
+                if case_id is not None:
+                    # El caso vinculado sale del buscador y la ficha; su
+                    # punto del mapa se retira (recreable al restaurar).
+                    await connection.execute(
+                        """
+                        UPDATE disaster_service.missing_person_cases
+                        SET publication_status = 'withdrawn',
+                            updated_at = NOW()
+                        WHERE id = $1
+                        """,
+                        case_id,
+                    )
+                    await connection.execute(
+                        _ADMIN_CASE_MAP_POINT_HIDE_SQL, case_id
+                    )
+                return await self._admin_fetch_person(
+                    connection, person_id
+                )
+
+    async def admin_restore_person(self, person_id: UUID) -> dict | None:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                restored = await connection.fetchrow(
+                    """
+                    UPDATE disaster_service.people
+                    SET hidden_at = NULL, hidden_by = NULL,
+                        updated_at = NOW()
+                    WHERE id = $1 AND hidden_at IS NOT NULL
+                    RETURNING missing_person_case_id
+                    """,
+                    person_id,
+                )
+                if restored is None:
+                    return await self._admin_fetch_person(
+                        connection, person_id
+                    )
+                case_id = restored["missing_person_case_id"]
+                if case_id is not None:
+                    await connection.execute(
+                        """
+                        UPDATE disaster_service.missing_person_cases
+                        SET publication_status = 'published',
+                            updated_at = NOW()
+                        WHERE id = $1
+                        """,
+                        case_id,
+                    )
+                    point_id = await connection.fetchval(
+                        _ADMIN_CASE_MAP_POINT_RESTORE_SQL, case_id
+                    )
+                    if point_id is not None:
+                        await connection.execute(
+                            """
+                            UPDATE disaster_service.missing_person_cases
+                            SET map_point_id = $2, updated_at = NOW()
+                            WHERE id = $1
+                            """,
+                            case_id,
+                            point_id,
+                        )
+                return await self._admin_fetch_person(
+                    connection, person_id
+                )
+
+    async def admin_update_person(
+        self, person_id: UUID, fields: dict
+    ) -> dict | str | None:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                current = await connection.fetchrow(
+                    """
+                    SELECT missing_person_case_id
+                    FROM disaster_service.people
+                    WHERE id = $1
+                    """,
+                    person_id,
+                )
+                if current is None:
+                    return None
+                case_id = current["missing_person_case_id"]
+                # Con caso vinculado el estado lo derivan las novedades
+                # (CHG-107/120/122/124): una edición manual sería
+                # pisoteada por la siguiente novedad.
+                if fields.get("status") is not None and case_id is not None:
+                    return "status_locked"
+                assignments: list[str] = []
+                values: list[object] = []
+                for column in (
+                    "display_name",
+                    "location",
+                    "related_event",
+                    "status",
+                ):
+                    value = fields.get(column)
+                    if value is None:
+                        continue
+                    values.append(value)
+                    if column == "status":
+                        assignments.append(
+                            f"status = ${len(values)}"
+                            "::disaster_service.human_status"
+                        )
+                    else:
+                        assignments.append(f"{column} = ${len(values)}")
+                if assignments:
+                    values.append(person_id)
+                    await connection.execute(
+                        f"""
+                        UPDATE disaster_service.people
+                        SET {", ".join(assignments)},
+                            updated_at = NOW()
+                        WHERE id = ${len(values)}
+                        """,
+                        *values,
+                    )
+                display_name = fields.get("display_name")
+                if display_name is not None and case_id is not None:
+                    # El nombre viaja al caso y a su punto del mapa para
+                    # que buscador, ficha y mapa no se contradigan.
+                    await connection.execute(
+                        """
+                        UPDATE disaster_service.missing_person_cases
+                        SET display_name = $2, updated_at = NOW()
+                        WHERE id = $1
+                        """,
+                        case_id,
+                        display_name,
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE disaster_service.operational_map_points p
+                        SET title = $2, updated_at = NOW()
+                        FROM disaster_service.missing_person_cases mc
+                        WHERE mc.id = $1 AND p.id = mc.map_point_id
+                        """,
+                        case_id,
+                        display_name,
+                    )
+                return await self._admin_fetch_person(
+                    connection, person_id
+                )
+
     # CHG-082 — Huella barata de cambios de la portada: cambia cuando
     # entra o se modifica cualquier registro visible en dashboards o
     # mapa; la web la sondea para refrescar al instante.
@@ -825,6 +1133,10 @@ class PostgresDisasterRepository:
                  FROM disaster_service.person_status_reports),
                 (SELECT COUNT(*) FROM disaster_service.people),
                 (SELECT COALESCE(MAX(created_at)::text, '')
+                 FROM disaster_service.people),
+                -- CHG-154: ocultar/editar por el admin también
+                -- refresca portada y mapa en vivo.
+                (SELECT COALESCE(MAX(updated_at)::text, '')
                  FROM disaster_service.people),
                 (SELECT COUNT(*) FROM disaster_service.aid_locations),
                 (SELECT COALESCE(MAX(updated_at)::text, '')
@@ -867,22 +1179,39 @@ class PostgresDisasterRepository:
             INNER JOIN disaster_service.sources s ON s.id = p.source_id
             WHERE ST_Y(p.location::geometry) BETWEEN -90 AND 90
               AND ST_X(p.location::geometry) BETWEEN -180 AND 180
+              -- CHG-153: los 4 tipos logísticos ya no salen de esta
+              -- tabla; se proyectan desde aid_locations (abajo). Se
+              -- compara como texto: el enum operational_map_category
+              -- no contiene los dos kinds nuevos.
+              AND p.category::text NOT IN (
+                  'collection_center', 'collection_point',
+                  'receiver_center', 'distribution_point'
+              )
             ORDER BY p.updated_at DESC
             LIMIT $1
             """,
             limit,
         )
-        points = [
-            OperationalMapPoint(
+        # CHG-153: puntos logísticos desde aid_locations. Solo válidos,
+        # visibles, con coordenadas y NO huérfanos (un dependiente exige
+        # su centro padre; los independientes siempre).
+        logistics = await self._pool.fetch(
+            _LOGISTICS_MAP_PROJECTION_SQL,
+            limit,
+        )
+
+        def _row_point(row: dict, precision: str) -> OperationalMapPoint:
+            return OperationalMapPoint(
                 id=row["id"],
                 category=row["category"],
                 title=row["title"],
                 location_label=row["location_label"],
                 latitude=row["latitude"],
                 longitude=row["longitude"],
-                coordinate_precision=row["coordinate_precision"],
+                coordinate_precision=row.get("coordinate_precision")
+                or precision,
                 verification_status=row["verification_status"],
-                related_disaster_id=row["related_disaster_id"],
+                related_disaster_id=row.get("related_disaster_id"),
                 description=row["description"],
                 source=SourceReference(
                     name=row["source_name"],
@@ -891,10 +1220,15 @@ class PostgresDisasterRepository:
                 ),
                 updated_at=row["updated_at"],
             )
-            for row in rows
+
+        merged = [_row_point(row, "exact") for row in rows] + [
+            _row_point(row, "exact") for row in logistics
         ]
-        operational = bool(rows) and all(
-            row["data_classification"] == "operational" for row in rows
+        merged.sort(key=lambda point: point.updated_at, reverse=True)
+        points = merged[:limit]
+        all_rows = list(rows) + list(logistics)
+        operational = bool(all_rows) and all(
+            row["data_classification"] == "operational" for row in all_rows
         )
         classification: DataClassification = (
             "operational" if operational else "demonstrative"
@@ -933,6 +1267,8 @@ class PostgresDisasterRepository:
                 INNER JOIN disaster_service.sources s
                     ON s.id = p.source_id
                 WHERE pr.visibility = 'published'
+                  -- CHG-154: los ocultos por el admin no se dibujan.
+                  AND p.hidden_at IS NULL
                   AND (
                     $5::text[] IS NULL
                     OR p.status::text = ANY($5::text[])
@@ -1022,7 +1358,8 @@ class PostgresDisasterRepository:
             """
             SELECT p.status::text AS status, COUNT(*)::int AS count
             FROM disaster_service.people p
-            WHERE (
+            WHERE p.hidden_at IS NULL
+            AND (
                 $1::text[] IS NULL
                 OR p.status::text = ANY($1::text[])
             )
@@ -2072,6 +2409,244 @@ class PostgresDisasterRepository:
                     False,
                 )
         return _contribution_receipt(row), True
+
+    async def create_aid_location(
+        self,
+        *,
+        idempotency_key: str,
+        kind: str,
+        name: str,
+        location_label: str,
+        municipality: str,
+        department: str,
+        latitude: float | None,
+        longitude: float | None,
+        description: str | None,
+        schedule: str | None,
+        contact: str | None,
+        parent_id: UUID | None,
+        accepted_supplies: list[str],
+        operational_status: str,
+        created_by_account_id: UUID | None,
+    ) -> tuple[dict, bool] | str:
+        """CHG-153: alta de un punto logístico con validación de
+        dependencia y ciudad server-side.
+
+        Devuelve (fila, created) o un código de error str:
+        `parent_not_found` | `parent_wrong_kind` | `parent_other_city`.
+        El reintento idempotente devuelve la fila original con
+        created=False.
+        """
+        expected_parent_kind = AID_LOCATION_PARENT_KIND.get(kind)
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                if parent_id is not None:
+                    parent = await connection.fetchrow(
+                        """
+                        SELECT kind::text AS kind, municipality
+                        FROM disaster_service.aid_locations
+                        WHERE id = $1
+                        """,
+                        parent_id,
+                    )
+                    if parent is None:
+                        return "parent_not_found"
+                    if parent["kind"] != expected_parent_kind:
+                        return "parent_wrong_kind"
+                    same_city = await connection.fetchval(
+                        """
+                        SELECT unaccent(lower(btrim($1)))
+                             = unaccent(lower(btrim($2)))
+                        """,
+                        parent["municipality"],
+                        municipality,
+                    )
+                    if not same_city:
+                        return "parent_other_city"
+
+                source_id = await connection.fetchval(
+                    """
+                    SELECT id FROM disaster_service.sources
+                    WHERE name = $1 AND source_type = 'citizen'
+                    LIMIT 1
+                    """,
+                    CITIZEN_LOGISTICS_SOURCE_NAME,
+                )
+                if source_id is None:
+                    source_id = await connection.fetchval(
+                        """
+                        INSERT INTO disaster_service.sources
+                            (name, source_type)
+                        VALUES ($1, 'citizen')
+                        RETURNING id
+                        """,
+                        CITIZEN_LOGISTICS_SOURCE_NAME,
+                    )
+
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO disaster_service.aid_locations (
+                        idempotency_key, created_by_account_id, kind,
+                        name, location_label, municipality, department,
+                        latitude, longitude, description, schedule,
+                        contact, parent_id, accepted_supplies,
+                        operational_status, source_id, publication_status
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                        $12, $13, $14, $15, $16, 'published'
+                    )
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                    RETURNING id, kind::text AS kind,
+                              operational_status::text AS operational_status,
+                              created_at
+                    """,
+                    idempotency_key,
+                    created_by_account_id,
+                    kind,
+                    name,
+                    location_label,
+                    municipality,
+                    department,
+                    latitude,
+                    longitude,
+                    description,
+                    schedule,
+                    contact,
+                    parent_id,
+                    accepted_supplies,
+                    operational_status,
+                    source_id,
+                )
+                if row is not None:
+                    return dict(row), True
+                existing = await connection.fetchrow(
+                    """
+                    SELECT id, kind::text AS kind,
+                           operational_status::text AS operational_status,
+                           created_at
+                    FROM disaster_service.aid_locations
+                    WHERE idempotency_key = $1
+                    """,
+                    idempotency_key,
+                )
+                return dict(existing), False
+
+    async def list_aid_location_parent_candidates(
+        self,
+        *,
+        kind: str,
+        municipality: str,
+    ) -> list[dict] | None:
+        """CHG-153: centros válidos para asociar un punto dependiente.
+
+        `kind` es el tipo DEPENDIENTE (recolección/distribución); se
+        listan centros del tipo padre que exige, publicados, no
+        inactivos y de la misma ciudad (comparación sin tildes, como la
+        validación del alta). Devuelve None si el tipo no es
+        dependiente.
+        """
+        expected_parent_kind = AID_LOCATION_PARENT_KIND.get(kind)
+        if expected_parent_kind is None:
+            return None
+        rows = await self._pool.fetch(
+            """
+            SELECT id, name, location_label AS address, municipality,
+                   department,
+                   operational_status::text AS operational_status
+            FROM disaster_service.aid_locations
+            WHERE kind = $1
+              AND publication_status = 'published'
+              AND operational_status <> 'inactive'
+              AND unaccent(lower(btrim(municipality)))
+                  = unaccent(lower(btrim($2)))
+            ORDER BY name
+            LIMIT 50
+            """,
+            expected_parent_kind,
+            municipality,
+        )
+        return [dict(row) for row in rows]
+
+    async def create_aid_location_report(
+        self,
+        *,
+        idempotency_key: str,
+        location_id: UUID,
+        actor_kind: str,
+        account_id: UUID | None,
+        denouncer_key: str,
+        reason_encrypted: bytes | None,
+    ) -> dict | None:
+        """CHG-153: registra una denuncia (dedup por denunciante) y, si
+        el lugar es un centro de acopio con >= 10 denunciantes distintos
+        vivos, lo pasa a `under_observation`. Devuelve el conteo y si
+        quedó en observación, o None si el lugar no existe.
+        """
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                target = await connection.fetchrow(
+                    """
+                    SELECT kind::text AS kind
+                    FROM disaster_service.aid_locations
+                    WHERE id = $1
+                    """,
+                    location_id,
+                )
+                if target is None:
+                    return None
+                await connection.execute(
+                    """
+                    INSERT INTO disaster_service.aid_location_reports (
+                        idempotency_key, location_id, actor_kind,
+                        account_id, denouncer_key, reason_encrypted
+                    ) VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (location_id, denouncer_key) DO NOTHING
+                    """,
+                    idempotency_key,
+                    location_id,
+                    actor_kind,
+                    account_id,
+                    denouncer_key,
+                    reason_encrypted,
+                )
+                count = int(
+                    await connection.fetchval(
+                        _AID_LOCATION_REPORTERS_COUNT_SQL, location_id
+                    )
+                )
+                # §12: solo los centros de acopio saltan a observación
+                # por umbral; recolección/distribución no.
+                under_observation = False
+                if (
+                    target["kind"] in ("collection_center", "receiver_center")
+                    and count >= AID_LOCATION_REPORT_THRESHOLD
+                ):
+                    await connection.execute(
+                        """
+                        UPDATE disaster_service.aid_locations
+                        SET operational_status = 'under_observation',
+                            updated_at = NOW()
+                        WHERE id = $1
+                          AND operational_status <> 'under_observation'
+                        """,
+                        location_id,
+                    )
+                    under_observation = True
+                else:
+                    current = await connection.fetchval(
+                        """
+                        SELECT operational_status::text
+                        FROM disaster_service.aid_locations
+                        WHERE id = $1
+                        """,
+                        location_id,
+                    )
+                    under_observation = current == "under_observation"
+        return {
+            "id": location_id,
+            "reports_count": count,
+            "under_observation": under_observation,
+        }
 
     async def create_aid_location_rating(
         self,
@@ -5003,3 +5578,73 @@ def _contribution_receipt(row) -> CommunityContributionReceipt:
         actor_kind=row["actor_kind"],
         received_at=row["received_at"],
     )
+
+
+# CHG-154 — Proyección administrativa de un registro de persona: la
+# misma fila para listar y para devolver tras cada mutación.
+_ADMIN_PERSON_SELECT = """
+    SELECT
+        p.id,
+        p.display_name,
+        p.status,
+        p.location,
+        p.related_event,
+        p.latitude,
+        p.longitude,
+        p.missing_person_case_id,
+        p.created_at,
+        p.updated_at,
+        p.hidden_at,
+        p.hidden_by,
+        s.name AS source_name,
+        s.source_type,
+        s.url AS source_url
+    FROM disaster_service.people p
+    INNER JOIN disaster_service.sources s ON s.id = p.source_id
+"""
+
+# CHG-154 — Ocultar retira también el punto del mapa del caso vinculado
+# (mecanismo CHG-081, aquí por id de caso); restaurar lo recrea desde
+# el reporte si hay coordenadas y el caso quedó sin punto.
+_ADMIN_CASE_MAP_POINT_HIDE_SQL = """
+    WITH target AS (
+        SELECT mc.id AS case_id, mc.map_point_id AS point_id
+        FROM disaster_service.missing_person_cases mc
+        WHERE mc.id = $1
+          AND mc.map_point_id IS NOT NULL
+    ), unlink AS (
+        UPDATE disaster_service.missing_person_cases mc
+        SET map_point_id = NULL, updated_at = NOW()
+        FROM target
+        WHERE mc.id = target.case_id
+    )
+    DELETE FROM disaster_service.operational_map_points p
+    USING target
+    WHERE p.id = target.point_id
+"""
+
+_ADMIN_CASE_MAP_POINT_RESTORE_SQL = """
+    INSERT INTO disaster_service.operational_map_points (
+        category, title, description, location_label, location,
+        coordinate_precision, verification_status, source_id,
+        data_classification, updated_at
+    )
+    SELECT 'missing_person', mc.display_name,
+           'Vista por última vez en ' || mc.last_seen_area,
+           mc.municipality || ', ' || mc.department,
+           ST_SetSRID(
+               ST_MakePoint(
+                   r.last_seen_longitude, r.last_seen_latitude
+               ),
+               4326
+           )::geography,
+           'exact', 'unverified', mc.source_id, 'operational', NOW()
+    FROM disaster_service.missing_person_cases mc
+    INNER JOIN disaster_service.missing_person_reports r
+        ON mc.public_case_code = r.public_case_code
+    WHERE mc.id = $1
+      AND mc.map_point_id IS NULL
+      AND r.last_seen_latitude IS NOT NULL
+      AND r.last_seen_longitude IS NOT NULL
+    RETURNING id
+"""

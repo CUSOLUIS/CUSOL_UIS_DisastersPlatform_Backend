@@ -103,6 +103,9 @@ OperationalMapCategory = Literal[
     "temporary_shelter",
     # CHG-069 — alertas ciudadanas de voluntariado.
     "volunteers_needed",
+    # CHG-153 — logística humanitaria.
+    "receiver_center",
+    "distribution_point",
 ]
 CoordinatePrecision = Literal["exact", "approximate", "municipality"]
 DataClassification = Literal["demonstrative", "operational"]
@@ -190,6 +193,9 @@ class OperationalMapSummary(ApiModel):
     temporary_shelter: int = Field(ge=0, default=0)
     # CHG-069: alertas de voluntariado activas.
     volunteers_needed: int = Field(ge=0, default=0)
+    # CHG-153: logística (contadores del backend).
+    receiver_center: int = Field(ge=0, default=0)
+    distribution_point: int = Field(ge=0, default=0)
 
 
 class OperationalMapOverview(ApiModel):
@@ -336,13 +342,29 @@ class MissingPersonDirectoryCard(ApiModel):
     data_classification: DataClassification
 
 
+# CHG-153 — logística humanitaria (espejo del contrato).
+AidLocationKind = Literal[
+    "collection_center",
+    "collection_point",
+    "receiver_center",
+    "distribution_point",
+]
+AidLocationOperationalStatus = Literal[
+    "open", "closed", "at_capacity", "under_observation", "inactive"
+]
+
+
 class AidLocationDirectoryCard(ApiModel):
-    kind: Literal["collection_center", "collection_point"]
+    kind: AidLocationKind
     id: UUID
     name: str = Field(min_length=1, max_length=180)
     location_label: str = Field(min_length=1, max_length=300)
     municipality: str = Field(min_length=1, max_length=100)
     department: str = Field(min_length=1, max_length=100)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    operational_status: AidLocationOperationalStatus = "open"
+    parent_id: UUID | None = None
     verification_status: VerificationStatus
     availability_status: AidLocationAvailability
     open_now: bool | None = None
@@ -352,6 +374,35 @@ class AidLocationDirectoryCard(ApiModel):
     source: SourceReference
     updated_at: datetime
     data_classification: DataClassification
+
+
+# CHG-153 — Recibos de alta y de denuncia (espejo del contrato).
+class AidLocationReceipt(ApiModel):
+    id: UUID
+    kind: AidLocationKind
+    operational_status: AidLocationOperationalStatus
+    created_at: datetime
+
+
+class AidLocationReportReceipt(ApiModel):
+    location_id: UUID
+    reports_count: int = Field(ge=1)
+    under_observation: bool
+
+
+# CHG-153 — Candidatos a centro asociado (espejo del contrato).
+class AidLocationParentCandidate(ApiModel):
+    id: UUID
+    name: str = Field(min_length=1, max_length=180)
+    address: str = Field(min_length=1, max_length=300)
+    municipality: str = Field(min_length=1, max_length=100)
+    department: str = Field(min_length=1, max_length=100)
+    operational_status: AidLocationOperationalStatus
+
+
+class AidLocationParentCandidatesResponse(ApiModel):
+    items: list[AidLocationParentCandidate]
+    total: int = Field(ge=0)
 
 
 # CHG-044 — Ofertas comunitarias (espejo del contrato).
@@ -658,6 +709,32 @@ class AdminMutationReceipt(ApiModel):
     version: int = Field(ge=1)
     audit_event_id: UUID
     updated_at: datetime
+
+
+# CHG-154 — Gestión admin de registros de personas (espejo del
+# contrato): ocultamiento reversible y edición acotada.
+AdminPeopleVisibility = Literal["visible", "hidden", "all"]
+
+
+class AdminPersonRecord(ApiModel):
+    id: UUID
+    display_name: str = Field(min_length=1)
+    status: HumanStatus
+    location: str = Field(min_length=1)
+    related_event: str = Field(min_length=1)
+    latitude: float | None = None
+    longitude: float | None = None
+    has_linked_case: bool
+    source: SourceReference
+    created_at: datetime
+    updated_at: datetime
+    hidden_at: datetime | None = None
+    hidden_by: str | None = None
+
+
+class AdminPeoplePage(ApiModel):
+    items: list[AdminPersonRecord]
+    total: int = Field(ge=0)
 
 
 class AdminEvidenceAccessGrant(ApiModel):

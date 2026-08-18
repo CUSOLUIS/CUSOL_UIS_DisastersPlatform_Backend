@@ -33,6 +33,10 @@ from .models import (
     AdminField,
     AdminModerationStatus,
     AdminMutationReceipt,
+    AdminPeoplePage,
+    AdminPeopleVisibility,
+    AdminPersonRecord,
+    AdminPersonUpdateInput,
     AdminSubmissionDetail,
     AdminSubmissionEditInput,
     AdminSubmissionKind,
@@ -40,7 +44,13 @@ from .models import (
     AdminSubmissionSummary,
     AdminVersionedReasonInput,
     AidLocationAvailability,
+    AidLocationInput,
+    AidLocationParentCandidate,
+    AidLocationParentCandidatesResponse,
     AidLocationRatingInput,
+    AidLocationReceipt,
+    AidLocationReportInput,
+    AidLocationReportReceipt,
     ChangeSignal,
     CommunityContributionReceipt,
     DisasterEventAutocompleteResponse,
@@ -1063,6 +1073,9 @@ def create_app(
             "community_meal": 0,
             "temporary_shelter": 0,
             "volunteers_needed": 0,
+            # CHG-153: logística (contadores del backend).
+            "receiver_center": 0,
+            "distribution_point": 0,
         }
         for item in items:
             by_category[item.category] += 1
@@ -1077,6 +1090,8 @@ def create_app(
                 community_meal=by_category["community_meal"],
                 temporary_shelter=by_category["temporary_shelter"],
                 volunteers_needed=by_category["volunteers_needed"],
+                receiver_center=by_category["receiver_center"],
+                distribution_point=by_category["distribution_point"],
             ),
             items=items,
             generated_at=datetime.now(UTC),
@@ -2029,6 +2044,195 @@ def create_app(
             public_status=public_status,
             items=items,
             total=len(items),
+        )
+
+    # CHG-153 — Candidatos a centro asociado para el formulario de alta
+    # de un punto dependiente (recolección/distribución).
+    @application.get(
+        "/internal/v1/aid-locations/parent-candidates",
+        response_model=AidLocationParentCandidatesResponse,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_aid_location_parent_candidates(
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        kind: Annotated[str, Query(min_length=1, max_length=40)],
+        municipality: Annotated[str, Query(min_length=1, max_length=100)],
+    ):
+        try:
+            rows = await data.list_aid_location_parent_candidates(
+                kind=kind, municipality=municipality
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Consulta no disponible",
+                "No fue posible listar los centros asociados.",
+            )
+        if rows is None:
+            return problem(
+                422,
+                "Tipo sin dependencia",
+                "Este tipo de punto no exige un centro asociado.",
+            )
+        return AidLocationParentCandidatesResponse(
+            items=[
+                AidLocationParentCandidate(**row) for row in rows
+            ],
+            total=len(rows),
+        )
+
+    # CHG-153 — Alta de un punto logístico (JSON). La dependencia y la
+    # ciudad se validan en el servicio (no se confía en el cliente).
+    @application.post(
+        "/internal/v1/aid-locations",
+        status_code=201,
+        response_model=AidLocationReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_aid_location(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        _actor_kind, account_id = actor
+
+        body = await request.body()
+        try:
+            payload = AidLocationInput.model_validate_json(body)
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+
+        try:
+            result = await data.create_aid_location(
+                idempotency_key=idempotency_key,
+                kind=payload.kind,
+                name=payload.name.strip(),
+                location_label=payload.address.strip(),
+                municipality=payload.municipality.strip(),
+                department=payload.department.strip(),
+                latitude=payload.latitude,
+                longitude=payload.longitude,
+                description=(
+                    payload.description.strip()
+                    if payload.description
+                    else None
+                ),
+                schedule=(
+                    payload.schedule.strip() if payload.schedule else None
+                ),
+                contact=(
+                    payload.contact.strip() if payload.contact else None
+                ),
+                parent_id=payload.parent_id,
+                accepted_supplies=list(payload.accepted_supplies),
+                operational_status=payload.operational_status,
+                created_by_account_id=account_id,
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible registrar el punto; ningún dato quedó "
+                "publicado.",
+            )
+
+        if isinstance(result, str):
+            messages = {
+                "parent_not_found": (
+                    "El centro asociado no existe."
+                ),
+                "parent_wrong_kind": (
+                    "El centro asociado no es del tipo requerido para "
+                    "este punto."
+                ),
+                "parent_other_city": (
+                    "El centro asociado pertenece a otra ciudad; elige "
+                    "uno de la misma ciudad."
+                ),
+            }
+            return problem(
+                422,
+                "Centro asociado inválido",
+                messages.get(result, "Centro asociado inválido."),
+                problem_type="validation-error",
+            )
+
+        row, _created = result
+        return AidLocationReceipt(
+            id=row["id"],
+            kind=row["kind"],
+            operational_status=row["operational_status"],
+            created_at=row["created_at"],
+        )
+
+    # CHG-153 — Denuncia sobre un lugar de ayuda (JSON). Dual anónimo/
+    # autenticado; el gateway resuelve la clave de denunciante
+    # (`x-denouncer-key`) para el dedup y el umbral.
+    @application.post(
+        "/internal/v1/aid-locations/{location_id}/reports",
+        status_code=202,
+        response_model=AidLocationReportReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_aid_location_report(
+        location_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        denouncer_key = request.headers.get("x-denouncer-key", "").strip()
+        if not denouncer_key:
+            return problem(
+                422,
+                "Denunciante no resuelto",
+                "Falta la clave de denunciante resuelta por el gateway.",
+            )
+
+        body = await request.body()
+        try:
+            payload = AidLocationReportInput.model_validate_json(body)
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+
+        try:
+            result = await data.create_aid_location_report(
+                idempotency_key=idempotency_key,
+                location_id=location_id,
+                actor_kind=actor_kind,
+                account_id=account_id,
+                denouncer_key=denouncer_key,
+                reason_encrypted=encrypt(payload.reason.strip()),
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible registrar la denuncia.",
+            )
+        if result is None:
+            return problem(
+                404,
+                "Lugar no disponible",
+                "El lugar no existe.",
+            )
+        return AidLocationReportReceipt(
+            location_id=result["id"],
+            reports_count=result["reports_count"],
+            under_observation=result["under_observation"],
         )
 
     @application.post(
@@ -3603,6 +3807,148 @@ def create_app(
                 "generatedAt": datetime.now(UTC).isoformat(),
             }
         )
+
+    # CHG-154 — Gestión admin de registros de personas: listar (con
+    # ocultos), ocultar (reversible), restaurar y editar. Nada se
+    # borra: el borrado definitivo será un apartado futuro.
+    def admin_person_model(row: dict) -> AdminPersonRecord:
+        return AdminPersonRecord(
+            id=row["id"],
+            display_name=row["display_name"],
+            status=row["status"],
+            location=row["location"],
+            related_event=row["related_event"],
+            latitude=row["latitude"],
+            longitude=row["longitude"],
+            has_linked_case=row["missing_person_case_id"] is not None,
+            source=SourceReference(
+                name=row["source_name"],
+                source_type=row["source_type"],
+                url=row["source_url"],
+            ),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            hidden_at=row["hidden_at"],
+            hidden_by=row["hidden_by"],
+        )
+
+    @application.get(
+        "/internal/v1/admin/people",
+        response_model=AdminPeoplePage,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_list_people(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        statuses: Annotated[list[HumanStatus] | None, Query()] = None,
+        q: Annotated[
+            str | None, Query(min_length=2, max_length=100)
+        ] = None,
+        visibility: Annotated[AdminPeopleVisibility, Query()] = "visible",
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        rows, total = await data.admin_list_people(
+            statuses, q, visibility, limit, offset
+        )
+        return AdminPeoplePage(
+            items=[admin_person_model(row) for row in rows],
+            total=total,
+        )
+
+    @application.patch(
+        "/internal/v1/admin/people/{person_id}",
+        response_model=AdminPersonRecord,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_update_person(
+        person_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        body = await request.body()
+        try:
+            payload = AdminPersonUpdateInput.model_validate_json(body)
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        fields = payload.model_dump(by_alias=False, exclude_none=True)
+        if not fields:
+            return problem(
+                422,
+                "Nada que modificar",
+                "Envía al menos un campo a modificar.",
+            )
+        result = await data.admin_update_person(person_id, fields)
+        if result is None:
+            return problem(
+                404,
+                "Registro no disponible",
+                "El registro de persona no existe.",
+            )
+        if result == "status_locked":
+            return problem(
+                409,
+                "Estado gobernado por novedades",
+                "Este registro tiene caso ciudadano vinculado: su "
+                "estado lo derivan las novedades verificadas y no se "
+                "edita a mano.",
+            )
+        return admin_person_model(result)
+
+    @application.post(
+        "/internal/v1/admin/people/{person_id}/hide",
+        response_model=AdminPersonRecord,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_hide_person(
+        person_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        _account_id, display_name = actor
+        result = await data.admin_hide_person(person_id, display_name)
+        if result is None:
+            return problem(
+                404,
+                "Registro no disponible",
+                "El registro de persona no existe.",
+            )
+        return admin_person_model(result)
+
+    @application.post(
+        "/internal/v1/admin/people/{person_id}/restore",
+        response_model=AdminPersonRecord,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_restore_person(
+        person_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        result = await data.admin_restore_person(person_id)
+        if result is None:
+            return problem(
+                404,
+                "Registro no disponible",
+                "El registro de persona no existe.",
+            )
+        return admin_person_model(result)
 
     @application.get(
         "/internal/v1/admin/submissions",
