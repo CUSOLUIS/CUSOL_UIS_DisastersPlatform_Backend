@@ -36,6 +36,19 @@ from . import moderation, offers
 # el instante público del último avistamiento.
 _BOGOTA_TZ = timezone(timedelta(hours=-5))
 
+# CHG-148: el contador «personas atendiendo» suma atenciones
+# autenticadas (help_request_attenders) y voluntarios anónimos
+# (help_request_volunteers).
+_COMBINED_ATTENDERS_COUNT_SQL = """
+    SELECT
+        (SELECT COUNT(*)
+         FROM disaster_service.help_request_attenders
+         WHERE help_request_id = $1)
+        + (SELECT COUNT(*)
+           FROM disaster_service.help_request_volunteers
+           WHERE help_request_id = $1)
+"""
+
 
 @dataclass(frozen=True)
 class HumanMapCell:
@@ -3526,9 +3539,14 @@ class PostgresDisasterRepository:
                 hr.notification_radius_km,
                 hr.created_at,
                 hr.expires_at,
-                (SELECT COUNT(*)
-                 FROM disaster_service.help_request_attenders a
-                 WHERE a.help_request_id = hr.id) AS attenders_count,
+                -- CHG-148: el contador suma atenciones autenticadas y
+                -- voluntarios anónimos.
+                ((SELECT COUNT(*)
+                  FROM disaster_service.help_request_attenders a
+                  WHERE a.help_request_id = hr.id)
+                 + (SELECT COUNT(*)
+                    FROM disaster_service.help_request_volunteers v
+                    WHERE v.help_request_id = hr.id)) AS attenders_count,
                 ($3::uuid IS NOT NULL AND EXISTS (
                     SELECT 1
                     FROM disaster_service.help_request_attenders a
@@ -3584,14 +3602,71 @@ class PostgresDisasterRepository:
                     account_id,
                 )
                 count = await connection.fetchval(
-                    """
-                    SELECT COUNT(*)
-                    FROM disaster_service.help_request_attenders
-                    WHERE help_request_id = $1
-                    """,
+                    _COMBINED_ATTENDERS_COUNT_SQL,
                     request_id,
                 )
         return {"id": request_id, "attenders_count": int(count)}
+
+    async def create_help_request_volunteer(
+        self,
+        *,
+        idempotency_key: str,
+        request_id: UUID,
+        name_encrypted: bytes,
+        phone_encrypted: bytes | None,
+        email_encrypted: bytes | None,
+        photo_storage_key: str | None,
+        photo_derived_storage_key: str | None,
+        photo_content_type: str | None,
+    ) -> tuple[dict, bool] | None:
+        """CHG-148: registra un voluntario anónimo (PII ya cifrada).
+
+        Devuelve (payload, created). `created=False` en el reintento
+        idempotente (mismos datos, sin duplicar ni recontar). None si
+        la solicitud no existe o ya expiró.
+        """
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                active = await connection.fetchval(
+                    """
+                    SELECT 1
+                    FROM disaster_service.help_requests
+                    WHERE id = $1 AND expires_at > NOW()
+                    """,
+                    request_id,
+                )
+                if active is None:
+                    return None
+                inserted = await connection.fetchval(
+                    """
+                    INSERT INTO
+                        disaster_service.help_request_volunteers (
+                            idempotency_key, help_request_id,
+                            name_encrypted, phone_encrypted,
+                            email_encrypted, photo_storage_key,
+                            photo_derived_storage_key, photo_content_type
+                        )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                    RETURNING id
+                    """,
+                    idempotency_key,
+                    request_id,
+                    name_encrypted,
+                    phone_encrypted,
+                    email_encrypted,
+                    photo_storage_key,
+                    photo_derived_storage_key,
+                    photo_content_type,
+                )
+                count = await connection.fetchval(
+                    _COMBINED_ATTENDERS_COUNT_SQL,
+                    request_id,
+                )
+        return {
+            "id": request_id,
+            "attenders_count": int(count),
+        }, inserted is not None
 
     async def get_help_request_photo(
         self, request_id: UUID
@@ -3632,9 +3707,14 @@ class PostgresDisasterRepository:
                 hr.created_at,
                 hr.expires_at,
                 hr.expires_at <= NOW() AS expired,
-                (SELECT COUNT(*)
-                 FROM disaster_service.help_request_attenders a
-                 WHERE a.help_request_id = hr.id) AS attenders_count,
+                -- CHG-148: el contador suma atenciones autenticadas y
+                -- voluntarios anónimos.
+                ((SELECT COUNT(*)
+                  FROM disaster_service.help_request_attenders a
+                  WHERE a.help_request_id = hr.id)
+                 + (SELECT COUNT(*)
+                    FROM disaster_service.help_request_volunteers v
+                    WHERE v.help_request_id = hr.id)) AS attenders_count,
                 hr.photo_derived_storage_key IS NOT NULL AS has_photo
             FROM disaster_service.help_requests hr
             ORDER BY hr.created_at DESC, hr.id DESC

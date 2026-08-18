@@ -1392,6 +1392,35 @@ class HelpRequestInput(ApiModel):
         return self
 
 
+# CHG-148 — Voluntario anónimo que se ofrece a atender una solicitud
+# desde el mapa. Solo datos personales del PROPIO voluntario (no de
+# terceros); privados, solo super_admin (DEC-148-01). El público solo
+# ve el contador que aumenta. La foto viaja en el multipart.
+class HelpRequestVolunteerInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    name: str = Field(min_length=1, max_length=160)
+    phone: str | None = Field(
+        default=None, max_length=PHONE_MAX_LENGTH, pattern=PHONE_PATTERN
+    )
+    email: str | None = Field(default=None, max_length=254)
+
+    @model_validator(mode="after")
+    def _name_is_readable(self):
+        # El nombre es texto real; no repetición ni cadena pegada. No se
+        # exigen varias palabras (un nombre puede ser uno solo).
+        try:
+            validate_community_text(self.name, "name", min_distinct_words=1)
+        except TextQualityError as error:
+            raise ValueError(str(error)) from error
+        return self
+
+
 class HelpRequestReceipt(ApiModel):
     id: UUID
     public_code: str

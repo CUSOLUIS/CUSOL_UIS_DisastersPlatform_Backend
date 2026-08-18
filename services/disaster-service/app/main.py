@@ -88,6 +88,7 @@ from .models import (
     AdminHelpRequestPage,
     HelpRequestAttendReceipt,
     HelpRequestInput,
+    HelpRequestVolunteerInput,
     HelpRequestPage,
     HelpRequestReceipt,
 )
@@ -3025,6 +3026,128 @@ def create_app(
                 "Solicitud no disponible",
                 "La solicitud no existe o ya expiró.",
             )
+        return HelpRequestAttendReceipt(
+            id=row["id"],
+            attenders_count=row["attenders_count"],
+            attending=True,
+        )
+
+    # CHG-148 — Voluntario ANÓNIMO desde el detalle del mapa: sin
+    # cuenta. Recoge solo datos personales del propio voluntario, los
+    # cifra (solo super_admin) y aumenta el contador. Reintento seguro
+    # por Idempotency-Key. Quien tiene cuenta usa /attend, no esto.
+    @application.post(
+        "/internal/v1/help-requests/{request_id}/volunteers",
+        response_model=HelpRequestAttendReceipt,
+        response_model_by_alias=True,
+        tags=["HelpRequests"],
+    )
+    async def volunteer_for_help_request(
+        request_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+
+        oversized = check_declared_length(request)
+        if oversized is not None:
+            return oversized
+
+        try:
+            form = await request.form()
+        except Exception:
+            return problem(
+                422,
+                "Formulario inválido",
+                "No fue posible interpretar el envío multipart.",
+            )
+
+        raw_payload = await read_payload_part(form)
+        if isinstance(raw_payload, JSONResponse):
+            return raw_payload
+        try:
+            payload = HelpRequestVolunteerInput.model_validate_json(
+                raw_payload
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+
+        prepared = await prepare_photo_parts(
+            form,
+            0,
+            1,
+            "El voluntario admite máximo una fotografía.",
+        )
+        if isinstance(prepared, JSONResponse):
+            return prepared
+
+        volunteer_id = uuid4()
+        saved_keys: list[str] = []
+
+        def cleanup() -> None:
+            for key in saved_keys:
+                object_storage.delete(key)
+
+        try:
+            stored = store_photos(
+                f"help-request-volunteers/{volunteer_id}",
+                prepared,
+                saved_keys,
+            )
+        except PhotoProcessingError:
+            cleanup()
+            return problem(
+                415,
+                "Fotografía no procesable",
+                "La fotografía no pudo validarse como imagen segura.",
+            )
+        except StorageUnavailableError:
+            cleanup()
+            return problem(
+                503,
+                "Almacenamiento no disponible",
+                "No fue posible resguardar la fotografía; el voluntario "
+                "no quedó registrado.",
+            )
+        photo = stored[0] if stored else None
+
+        try:
+            result = await data.create_help_request_volunteer(
+                idempotency_key=idempotency_key,
+                request_id=request_id,
+                name_encrypted=encrypt(payload.name.strip()),
+                phone_encrypted=encrypt(payload.phone),
+                email_encrypted=encrypt(payload.email),
+                photo_storage_key=photo.storage_key if photo else None,
+                photo_derived_storage_key=(
+                    photo.derived_storage_key if photo else None
+                ),
+                photo_content_type=(
+                    photo.content_type if photo else None
+                ),
+            )
+        except asyncpg.PostgresError:
+            cleanup()
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible registrar al voluntario; nada quedó "
+                "guardado.",
+            )
+
+        if result is None:
+            cleanup()
+            return problem(
+                404,
+                "Solicitud no disponible",
+                "La solicitud no existe o ya expiró.",
+            )
+        row, created = result
+        if not created:
+            # Reintento idempotente: los archivos de este intento sobran.
+            cleanup()
         return HelpRequestAttendReceipt(
             id=row["id"],
             attenders_count=row["attenders_count"],

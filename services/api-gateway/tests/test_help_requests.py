@@ -620,3 +620,68 @@ async def test_platform_reset_requires_super_admin():
         json={"confirm": "REINICIAR TODO"},
     )
     assert as_user.status_code == 403
+
+
+# CHG-148 — Voluntario anónimo: canal público (sin sesión), multipart,
+# reenvío al servicio interno y contador de vuelta.
+@pytest.mark.anyio
+async def test_volunteer_forwards_anonymously_and_returns_count():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["actor"] = request.headers.get("x-actor-kind")
+        seen["idempotency"] = request.headers.get("idempotency-key")
+        seen["cookie"] = request.headers.get("cookie")
+        seen["body"] = await request.aread()
+        return httpx.Response(200, json=ATTEND_RECEIPT)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        f"{PATH}/{REQUEST_ID}/volunteers",
+        headers=IDEMPOTENCY,
+        files=[
+            (
+                "payload",
+                (None, '{"name":"Maria"}', "application/json"),
+            ),
+        ],
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert response.json() == ATTEND_RECEIPT
+    assert seen["path"] == (
+        f"/internal/v1/help-requests/{REQUEST_ID}/volunteers"
+    )
+    assert seen["actor"] == "anonymous"
+    assert seen["idempotency"] == IDEMPOTENCY["Idempotency-Key"]
+
+
+@pytest.mark.anyio
+async def test_volunteer_requires_idempotency_key():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json=ATTEND_RECEIPT)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        f"{PATH}/{REQUEST_ID}/volunteers",
+        files=[("payload", (None, '{"name":"Maria"}', "application/json"))],
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 422
+    assert calls == []

@@ -2580,6 +2580,88 @@ def create_app(
                 title="Servicio de solicitudes no disponible",
             )
 
+    # CHG-148 — Voluntario ANÓNIMO de una solicitud: canal público (sin
+    # sesión), multipart con `payload` (+ foto opcional). Quien tiene
+    # cuenta usa /attend; esto es para quien no la tiene. El gateway
+    # reenvía tal cual; el disaster-service cifra la PII (super_admin) y
+    # aumenta el contador.
+    @application.post(
+        "/api/v1/help-requests/{request_id}/volunteers",
+        response_model=HelpRequestAttendReceipt,
+        response_model_by_alias=True,
+        responses={
+            404: {"description": "Solicitud inexistente o expirada"},
+            413: {"description": "Carga demasiado grande"},
+            415: {"description": "Fotografía no permitida"},
+            422: {"description": "Datos inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HelpRequests"],
+    )
+    async def volunteer_for_help_request(
+        request_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        if not help_request_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de solicitudes por minuto."
+            )
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        declared = request.headers.get("content-length")
+        if declared is not None and declared.isdigit():
+            if int(declared) > resolved_settings.max_report_body_bytes:
+                return problem_response(
+                    "El envío supera el máximo total permitido.",
+                    title="Carga demasiado grande",
+                    status_code=413,
+                    problem_type="payload-too-large",
+                )
+        # Canal público: la cuenta es opcional y jamás se exige sesión.
+        account = await resolve_optional_account(request, identity)
+        headers = {
+            "content-type": request.headers.get("content-type", ""),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": (
+                "authenticated" if account is not None else "anonymous"
+            ),
+        }
+        if account is not None:
+            headers["x-account-id"] = str(account.id)
+        try:
+            response = await upstream.post(
+                f"/internal/v1/help-requests/{request_id}/volunteers",
+                content=request.stream(),
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return HelpRequestAttendReceipt.model_validate(
+                response.json()
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible registrar al voluntario en este momento.",
+                title="Servicio de solicitudes no disponible",
+            )
+
     # CHG-125 — Fotografía pública de la solicitud: se reenvía tal
     # cual, con su tipo de contenido y su cabecera de caché (patrón
     # CHG-105).

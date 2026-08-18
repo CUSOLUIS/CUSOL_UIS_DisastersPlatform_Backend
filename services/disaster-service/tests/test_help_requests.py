@@ -34,6 +34,8 @@ class FakeHelpRequestRepository:
     def __init__(self):
         self.rows: dict[UUID, dict] = {}
         self.attenders: set[tuple[UUID, UUID]] = set()
+        # CHG-148: voluntarios anónimos (una fila por envío).
+        self.volunteers: list[dict] = []
         self.by_key: dict[str, UUID] = {}
         # CHG-138: (acción, resultado) de la auditoría admin.
         self.audit: list[tuple[str, str]] = []
@@ -188,11 +190,7 @@ class FakeHelpRequestRepository:
             page.append(
                 {
                     **row,
-                    "attenders_count": sum(
-                        1
-                        for rid, _aid in self.attenders
-                        if rid == row["id"]
-                    ),
+                    "attenders_count": self._attenders_count(row["id"]),
                     "attended_by_me": account_id is not None
                     and (row["id"], account_id) in self.attenders,
                     "has_photo": row["photo_derived_storage_key"]
@@ -201,15 +199,50 @@ class FakeHelpRequestRepository:
             )
         return page, len(active)
 
+    def _attenders_count(self, request_id: UUID) -> int:
+        # CHG-148: atenciones autenticadas + voluntarios anónimos.
+        authenticated = sum(
+            1 for rid, _aid in self.attenders if rid == request_id
+        )
+        anonymous = sum(
+            1 for v in self.volunteers if v["help_request_id"] == request_id
+        )
+        return authenticated + anonymous
+
     async def attend_help_request(self, request_id, account_id):
         row = self.rows.get(request_id)
         if row is None or not self._active(row):
             return None
         self.attenders.add((request_id, account_id))
-        count = sum(
-            1 for rid, _aid in self.attenders if rid == request_id
+        return {
+            "id": request_id,
+            "attenders_count": self._attenders_count(request_id),
+        }
+
+    async def create_help_request_volunteer(
+        self, *, idempotency_key, request_id, **kwargs
+    ):
+        row = self.rows.get(request_id)
+        if row is None or not self._active(row):
+            return None
+        already = any(
+            v["idempotency_key"] == idempotency_key for v in self.volunteers
         )
-        return {"id": request_id, "attenders_count": count}
+        if not already:
+            self.volunteers.append(
+                {
+                    "idempotency_key": idempotency_key,
+                    "help_request_id": request_id,
+                    **kwargs,
+                }
+            )
+        return (
+            {
+                "id": request_id,
+                "attenders_count": self._attenders_count(request_id),
+            },
+            not already,
+        )
 
     async def get_help_request_photo(self, request_id):
         row = self.rows.get(request_id)
@@ -654,6 +687,101 @@ async def test_attend_expired_request_is_not_found():
     )
 
     assert response.status_code == 404
+
+
+# --- Voluntario anónimo (CHG-148) ---
+
+
+def volunteer_payload(**overrides):
+    payload = {
+        "name": "María Restrepo",
+        "phone": "+57 300 123 4567",
+        "email": "maria@example.com",
+    }
+    payload.update(overrides)
+    return payload
+
+
+async def post_volunteer(app, request_id, payload=None, key="voluntario-anon-01"):
+    return await request_app(
+        app,
+        "POST",
+        f"/internal/v1/help-requests/{request_id}/volunteers",
+        data={
+            "payload": json.dumps(
+                payload if payload is not None else volunteer_payload()
+            )
+        },
+        headers={"Idempotency-Key": key},
+    )
+
+
+@pytest.mark.anyio
+async def test_volunteer_anonymous_increments_count():
+    repository = FakeHelpRequestRepository()
+    request_id = repository.seed()
+    app = help_app(repository=repository)
+
+    response = await post_volunteer(app, request_id)
+
+    assert response.status_code == 200
+    assert response.json()["attendersCount"] == 1
+    # La PII no viaja de vuelta: solo el contador.
+    assert "name" not in response.json()
+    assert len(repository.volunteers) == 1
+
+
+@pytest.mark.anyio
+async def test_volunteer_and_attend_combine_in_count():
+    repository = FakeHelpRequestRepository()
+    request_id = repository.seed()
+    app = help_app(repository=repository)
+
+    await request_app(
+        app,
+        "POST",
+        f"/internal/v1/help-requests/{request_id}/attend",
+        headers=AUTH_HEADERS,
+    )
+    response = await post_volunteer(app, request_id)
+
+    assert response.json()["attendersCount"] == 2
+
+
+@pytest.mark.anyio
+async def test_volunteer_is_idempotent():
+    repository = FakeHelpRequestRepository()
+    request_id = repository.seed()
+    app = help_app(repository=repository)
+
+    first = await post_volunteer(app, request_id, key="mismo-voluntario-01")
+    second = await post_volunteer(app, request_id, key="mismo-voluntario-01")
+
+    assert first.json()["attendersCount"] == 1
+    assert second.json()["attendersCount"] == 1
+    assert len(repository.volunteers) == 1
+
+
+@pytest.mark.anyio
+async def test_volunteer_on_expired_request_is_not_found():
+    repository = FakeHelpRequestRepository()
+    request_id = repository.seed(expired=True)
+    app = help_app(repository=repository)
+
+    response = await post_volunteer(app, request_id)
+
+    assert response.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_volunteer_rejects_blank_name():
+    repository = FakeHelpRequestRepository()
+    request_id = repository.seed()
+    app = help_app(repository=repository)
+
+    response = await post_volunteer(app, request_id, payload=volunteer_payload(name=""))
+
+    assert response.status_code == 422
 
 
 # --- Fotografía pública ---
