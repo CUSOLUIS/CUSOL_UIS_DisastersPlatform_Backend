@@ -1220,8 +1220,13 @@ class PostgresDisasterRepository:
         driver_document_type: str,
         driver_document_number_encrypted: bytes | None,
         driver_phone_encrypted: bytes | None,
-        tractor_plate: str,
-        trailer_plate: str,
+        tractor_plate: str | None,
+        trailer_plate: str | None,
+        # CHG-173: identidad de la embarcación (solo la lanchera; en la
+        # mulera llegan en None, y al revés con las placas).
+        vessel_registration: str | None,
+        vessel_name: str | None,
+        vessel_type: str | None,
         vehicle_visible_characteristics: str,
     ) -> dict | str:
         async def _center(location_id: UUID) -> dict | None:
@@ -1286,9 +1291,10 @@ class PostgresDisasterRepository:
                 driver_full_name, driver_document_type,
                 driver_document_number_encrypted, driver_phone_encrypted,
                 tractor_plate, trailer_plate,
+                vessel_registration, vessel_name, vessel_type,
                 vehicle_visible_characteristics
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                      $12, $13, $14, $15)
+                      $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (idempotency_key) DO NOTHING
             RETURNING id, kind, status, origin_location_id,
                       destination_location_id, created_at
@@ -1307,6 +1313,9 @@ class PostgresDisasterRepository:
             driver_phone_encrypted,
             tractor_plate,
             trailer_plate,
+            vessel_registration,
+            vessel_name,
+            vessel_type,
             vehicle_visible_characteristics,
         )
         if row is None:
@@ -1531,6 +1540,7 @@ class PostgresDisasterRepository:
             """
             SELECT t.id, t.kind, t.status::text AS status,
                    t.supplies_summary, t.tractor_plate, t.trailer_plate,
+                   t.vessel_registration, t.vessel_name, t.vessel_type,
                    t.vehicle_visible_characteristics,
                    t.departed_at, t.arrived_at, t.created_at,
                    t.last_latitude, t.last_longitude, t.last_position_at,

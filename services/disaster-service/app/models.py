@@ -1995,8 +1995,21 @@ TransportDriverDocumentType = Literal[
     "Permiso por protección temporal (PPT)",
 ]
 
+# CHG-173 §: catálogo cerrado de embarcaciones fluviales.
+TransportVesselType = Literal[
+    "Lancha",
+    "Chalupa",
+    "Bongo",
+    "Planchón",
+    "Ferri",
+]
+
 # CHG-171 §32-33: placa normalizada (mayúsculas, sin espacios/guiones).
 _PLATE_PATTERN = re.compile(r"^[A-Z0-9]{5,10}$")
+# CHG-173: la matrícula fluvial no sigue el formato de placa terrestre
+# (p. ej. «CP-05-1234»), así que se normaliza igual pero con un rango
+# más ancho.
+_VESSEL_REGISTRATION_PATTERN = re.compile(r"^[A-Z0-9]{4,15}$")
 
 
 def _normalize_plate(value: str) -> str:
@@ -2006,6 +2019,16 @@ def _normalize_plate(value: str) -> str:
             "La placa debe tener entre 5 y 10 letras o números."
         )
     return plate
+
+
+def _normalize_vessel_registration(value: str) -> str:
+    registration = re.sub(r"[\s-]+", "", value.strip().upper())
+    if not _VESSEL_REGISTRATION_PATTERN.fullmatch(registration):
+        raise ValueError(
+            "La matrícula de la embarcación debe tener entre 4 y 15 "
+            "letras o números."
+        )
+    return registration
 
 
 class HumanitarianTransportInput(ApiModel):
@@ -2031,9 +2054,25 @@ class HumanitarianTransportInput(ApiModel):
     driver_phone: str = Field(
         max_length=PHONE_MAX_LENGTH, pattern=PHONE_PATTERN
     )
-    # CHG-171 §31-35: identificación del vehículo.
-    tractor_plate: str = Field(min_length=5, max_length=12)
-    trailer_plate: str = Field(min_length=5, max_length=12)
+    # CHG-171 §31-35: identificación del vehículo terrestre. CHG-173:
+    # opcionales en el esquema porque solo la mulera las trae; el
+    # validador de abajo las exige (y prohíbe las de la lancha) según
+    # el tipo, para que ningún registro mezcle los dos mundos.
+    tractor_plate: str | None = Field(
+        default=None, min_length=5, max_length=12
+    )
+    trailer_plate: str | None = Field(
+        default=None, min_length=5, max_length=12
+    )
+    # CHG-173: identidad propia de la embarcación (solo la lanchera).
+    vessel_registration: str | None = Field(
+        default=None, min_length=4, max_length=20
+    )
+    vessel_name: str | None = Field(
+        default=None, min_length=3, max_length=120
+    )
+    vessel_type: TransportVesselType | None = None
+    # Compartido por los dos medios, con etiqueta propia en cada uno.
     vehicle_visible_characteristics: str = Field(
         min_length=5, max_length=500
     )
@@ -2048,8 +2087,77 @@ class HumanitarianTransportInput(ApiModel):
 
     @field_validator("tractor_plate", "trailer_plate")
     @classmethod
-    def _plate(cls, value: str) -> str:
-        return _normalize_plate(value)
+    def _plate(cls, value: str | None) -> str | None:
+        return None if value is None else _normalize_plate(value)
+
+    @field_validator("vessel_registration")
+    @classmethod
+    def _vessel_registration(cls, value: str | None) -> str | None:
+        return (
+            None if value is None else _normalize_vessel_registration(value)
+        )
+
+    @field_validator("vessel_name")
+    @classmethod
+    def _vessel_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        trimmed = value.strip()
+        if len(trimmed) < 3:
+            raise ValueError(
+                "Escribe el nombre de la embarcación."
+            )
+        return trimmed
+
+    # CHG-173: el contrato es condicional por tipo. La mulera va con
+    # sus dos placas; la lanchera, con matrícula, nombre y tipo de
+    # embarcación. Enviar los campos del otro medio es un error de
+    # cliente, no un dato que se ignora en silencio.
+    @model_validator(mode="after")
+    def _vehicle_identity_matches_kind(
+        self,
+    ) -> "HumanitarianTransportInput":
+        if self.kind == "mule":
+            missing = [
+                name
+                for name, value in (
+                    ("tractorPlate", self.tractor_plate),
+                    ("trailerPlate", self.trailer_plate),
+                )
+                if value is None
+            ]
+            if missing:
+                raise ValueError(
+                    "La mulera exige la placa del tractocamión y la del "
+                    "tráiler."
+                )
+            if (
+                self.vessel_registration is not None
+                or self.vessel_name is not None
+                or self.vessel_type is not None
+            ):
+                raise ValueError(
+                    "La mulera no lleva datos de embarcación."
+                )
+        else:
+            if (
+                self.vessel_registration is None
+                or self.vessel_name is None
+                or self.vessel_type is None
+            ):
+                raise ValueError(
+                    "La lanchera exige la matrícula, el nombre y el tipo "
+                    "de la embarcación."
+                )
+            if (
+                self.tractor_plate is not None
+                or self.trailer_plate is not None
+            ):
+                raise ValueError(
+                    "La lanchera no lleva placas de tractocamión ni de "
+                    "tráiler."
+                )
+        return self
 
 
 class HumanitarianTransportReceipt(ApiModel):
@@ -2116,6 +2224,11 @@ class ActiveTransport(ApiModel):
     supplies_summary: str | None = None
     tractor_plate: str | None = None
     trailer_plate: str | None = None
+    # CHG-173: identificación visible de la embarcación; como las
+    # placas, es pública (lo del conductor nunca lo es).
+    vessel_registration: str | None = None
+    vessel_name: str | None = None
+    vessel_type: str | None = None
     vehicle_visible_characteristics: str | None = None
     departed_at: datetime | None = None
     arrived_at: datetime | None = None

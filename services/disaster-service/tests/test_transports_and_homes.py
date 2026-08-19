@@ -516,3 +516,111 @@ async def test_active_transports_feed_never_leaks_driver_data():
     serialized = str(body)
     assert "driver" not in serialized
     assert "1098765432" not in serialized
+
+
+# CHG-173 — La lanchera tiene identidad propia de embarcación; el
+# contrato del vehículo es condicional por tipo.
+BOAT_BODY = {
+    "kind": "boat",
+    "originMunicipality": "Bucaramanga",
+    "destinationMunicipality": "El Playón",
+    "originLocationId": str(ORIGIN_ID),
+    "destinationLocationId": str(DESTINATION_ID),
+    "suppliesSummary": "Agua y alimentos no perecederos",
+    "driverFullName": "Rosa Elena Payares",
+    "driverDocumentType": "Cédula de ciudadanía",
+    "driverDocumentNumber": "1098765432",
+    "driverPhone": "+57 300 123 4567",
+    "vesselRegistration": "cp-05-1234",
+    "vesselName": "La Golondrina",
+    "vesselType": "Chalupa",
+    "vehicleVisibleCharacteristics": (
+        "Chalupa blanca con techo azul y franja amarilla."
+    ),
+}
+
+
+@pytest.mark.anyio
+async def test_boat_transport_registers_with_vessel_identity():
+    repository = FakeTransportsRepository()
+    app = transports_app(repository)
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/humanitarian-transports",
+        headers=AUTH_HEADERS,
+        json=BOAT_BODY,
+    )
+
+    assert response.status_code == 201
+    call = repository.calls[0]
+    # La matrícula se normaliza como las placas (mayúsculas, sin
+    # espacios ni guiones), pero admite el formato fluvial.
+    assert call["vessel_registration"] == "CP051234"
+    assert call["vessel_name"] == "La Golondrina"
+    assert call["vessel_type"] == "Chalupa"
+    # La lanchera no lleva placas de camión.
+    assert call["tractor_plate"] is None
+    assert call["trailer_plate"] is None
+
+
+@pytest.mark.anyio
+async def test_boat_transport_requires_full_vessel_identity():
+    app = transports_app()
+
+    for missing in ("vesselRegistration", "vesselName", "vesselType"):
+        body = {key: value for key, value in BOAT_BODY.items() if key != missing}
+        response = await request_app(
+            app,
+            "POST",
+            "/internal/v1/humanitarian-transports",
+            headers=AUTH_HEADERS,
+            json=body,
+        )
+        assert response.status_code == 422, missing
+
+
+@pytest.mark.anyio
+async def test_transport_kinds_do_not_mix_vehicle_identity():
+    app = transports_app()
+
+    # Una lanchera con placas de tractocamión.
+    boat_with_plates = await request_app(
+        app,
+        "POST",
+        "/internal/v1/humanitarian-transports",
+        headers=AUTH_HEADERS,
+        json={**BOAT_BODY, "tractorPlate": "ABC123", "trailerPlate": "R99881"},
+    )
+    assert boat_with_plates.status_code == 422
+
+    # Una mulera con datos de embarcación.
+    mule_with_vessel = await request_app(
+        app,
+        "POST",
+        "/internal/v1/humanitarian-transports",
+        headers=AUTH_HEADERS,
+        json={
+            **TRANSPORT_BODY,
+            "vesselName": "La Golondrina",
+            "vesselType": "Chalupa",
+            "vesselRegistration": "CP051234",
+        },
+    )
+    assert mule_with_vessel.status_code == 422
+
+    # Y una mulera sin sus placas.
+    mule_without_plates = {
+        key: value
+        for key, value in TRANSPORT_BODY.items()
+        if key not in ("tractorPlate", "trailerPlate")
+    }
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/humanitarian-transports",
+        headers=AUTH_HEADERS,
+        json=mule_without_plates,
+    )
+    assert response.status_code == 422

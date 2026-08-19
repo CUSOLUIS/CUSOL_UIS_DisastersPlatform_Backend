@@ -2177,6 +2177,12 @@ def create_app(
                 driver_phone_encrypted=encrypt(payload.driver_phone),
                 tractor_plate=payload.tractor_plate,
                 trailer_plate=payload.trailer_plate,
+                # CHG-173: la lanchera trae su propia identidad y la
+                # mulera sus placas; el modelo ya garantizó que no se
+                # mezclan.
+                vessel_registration=payload.vessel_registration,
+                vessel_name=payload.vessel_name,
+                vessel_type=payload.vessel_type,
                 vehicle_visible_characteristics=(
                     payload.vehicle_visible_characteristics.strip()
                 ),

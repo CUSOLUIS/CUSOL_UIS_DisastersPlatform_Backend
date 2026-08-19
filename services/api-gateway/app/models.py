@@ -1195,6 +1195,11 @@ class ActiveTransport(ApiModel):
     supplies_summary: str | None = None
     tractor_plate: str | None = None
     trailer_plate: str | None = None
+    # CHG-173: identificación visible de la embarcación (la lanchera
+    # no lleva placas; lo del conductor sigue sin publicarse).
+    vessel_registration: str | None = None
+    vessel_name: str | None = None
+    vessel_type: str | None = None
     vehicle_visible_characteristics: str | None = None
     departed_at: datetime | None = None
     arrived_at: datetime | None = None
