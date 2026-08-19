@@ -179,6 +179,9 @@ class OperationalMapPoint(ApiModel):
     description: str | None = None
     source: SourceReference
     updated_at: datetime
+    # CHG-166: promedio de estrellas de los comentarios del punto.
+    comment_rating_average: float | None = Field(default=None, ge=1, le=5)
+    comment_rating_count: int = Field(default=0, ge=0)
 
 
 class OperationalMapSummary(ApiModel):
@@ -404,12 +407,17 @@ class AidLocationComment(ApiModel):
     author_display_name: str | None = None
     actor_kind: Literal["anonymous", "authenticated"]
     content: str = Field(min_length=1, max_length=1000)
+    # CHG-166: None en comentarios previos a la mejora.
+    rating: int | None = Field(default=None, ge=1, le=5)
     created_at: datetime
 
 
 class AidLocationCommentsResponse(ApiModel):
     items: list[AidLocationComment]
     total: int = Field(ge=0)
+    # CHG-166: promedio (1 decimal) y cuántos calificaron.
+    rating_average: float | None = Field(default=None, ge=1, le=5)
+    rating_count: int = Field(default=0, ge=0)
 
 
 # CHG-165 — Consola super_admin: verificación/reactivación de acopios

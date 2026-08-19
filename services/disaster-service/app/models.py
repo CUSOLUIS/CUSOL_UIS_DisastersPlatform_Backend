@@ -170,6 +170,11 @@ class OperationalMapPoint(ApiModel):
     description: str | None = None
     source: SourceReference
     updated_at: datetime
+    # CHG-166: promedio de estrellas de los comentarios del punto
+    # logístico (None/0 en las demás categorías); el popup del mapa lo
+    # muestra encima del resumen.
+    comment_rating_average: float | None = Field(default=None, ge=1, le=5)
+    comment_rating_count: int = Field(default=0, ge=0)
 
 
 class OperationalMapSummary(ApiModel):
@@ -752,6 +757,8 @@ class AidLocationCommentInput(ApiModel):
     )
 
     content: str = Field(min_length=5, max_length=1000)
+    # CHG-166: calificación 1-5 obligatoria en comentarios nuevos.
+    rating: int = Field(ge=1, le=5)
 
     # Mismo criterio antibasura que el resto de textos comunitarios;
     # umbral bajo porque un comentario útil puede ser muy breve.
@@ -773,12 +780,17 @@ class AidLocationComment(ApiModel):
     author_display_name: str | None = None
     actor_kind: ContributionActorKind
     content: str = Field(min_length=1, max_length=1000)
+    # CHG-166: None en comentarios anteriores a la mejora.
+    rating: int | None = Field(default=None, ge=1, le=5)
     created_at: datetime
 
 
 class AidLocationCommentsResponse(ApiModel):
     items: list[AidLocationComment]
     total: int = Field(ge=0)
+    # CHG-166: promedio (1 decimal) y cuántos comentarios calificaron.
+    rating_average: float | None = Field(default=None, ge=1, le=5)
+    rating_count: int = Field(default=0, ge=0)
 
 
 # CHG-165 — Consola super_admin: verificación y reactivación de

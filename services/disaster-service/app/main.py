@@ -2431,11 +2431,15 @@ def create_app(
                     author_display_name=row["author_display_name"],
                     actor_kind=row["actor_kind"],
                     content=row["content"],
+                    rating=row.get("rating"),
                     created_at=row["created_at"],
                 )
                 for row in result["items"]
             ],
             total=result["total"],
+            # CHG-166: promedio de estrellas calculado en el servicio.
+            rating_average=result.get("rating_average"),
+            rating_count=result.get("rating_count", 0),
         )
 
     @application.post(
@@ -2485,6 +2489,8 @@ def create_app(
                 account_id=account_id,
                 author_display_name=author_display_name,
                 content=payload.content.strip(),
+                # CHG-166: calificación 1-5 obligatoria.
+                rating=payload.rating,
             )
         except asyncpg.PostgresError:
             return problem(
@@ -2499,6 +2505,7 @@ def create_app(
             author_display_name=row["author_display_name"],
             actor_kind=row["actor_kind"],
             content=row["content"],
+            rating=row.get("rating"),
             created_at=row["created_at"],
         )
 

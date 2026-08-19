@@ -87,7 +87,16 @@ class FakeCommunityRepository:
         ordered = sorted(
             self.comments, key=lambda c: c["created_at"], reverse=True
         )
-        return {"items": ordered[:limit], "total": len(self.comments)}
+        # CHG-166: promedio solo sobre quienes calificaron.
+        rated = [c["rating"] for c in self.comments if c["rating"]]
+        return {
+            "items": ordered[:limit],
+            "total": len(self.comments),
+            "rating_average": (
+                round(sum(rated) / len(rated), 1) if rated else None
+            ),
+            "rating_count": len(rated),
+        }
 
     async def create_aid_location_comment(
         self,
@@ -98,6 +107,7 @@ class FakeCommunityRepository:
         account_id,
         author_display_name,
         content,
+        rating,
     ):
         if location_id != self.center["id"]:
             return None
@@ -111,6 +121,7 @@ class FakeCommunityRepository:
             "author_display_name": author_display_name,
             "actor_kind": actor_kind,
             "content": content,
+            "rating": rating,
             "created_at": BASE_AT + timedelta(minutes=len(self.comments)),
         }
         self.comments.append(row)
@@ -283,7 +294,7 @@ async def test_authenticated_comment_keeps_author_and_date():
                 "María Gómez".encode()
             ).decode(),
         },
-        json={"content": "Hay disponibilidad para recibir ropa."},
+        json={"content": "Hay disponibilidad para recibir ropa.", "rating": 5},
     )
 
     assert response.status_code == 201
@@ -291,7 +302,10 @@ async def test_authenticated_comment_keeps_author_and_date():
     assert body["authorDisplayName"] == "María Gómez"
     assert body["actorKind"] == "authenticated"
     assert body["createdAt"]
+    # CHG-166: la calificación queda persistida con el comentario.
+    assert body["rating"] == 5
     assert repository.comments[0]["account_id"] == ACTOR_ID
+    assert repository.comments[0]["rating"] == 5
 
 
 @pytest.mark.anyio
@@ -304,7 +318,10 @@ async def test_anonymous_comment_stores_null_account():
         "POST",
         COMMENTS_PATH,
         headers={**idempotency("c2"), "X-Actor-Kind": "anonymous"},
-        json={"content": "Acabo de entregar varias cajas en este punto."},
+        json={
+            "content": "Acabo de entregar varias cajas en este punto.",
+            "rating": 4,
+        },
     )
 
     assert response.status_code == 201
@@ -320,11 +337,11 @@ async def test_comments_come_back_newest_first():
     repository = FakeCommunityRepository()
     app = community_app(repository)
 
-    for index, text in enumerate(
+    for index, (text, stars) in enumerate(
         [
-            "Primer comentario del punto de acopio.",
-            "Segundo comentario del punto de acopio.",
-            "Tercer comentario del punto de acopio.",
+            ("Primer comentario del punto de acopio.", 5),
+            ("Segundo comentario del punto de acopio.", 4),
+            ("Tercer comentario del punto de acopio.", 3),
         ]
     ):
         created = await request_app(
@@ -335,7 +352,7 @@ async def test_comments_come_back_newest_first():
                 **idempotency(f"o{index}"),
                 "X-Actor-Kind": "anonymous",
             },
-            json={"content": text},
+            json={"content": text, "rating": stars},
         )
         assert created.status_code == 201
 
@@ -348,6 +365,25 @@ async def test_comments_come_back_newest_first():
         "Primer comentario del punto de acopio.",
     ]
     assert listing.json()["total"] == 3
+    # CHG-166: promedio server-side (5+4+3)/3 = 4.0 sobre 3 calificados.
+    assert listing.json()["ratingAverage"] == 4.0
+    assert listing.json()["ratingCount"] == 3
+
+
+@pytest.mark.anyio
+async def test_comment_without_rating_is_invalid():
+    # CHG-166: los comentarios nuevos exigen la calificación 1-5.
+    app = community_app()
+
+    response = await request_app(
+        app,
+        "POST",
+        COMMENTS_PATH,
+        headers={**idempotency("nr"), "X-Actor-Kind": "anonymous"},
+        json={"content": "Comentario sin estrellas del punto."},
+    )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.anyio

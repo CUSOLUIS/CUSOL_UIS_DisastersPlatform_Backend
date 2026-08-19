@@ -51,9 +51,17 @@ COMMENT = {
     "authorDisplayName": None,
     "actorKind": "anonymous",
     "content": "El punto continúa abierto y recibiendo.",
+    # CHG-166: calificación 1-5 del comentario.
+    "rating": 5,
     "createdAt": "2026-08-19T12:00:00Z",
 }
-COMMENTS_PAGE = {"items": [COMMENT], "total": 1}
+COMMENTS_PAGE = {
+    "items": [COMMENT],
+    "total": 1,
+    # CHG-166: promedio server-side.
+    "ratingAverage": 5.0,
+    "ratingCount": 1,
+}
 
 CENTER_SUMMARY = {
     "id": LOCATION_ID,

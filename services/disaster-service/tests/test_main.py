@@ -437,10 +437,12 @@ async def test_building_pending_serializes_only_public_contract_fields():
     assert item["category"] == "building_pending"
     # Solo los campos públicos del contrato: sin identidad, propiedad,
     # residentes ni diagnóstico estructural.
+    # CHG-166 sumó el promedio de estrellas de comentarios (público).
     assert set(item.keys()) == {
         "id", "category", "title", "locationLabel", "latitude",
         "longitude", "coordinatePrecision", "verificationStatus",
         "relatedDisasterId", "description", "source", "updatedAt",
+        "commentRatingAverage", "commentRatingCount",
     }
     forbidden = {
         "residents", "owner", "ownerName", "address", "structuralRisk",

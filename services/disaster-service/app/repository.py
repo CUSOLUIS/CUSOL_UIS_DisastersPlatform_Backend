@@ -78,7 +78,19 @@ _LOGISTICS_MAP_PROJECTION_SQL = """
         a.updated_at,
         s.name AS source_name,
         s.source_type,
-        s.url AS source_url
+        s.url AS source_url,
+        -- CHG-166: promedio de estrellas de los comentarios (solo los
+        -- que calificaron); el popup del mapa lo muestra encima.
+        (
+            SELECT ROUND(AVG(c.rating)::numeric, 1)::float8
+            FROM disaster_service.aid_location_comments c
+            WHERE c.location_id = a.id AND c.rating IS NOT NULL
+        ) AS comment_rating_average,
+        (
+            SELECT COUNT(*)
+            FROM disaster_service.aid_location_comments c
+            WHERE c.location_id = a.id AND c.rating IS NOT NULL
+        ) AS comment_rating_count
     FROM disaster_service.aid_locations a
     INNER JOIN disaster_service.sources s ON s.id = a.source_id
     WHERE a.latitude IS NOT NULL
@@ -1403,6 +1415,10 @@ class PostgresDisasterRepository:
                     url=row["source_url"],
                 ),
                 updated_at=row["updated_at"],
+                # CHG-166: solo la proyección logística trae estas
+                # columnas; el resto queda en None/0.
+                comment_rating_average=row.get("comment_rating_average"),
+                comment_rating_count=row.get("comment_rating_count") or 0,
             )
 
         merged = (
@@ -2909,7 +2925,8 @@ class PostgresDisasterRepository:
             rows = await connection.fetch(
                 """
                 SELECT id, account_id, author_display_name,
-                       actor_kind::text AS actor_kind, content, created_at
+                       actor_kind::text AS actor_kind, content, rating,
+                       created_at
                 FROM disaster_service.aid_location_comments
                 WHERE location_id = $1
                 ORDER BY created_at DESC, id DESC
@@ -2928,7 +2945,22 @@ class PostgresDisasterRepository:
                     location_id,
                 )
             )
-        return {"items": [dict(row) for row in rows], "total": total}
+            # CHG-166: promedio server-side sobre los que calificaron.
+            aggregate = await connection.fetchrow(
+                """
+                SELECT ROUND(AVG(rating)::numeric, 1)::float8 AS average,
+                       COUNT(rating) AS count
+                FROM disaster_service.aid_location_comments
+                WHERE location_id = $1 AND rating IS NOT NULL
+                """,
+                location_id,
+            )
+        return {
+            "items": [dict(row) for row in rows],
+            "total": total,
+            "rating_average": aggregate["average"],
+            "rating_count": int(aggregate["count"]),
+        }
 
     async def create_aid_location_comment(
         self,
@@ -2939,9 +2971,11 @@ class PostgresDisasterRepository:
         account_id: UUID | None,
         author_display_name: str | None,
         content: str,
+        rating: int,
     ) -> dict | None:
         """CHG-165 §5: publica un comentario (anónimo o con cuenta) de
-        forma idempotente. None si el lugar no existe."""
+        forma idempotente; CHG-166 suma la calificación 1-5. None si el
+        lugar no existe."""
         async with self._pool.acquire() as connection:
             async with connection.transaction():
                 exists = await connection.fetchval(
@@ -2957,12 +2991,12 @@ class PostgresDisasterRepository:
                     """
                     INSERT INTO disaster_service.aid_location_comments (
                         idempotency_key, location_id, account_id,
-                        author_display_name, actor_kind, content
-                    ) VALUES ($1, $2, $3, $4, $5, $6)
+                        author_display_name, actor_kind, content, rating
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                     ON CONFLICT (idempotency_key) DO NOTHING
                     RETURNING id, account_id, author_display_name,
                               actor_kind::text AS actor_kind, content,
-                              created_at
+                              rating, created_at
                     """,
                     idempotency_key,
                     location_id,
@@ -2970,6 +3004,7 @@ class PostgresDisasterRepository:
                     author_display_name,
                     actor_kind,
                     content,
+                    rating,
                 )
                 if row is None:
                     # Reintento con la misma llave: devolver lo ya
@@ -2978,7 +3013,7 @@ class PostgresDisasterRepository:
                         """
                         SELECT id, account_id, author_display_name,
                                actor_kind::text AS actor_kind, content,
-                               created_at
+                               rating, created_at
                         FROM disaster_service.aid_location_comments
                         WHERE idempotency_key = $1
                         """,
