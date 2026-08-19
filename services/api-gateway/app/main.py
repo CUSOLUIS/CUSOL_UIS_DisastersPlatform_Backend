@@ -55,6 +55,7 @@ from .models import (
     AdminAidLocationVerificationsResponse,
     AidLocationAvailability,
     AidLocationComment,
+    AidLocationCommentDeleteReceipt,
     AidLocationCommentsResponse,
     AidLocationParentCandidatesResponse,
     AidLocationReceipt,
@@ -4481,6 +4482,39 @@ def create_app(
             f"/internal/v1/admin/aid-locations/{location_id}/reactivate",
             account,
             AdminAidLocationActionReceipt,
+        )
+
+    # CHG-167 — Borrado admin de un comentario de acopio local. Muta:
+    # va por admin_mutation (Origin válido + super_admin + limitador).
+    @application.delete(
+        "/api/v1/admin/aid-locations/{location_id}/comments/{comment_id}",
+        response_model=AidLocationCommentDeleteReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Comentario inexistente"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_delete_aid_location_comment(
+        location_id: UUID,
+        comment_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "DELETE",
+            f"/internal/v1/admin/aid-locations/{location_id}/comments/"
+            f"{comment_id}",
+            AidLocationCommentDeleteReceipt,
         )
 
     return application

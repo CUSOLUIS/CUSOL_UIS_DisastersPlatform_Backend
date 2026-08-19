@@ -127,6 +127,24 @@ class FakeCommunityRepository:
         self.comments.append(row)
         return row
 
+    # CHG-167: borrado admin definitivo y auditado.
+    async def admin_delete_aid_location_comment(
+        self,
+        *,
+        location_id,
+        comment_id,
+        actor_account_id,
+        actor_display_name,
+    ):
+        if location_id != self.center["id"]:
+            return 0
+        for comment in self.comments:
+            if comment["id"] == comment_id:
+                self.comments.remove(comment)
+                self.admin_audit.append("aid_location_comment_deleted")
+                return 1
+        return 0
+
     # --- denuncias ---
 
     def _live_count(self) -> int:
@@ -620,3 +638,81 @@ async def test_reactivating_a_healthy_center_conflicts():
     )
 
     assert response.status_code == 409
+
+
+# --- CHG-167: borrado admin de comentarios ---------------------------
+
+
+def comment_delete_path(comment_id) -> str:
+    return (
+        f"/internal/v1/admin/aid-locations/{LOCATION_ID}"
+        f"/comments/{comment_id}"
+    )
+
+
+@pytest.mark.anyio
+async def test_admin_deletes_a_comment_and_audits():
+    repository = FakeCommunityRepository()
+    app = community_app(repository)
+    created = await request_app(
+        app,
+        "POST",
+        COMMENTS_PATH,
+        headers={**idempotency("d1"), "X-Actor-Kind": "anonymous"},
+        json={"content": "Este punto dejó de atender.", "rating": 2},
+    )
+    comment_id = created.json()["id"]
+
+    response = await request_app(
+        app,
+        "DELETE",
+        comment_delete_path(comment_id),
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": 1}
+    assert repository.comments == []
+    assert repository.admin_audit == ["aid_location_comment_deleted"]
+
+
+@pytest.mark.anyio
+async def test_deleting_unknown_comment_is_404():
+    app = community_app()
+
+    response = await request_app(
+        app,
+        "DELETE",
+        comment_delete_path(uuid4()),
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_deleting_comment_requires_admin_role():
+    repository = FakeCommunityRepository()
+    app = community_app(repository)
+    created = await request_app(
+        app,
+        "POST",
+        COMMENTS_PATH,
+        headers={**idempotency("d2"), "X-Actor-Kind": "anonymous"},
+        json={"content": "Comentario que nadie más puede borrar.", "rating": 3},
+    )
+    comment_id = created.json()["id"]
+
+    without_role = await request_app(
+        app, "DELETE", comment_delete_path(comment_id)
+    )
+    as_moderator = await request_app(
+        app,
+        "DELETE",
+        comment_delete_path(comment_id),
+        headers=MODERATOR_HEADERS,
+    )
+
+    assert without_role.status_code == 403
+    assert as_moderator.status_code == 403
+    assert len(repository.comments) == 1

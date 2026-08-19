@@ -3021,6 +3021,45 @@ class PostgresDisasterRepository:
                     )
         return dict(row) if row is not None else None
 
+    async def admin_delete_aid_location_comment(
+        self,
+        *,
+        location_id: UUID,
+        comment_id: UUID,
+        actor_account_id: UUID,
+        actor_display_name: str,
+    ) -> int:
+        """CHG-167: borra definitivamente un comentario del acopio y
+        audita el acto en el mismo movimiento. 0 si no existe (o no
+        pertenece a ese lugar); el promedio CHG-166 se recalcula solo
+        al leer."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                deleted = await connection.fetchval(
+                    """
+                    DELETE FROM disaster_service.aid_location_comments
+                    WHERE id = $1 AND location_id = $2
+                    RETURNING id
+                    """,
+                    comment_id,
+                    location_id,
+                )
+                if deleted is None:
+                    return 0
+                await self._admin_audit(
+                    connection,
+                    actor_account_id,
+                    actor_display_name,
+                    "aid_location_comment_deleted",
+                    "aid_location_comment",
+                    comment_id,
+                    "success",
+                    None,
+                    ["deleted"],
+                    None,
+                )
+        return 1
+
     # CHG-165 — Consola super_admin de Centros de Acopio Local.
     _ADMIN_AID_LOCATION_SUMMARY_SQL = """
         SELECT

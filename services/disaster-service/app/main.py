@@ -54,6 +54,7 @@ from .models import (
     AidLocationParentCandidate,
     AidLocationParentCandidatesResponse,
     AidLocationRatingInput,
+    AidLocationCommentDeleteReceipt,
     AdminAidLocationActionReceipt,
     AdminAidLocationSummary,
     AdminAidLocationVerificationDecision,
@@ -4301,6 +4302,40 @@ def create_app(
             disabled_at=row["disabled_at"],
             active_reports_count=row["active_reports_count"],
         )
+
+    # CHG-167 — Borrado admin de un comentario de acopio local:
+    # definitivo y auditado (patrón CHG-159); el promedio CHG-166 se
+    # recalcula solo al leer.
+    @application.delete(
+        "/internal/v1/admin/aid-locations/{location_id}/comments/"
+        "{comment_id}",
+        response_model=AidLocationCommentDeleteReceipt,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_delete_aid_location_comment(
+        location_id: UUID,
+        comment_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display = actor
+        deleted = await data.admin_delete_aid_location_comment(
+            location_id=location_id,
+            comment_id=comment_id,
+            actor_account_id=actor_account_id,
+            actor_display_name=actor_display,
+        )
+        if deleted == 0:
+            return problem(
+                404,
+                "Comentario no encontrado",
+                "El comentario no existe o ya fue borrado.",
+            )
+        return AidLocationCommentDeleteReceipt(deleted=deleted)
 
     # CHG-154 — Gestión admin de registros de personas: listar (con
     # ocultos), ocultar (reversible), restaurar y editar. Nada se

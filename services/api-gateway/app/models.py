@@ -456,6 +456,11 @@ class AdminAidLocationActionReceipt(ApiModel):
     active_reports_count: int = Field(ge=0)
 
 
+# CHG-167 — Borrado admin de un comentario (definitivo y auditado).
+class AidLocationCommentDeleteReceipt(ApiModel):
+    deleted: int = Field(ge=0)
+
+
 # CHG-153 — Candidatos a centro asociado (espejo del contrato).
 class AidLocationParentCandidate(ApiModel):
     id: UUID

@@ -372,3 +372,63 @@ async def test_admin_reactivate_passes_conflict_through():
 
     assert response.status_code == 409
     assert response.json()["title"] == "Centro no deshabilitado"
+
+
+# --- CHG-167: borrado admin de comentarios ---------------------------
+
+COMMENT_DELETE_PATH = (
+    f"/api/v1/admin/aid-locations/{LOCATION_ID}"
+    f"/comments/{COMMENT['id']}"
+)
+
+
+@pytest.mark.anyio
+async def test_admin_comment_delete_forwards_actor_and_receipt():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["role"] = request.headers.get("x-actor-role")
+        return httpx.Response(200, json={"deleted": 1})
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app, "DELETE", COMMENT_DELETE_PATH, headers=ADMIN_COOKIE
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": 1}
+    assert seen["method"] == "DELETE"
+    assert seen["path"] == (
+        f"/internal/v1/admin/aid-locations/{LOCATION_ID}"
+        f"/comments/{COMMENT['id']}"
+    )
+    assert seen["role"] == "super_admin"
+
+
+@pytest.mark.anyio
+async def test_admin_comment_delete_requires_session_and_role():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"deleted": 1})
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    anonymous = await request_gateway(app, "DELETE", COMMENT_DELETE_PATH)
+    as_user = await request_gateway(
+        app, "DELETE", COMMENT_DELETE_PATH, headers=USER_COOKIE
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert anonymous.status_code == 401
+    assert as_user.status_code == 403
+    assert calls == []
