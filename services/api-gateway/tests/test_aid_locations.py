@@ -213,11 +213,14 @@ async def test_create_rejects_disallowed_origin():
 
 @pytest.mark.anyio
 async def test_create_passes_through_upstream_validation_error():
+    # Con un tipo que sí admite alta anónima (CHG-161 F2 exige sesión
+    # para acopio local y distribución): lo que se prueba aquí es que
+    # los 4xx del servicio llegan intactos.
     problem = {
         "type": "validation-error",
         "title": "Dependencia inválida",
         "status": 422,
-        "detail": "Un punto de distribución exige un acopio padre.",
+        "detail": "Un punto de recolección exige un acopio padre.",
     }
 
     def handler(request: httpx.Request):
@@ -231,7 +234,7 @@ async def test_create_passes_through_upstream_validation_error():
         "POST",
         CREATE_PATH,
         headers=IDEMPOTENCY,
-        json={"kind": "distribution_point"},
+        json={"kind": "collection_point"},
     )
     await upstream.aclose()
     await identity.aclose()
@@ -292,6 +295,106 @@ async def test_create_anonymous_rate_limit():
 
     assert first.status_code == 201
     assert second.status_code == 429
+
+
+# CHG-161 (F2) — Refuerzo server-side del portón de sesión: el acopio
+# local y el punto de distribución no admiten alta anónima; la puerta
+# pública lo corta sin molestar al disaster-service.
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "kind", ["collection_center", "distribution_point"]
+)
+async def test_create_requires_session_for_responsible_kinds(kind):
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(201, json=RECEIPT)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        CREATE_PATH,
+        headers=IDEMPOTENCY,
+        json={"kind": kind, "name": "Acopio Norte"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 401
+    body = response.json()
+    assert body["title"] == "Sesión requerida"
+    assert body["type"] == "session-required"
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_create_allows_responsible_kind_with_session():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["actor"] = request.headers.get("x-actor-kind")
+        seen["account"] = request.headers.get("x-account-id")
+        seen["body"] = await request.aread()
+        return httpx.Response(201, json=RECEIPT)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        CREATE_PATH,
+        headers=IDEMPOTENCY,
+        cookies={"cusol_session": "token-user"},
+        json={"kind": "collection_center", "name": "Acopio Norte"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 201
+    assert seen["actor"] == "authenticated"
+    assert seen["account"] == USER_ACCOUNT["id"]
+    assert b"collection_center" in seen["body"]
+
+
+@pytest.mark.anyio
+async def test_create_forwards_unreadable_body_for_upstream_validation():
+    """Un cuerpo que no es JSON no se juzga aquí: lo valida el servicio."""
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["body"] = await request.aread()
+        return httpx.Response(
+            422,
+            json={
+                "type": "validation-error",
+                "title": "Datos inválidos",
+                "status": 422,
+                "detail": "El cuerpo no es JSON.",
+            },
+        )
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        CREATE_PATH,
+        headers={**IDEMPOTENCY, "Content-Type": "application/json"},
+        content=b"no-soy-json",
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 422
+    assert seen["body"] == b"no-soy-json"
 
 
 # --- candidatos a centro asociado ------------------------------------
@@ -701,6 +804,77 @@ async def test_damaged_home_allows_anonymous_and_forwards():
     assert response.status_code == 201
     assert seen["path"] == "/internal/v1/damaged-home-reports"
     assert seen["actor"] == "anonymous"
+
+
+# CHG-162 (F2) — El informe admite fotos del daño: multipart en
+# streaming (el gateway no interpreta las partes) con la misma guardia
+# de tamaño que el reporte de edificio.
+
+
+@pytest.mark.anyio
+async def test_damaged_home_forwards_multipart_photos_untouched():
+    seen = {}
+
+    async def disaster_handler(request: httpx.Request):
+        seen["content_type"] = request.headers.get("content-type")
+        seen["body"] = await request.aread()
+        seen["cookie"] = request.headers.get("cookie")
+        return httpx.Response(
+            201,
+            json={
+                "id": "99999999-9999-4999-8999-999999999903",
+                "createdAt": "2026-08-18T21:00:00Z",
+            },
+        )
+
+    upstream, identity = make_clients(disaster_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/damaged-homes",
+        headers={**IDEMPOTENCY, "Cookie": "otra_cookie=privada"},
+        data={"payload": '{"description":"La casa perdió el techo."}'},
+        files=[("photos", ("daño.jpg", b"binario-de-foto", "image/jpeg"))],
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 201
+    assert seen["content_type"].startswith("multipart/form-data")
+    assert b"binario-de-foto" in seen["body"]
+    # Las cookies del visitante nunca viajan al servicio.
+    assert seen["cookie"] is None
+
+
+@pytest.mark.anyio
+async def test_damaged_home_rejects_oversized_upload():
+    calls = []
+
+    def disaster_handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(201, json={})
+
+    upstream, identity = make_clients(disaster_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/damaged-homes",
+        headers={
+            **IDEMPOTENCY,
+            "Content-Type": "multipart/form-data; boundary=x",
+            "Content-Length": "99999999",
+        },
+        content=b"--x--",
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 413
+    assert calls == []
 
 
 # --- CHG-171: catálogo de ciudades, viaje GPS y feed del mapa --------

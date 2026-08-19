@@ -19,6 +19,8 @@ from uuid import UUID
 AdminSubmissionKind = Literal[
     "missing_person_report",
     "unverified_building_report",
+    # CHG-162 (F2) — «Mi casita partida».
+    "damaged_home_report",
     "person_status_report",
     "aid_location_rating",
     "collection_center_registration",
@@ -40,7 +42,10 @@ AdminAction = Literal[
 AdminSubmissionTheme = Literal["personas", "infraestructura", "ayuda"]
 THEME_KINDS: dict[str, tuple[str, ...]] = {
     "personas": ("missing_person_report", "person_status_report"),
-    "infraestructura": ("unverified_building_report",),
+    "infraestructura": (
+        "unverified_building_report",
+        "damaged_home_report",
+    ),
     "ayuda": (
         "aid_location_rating",
         "collection_center_registration",
@@ -55,6 +60,7 @@ THEME_KINDS: dict[str, tuple[str, ...]] = {
 ACTIVE_KINDS: tuple[str, ...] = (
     "missing_person_report",
     "unverified_building_report",
+    "damaged_home_report",
     "person_status_report",
     "aid_location_rating",
     "community_meal_offer",
@@ -147,6 +153,13 @@ EDITABLE_FIELDS: dict[str, dict[str, EditableField]] = {
         "department": EditableField("department", 100),
         "municipality": EditableField("municipality", 100),
         "sector": EditableField("sector", 160),
+    },
+    # CHG-162 (F2): la descripción del daño es evidencia ciudadana y no
+    # se edita; sí se corrige dónde queda la vivienda.
+    "damaged_home_report": {
+        "department": EditableField("department", 100),
+        "municipality": EditableField("municipality", 100),
+        "address": EditableField("address", 300, min_length=3),
     },
     "person_status_report": {},
     "aid_location_rating": {},

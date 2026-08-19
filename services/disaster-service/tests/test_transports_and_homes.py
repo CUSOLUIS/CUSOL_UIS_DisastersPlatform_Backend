@@ -5,6 +5,7 @@ centros y recibo idempotente. Casita: alta anónima permitida y recibo.
 Todo con repositorio falso (sin base de datos).
 """
 
+import json
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -12,7 +13,7 @@ import pytest
 
 from app.main import create_app
 
-from test_missing_persons import FakeStorage, request_app
+from test_missing_persons import FakeStorage, photos_form, request_app
 
 
 ACCOUNT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa7")
@@ -58,6 +59,8 @@ class FakeTransportsRepository:
         self.journey_outcome = journey_outcome
         self.calls: list[dict] = []
         self.journey_calls: list[tuple[str, dict]] = []
+        # CHG-162 (F2): claves ya vistas, para simular la idempotencia.
+        self.seen_keys: set[str] = set()
 
     async def ping(self):
         return True
@@ -79,7 +82,14 @@ class FakeTransportsRepository:
 
     async def create_damaged_home_report(self, **kwargs):
         self.calls.append(kwargs)
-        return {"id": uuid4(), "created_at": CREATED_AT}
+        # CHG-162 (F2): la constancia viaja con `created`; en un
+        # reintento idempotente el servicio limpia los binarios.
+        created = kwargs["idempotency_key"] not in self.seen_keys
+        self.seen_keys.add(kwargs["idempotency_key"])
+        return (
+            {"id": kwargs["report_id"], "created_at": CREATED_AT},
+            created,
+        )
 
     # --- CHG-171 ---
 
@@ -624,3 +634,129 @@ async def test_transport_kinds_do_not_mix_vehicle_identity():
         json=mule_without_plates,
     )
     assert response.status_code == 422
+
+
+# --- CHG-162 (F2): fotos del daño ------------------------------------
+
+DAMAGED_HOME_PAYLOAD = {
+    "description": "La casa perdió el techo y un muro lateral.",
+    "department": "Santander",
+    "municipality": "Bucaramanga",
+    "address": "Calle 10 # 4-20, barrio La Feria",
+    "latitude": 7.11935,
+    "longitude": -73.12274,
+}
+
+
+def damaged_home_form(count: int) -> dict:
+    return {
+        "data": {"payload": json.dumps(DAMAGED_HOME_PAYLOAD)},
+        "files": photos_form(count),
+    }
+
+
+@pytest.mark.anyio
+async def test_damaged_home_stores_photos_with_opaque_keys():
+    repository = FakeTransportsRepository()
+    storage = FakeStorage()
+    app = create_app(repository=repository, storage=storage)
+
+    form = damaged_home_form(2)
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/damaged-home-reports",
+        headers=ANON_HEADERS,
+        data=form["data"],
+        files=form["files"],
+    )
+
+    assert response.status_code == 201
+    photos = repository.calls[0]["photos"]
+    assert [photo.position for photo in photos] == [1, 2]
+    report_id = repository.calls[0]["report_id"]
+    # Claves opacas bajo el prefijo del informe; nunca el nombre
+    # original del archivo.
+    assert all(
+        key.startswith(f"damaged-home-reports/{report_id}/")
+        for key in storage.objects
+    )
+    assert not any("foto-" in key for key in storage.objects)
+    # Original en cuarentena y derivado sin metadatos por cada foto.
+    assert len(storage.objects) == 4
+
+
+@pytest.mark.anyio
+async def test_damaged_home_without_photos_still_publishes():
+    """Las fotos son opcionales por los dos caminos.
+
+    Multipart sin partes `photos` (el formulario cuando nadie adjunta
+    nada) y JSON puro (un bundle viejo, CHG-137): ambos publican.
+    """
+    repository = FakeTransportsRepository()
+    app = transports_app(repository)
+
+    multipart = await request_app(
+        app,
+        "POST",
+        "/internal/v1/damaged-home-reports",
+        headers=ANON_HEADERS,
+        files={"payload": (None, json.dumps(DAMAGED_HOME_PAYLOAD))},
+    )
+    legacy_json = await request_app(
+        app,
+        "POST",
+        "/internal/v1/damaged-home-reports",
+        headers={**ANON_HEADERS, "Idempotency-Key": "clave-idempotente-json-0162"},
+        json=DAMAGED_HOME_PAYLOAD,
+    )
+
+    assert multipart.status_code == 201
+    assert legacy_json.status_code == 201
+    assert repository.calls[0]["photos"] == []
+    assert repository.calls[1]["photos"] == []
+
+
+@pytest.mark.anyio
+async def test_damaged_home_rejects_more_photos_than_allowed():
+    repository = FakeTransportsRepository()
+    storage = FakeStorage()
+    app = create_app(repository=repository, storage=storage)
+
+    form = damaged_home_form(4)
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/damaged-home-reports",
+        headers=ANON_HEADERS,
+        data=form["data"],
+        files=form["files"],
+    )
+
+    assert response.status_code == 422
+    assert repository.calls == []
+    assert storage.objects == {}
+
+
+@pytest.mark.anyio
+async def test_damaged_home_idempotent_retry_drops_new_binaries():
+    repository = FakeTransportsRepository()
+    storage = FakeStorage()
+    app = create_app(repository=repository, storage=storage)
+
+    for _ in range(2):
+        form = damaged_home_form(1)
+        response = await request_app(
+            app,
+            "POST",
+            "/internal/v1/damaged-home-reports",
+            headers=ANON_HEADERS,
+            data=form["data"],
+            files=form["files"],
+        )
+        assert response.status_code == 201
+
+    # El segundo intento no deja basura: sus dos objetos se borran.
+    assert len(storage.deleted) == 2
+    assert len(storage.objects) == 2
+

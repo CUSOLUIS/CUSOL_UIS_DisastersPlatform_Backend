@@ -575,6 +575,16 @@ AidLocationOperationalStatus = Literal[
     "under_observation",  # EN_OBSERVACION (umbral de denuncias)
     "inactive",  # INACTIVO
 ]
+# CHG-161 (F2) — Tipos cuya alta exige una cuenta: el acopio local y el
+# punto de distribución asumen responsabilidad permanente sobre insumos
+# ajenos, así que necesitan una persona responsable identificable. Es el
+# refuerzo server-side del portón que el formulario ya pinta
+# (`AID_LOCATION_REQUIRES_SESSION` en el frontend); recolección y acopio
+# receptor siguen admitiendo alta anónima.
+AID_LOCATION_KINDS_REQUIRING_ACCOUNT: frozenset[str] = frozenset(
+    {"collection_center", "distribution_point"}
+)
+
 # Punto dependiente -> tipo del centro padre que exige.
 AID_LOCATION_PARENT_KIND: dict[str, str] = {
     "collection_point": "collection_center",
@@ -1376,6 +1386,8 @@ class UnverifiedBuildingReportReceipt(ApiModel):
 AdminSubmissionKind = Literal[
     "missing_person_report",
     "unverified_building_report",
+    # CHG-162 (F2) — «Mi casita partida» en el tema Infraestructura.
+    "damaged_home_report",
     "person_status_report",
     "aid_location_rating",
     "collection_center_registration",

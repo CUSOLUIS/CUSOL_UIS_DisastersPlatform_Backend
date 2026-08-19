@@ -14,6 +14,7 @@ import pytest
 from app import admin as admin_rules
 from app.config import Settings
 from app.main import build_fernet, create_app
+from app.models import AdminSubmissionSummary
 from app.storage import StorageUnavailableError
 
 from test_missing_persons import FakeStorage, request_app
@@ -906,6 +907,44 @@ async def test_admin_list_passes_theme_filter():
     assert repository.list_args["theme"] == "ayuda"
 
 
+def test_admin_summary_accepts_every_active_kind():
+    """Los tipos activos tienen que caber en el modelo del resumen.
+
+    CHG-162 (F2): añadir un tipo a `_ADMIN_UNIFIED_CTE` sin ampliar el
+    Literal del modelo tumbaba la bandeja entera con un 503; esta
+    prueba lo detecta sin base de datos.
+    """
+    for kind in admin_rules.ACTIVE_KINDS:
+        moment = datetime(2026, 8, 19, 10, 0, tzinfo=UTC)
+        summary = AdminSubmissionSummary(
+            id=uuid4(),
+            kind=kind,
+            tracking_code="COD-0001",
+            title="Título de bandeja",
+            status="under_review",
+            source_label="Reporte anónimo",
+            evidence_count=0,
+            received_at=moment,
+            updated_at=moment,
+            version=1,
+        )
+        assert summary.kind == kind
+
+
+def test_every_active_kind_has_field_specs():
+    """Sin ficha de campos, el detalle del expediente revienta.
+
+    CHG-162 (F2): faltaba la entrada del tipo nuevo en
+    `ADMIN_FIELD_SPECS` y `GET /admin/submissions/{id}` respondía 503
+    por un KeyError; la bandeja sí lo listaba.
+    """
+    from app.main import ADMIN_FIELD_SPECS
+
+    for kind in admin_rules.ACTIVE_KINDS:
+        assert kind in ADMIN_FIELD_SPECS, kind
+        assert ADMIN_FIELD_SPECS[kind]
+
+
 def test_theme_kinds_cover_every_kind_once():
     # Los tres temas cubren exactamente los tipos del contrato,
     # sin solapamientos.
@@ -919,6 +958,7 @@ def test_theme_kinds_cover_every_kind_once():
         "missing_person_report",
         "person_status_report",
         "unverified_building_report",
+        "damaged_home_report",
         "aid_location_rating",
         "collection_center_registration",
         "collection_point_registration",

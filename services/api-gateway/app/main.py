@@ -73,6 +73,7 @@ from .models import (
     AidLocationCommentsResponse,
     AidLocationParentCandidatesResponse,
     AidLocationReceipt,
+    AID_LOCATION_KINDS_REQUIRING_ACCOUNT,
     AidLocationReportReceipt,
     AuthenticatedAccount,
     ChangeSignal,
@@ -3754,6 +3755,7 @@ def create_app(
         response_model=AidLocationReceipt,
         response_model_by_alias=True,
         responses={
+            401: {"description": "Tipo que exige sesión, sin sesión"},
             413: {"description": "Carga demasiado grande"},
             422: {"description": "Datos o dependencia inválidos"},
             429: {"description": "Límite excedido"},
@@ -3793,6 +3795,23 @@ def create_app(
             return rate_limited_response(
                 "Se superó el límite de registros por minuto."
             )
+        body = await request.body()
+        # CHG-161 (F2) — El acopio local y el punto de distribución
+        # exigen cuenta: la puerta pública lo corta aquí sin molestar al
+        # servicio. Un cuerpo ilegible se deja pasar tal cual para que
+        # el disaster-service conteste el 422 con el detalle de campos.
+        if account is None:
+            try:
+                declared_kind = json.loads(body).get("kind")
+            except (ValueError, AttributeError):
+                declared_kind = None
+            if declared_kind in AID_LOCATION_KINDS_REQUIRING_ACCOUNT:
+                return problem_response(
+                    "Este tipo de punto logístico exige iniciar sesión.",
+                    title="Sesión requerida",
+                    status_code=401,
+                    problem_type="session-required",
+                )
         headers = {
             "content-type": request.headers.get(
                 "content-type", "application/json"
@@ -3804,7 +3823,6 @@ def create_app(
         }
         if account is not None:
             headers["x-account-id"] = str(account.id)
-        body = await request.body()
         try:
             response = await upstream.post(
                 "/internal/v1/aid-locations", content=body, headers=headers
@@ -4527,6 +4545,18 @@ def create_app(
                 status_code=422,
                 problem_type="validation-error",
             )
+        # CHG-162 (F2) — Desde que el informe admite fotos del daño, el
+        # cuerpo puede ser multipart: misma guardia de tamaño que el
+        # reporte de edificio, sin interpretar las partes.
+        declared = request.headers.get("content-length")
+        if declared is not None and declared.isdigit():
+            if int(declared) > resolved_settings.max_report_body_bytes:
+                return problem_response(
+                    "El envío supera el máximo total permitido.",
+                    title="Carga demasiado grande",
+                    status_code=413,
+                    problem_type="payload-too-large",
+                )
         account = await resolve_optional_account(request, identity)
         if account is not None:
             if not account_contribution_limiter.allow(

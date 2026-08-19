@@ -360,6 +360,12 @@ AidLocationOperationalStatus = Literal[
     "open", "closed", "at_capacity", "under_observation", "inactive"
 ]
 
+# CHG-161 (F2) — Espejo de la regla del disaster-service: estos dos
+# tipos no admiten alta anónima.
+AID_LOCATION_KINDS_REQUIRING_ACCOUNT: frozenset[str] = frozenset(
+    {"collection_center", "distribution_point"}
+)
+
 
 class AidLocationDirectoryCard(ApiModel):
     kind: AidLocationKind
@@ -665,6 +671,8 @@ AdminAccountStatus = Literal[
 AdminSubmissionKind = Literal[
     "missing_person_report",
     "unverified_building_report",
+    # CHG-162 (F2) — «Mi casita partida» en el tema Infraestructura.
+    "damaged_home_report",
     "person_status_report",
     "aid_location_rating",
     "collection_center_registration",

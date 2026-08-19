@@ -47,6 +47,7 @@ from .models import (
     AdminVersionedReasonInput,
     AidLocationAvailability,
     AidLocationInput,
+    AID_LOCATION_KINDS_REQUIRING_ACCOUNT,
     DamagedHomeReportInput,
     DamagedHomeReportReceipt,
     ActiveTransport,
@@ -365,6 +366,23 @@ ADMIN_FIELD_SPECS: dict[str, list[tuple]] = {
         ("reporterLongitude", "Longitud del reportante",
          "reporter_snapshot_longitude_encrypted", "protected",
          "decrypt", "number"),
+    ],
+    # CHG-162 (F2) — «Mi casita partida»: informe público (nace en el
+    # mapa), sin campos cifrados. Va antes que los demás tipos para no
+    # pisar las etiquetas compartidas de FIELD_LABELS.
+    "damaged_home_report": [
+        ("description", "Descripción del daño", "description",
+         "public", None, "multiline"),
+        ("department", "Departamento", "department", "public", None,
+         "text"),
+        ("municipality", "Municipio", "municipality", "public", None,
+         "text"),
+        ("address", "Dirección", "address", "public", None, "text"),
+        ("latitude", "Latitud", "latitude", "public", None, "number"),
+        ("longitude", "Longitud", "longitude", "public", None,
+         "number"),
+        ("visible", "Visible en el mapa", "visible", "public", None,
+         "text"),
     ],
     "unverified_building_report": [
         ("buildingReference", "Referencia del edificio",
@@ -2800,14 +2818,79 @@ def create_app(
         if isinstance(actor, JSONResponse):
             return actor
         _actor_kind, account_id = actor
+        oversize = check_declared_length(request)
+        if oversize is not None:
+            return oversize
+
+        # CHG-162 (F2) — Las fotos del daño llegan en multipart, con la
+        # parte JSON `payload` al lado. El envío JSON puro se conserva:
+        # un bundle viejo sigue reportando sin fotografías (CHG-137).
+        prepared: list[tuple[int, bytes, str]] = []
+        if request.headers.get("content-type", "").startswith(
+            "multipart/"
+        ):
+            try:
+                form = await request.form()
+            except Exception:
+                return problem(
+                    422,
+                    "Formulario inválido",
+                    "No fue posible interpretar el envío multipart.",
+                )
+            raw_payload = await read_payload_part(form)
+            if isinstance(raw_payload, JSONResponse):
+                return raw_payload
+            photos_or_problem = await prepare_photo_parts(
+                form,
+                0,
+                resolved_settings.max_photos,
+                "El informe admite hasta tres fotografías del daño.",
+            )
+            if isinstance(photos_or_problem, JSONResponse):
+                return photos_or_problem
+            prepared = photos_or_problem
+        else:
+            raw_payload = await request.body()
+
         try:
             payload = DamagedHomeReportInput.model_validate_json(
-                await request.body()
+                raw_payload
             )
         except ValidationError as error:
             return invalid_fields_problem(error)
+
+        report_id = uuid4()
+        saved_keys: list[str] = []
+
+        def cleanup() -> None:
+            for key in saved_keys:
+                object_storage.delete(key)
+
         try:
-            result = await data.create_damaged_home_report(
+            stored_photos = store_photos(
+                f"damaged-home-reports/{report_id}",
+                prepared,
+                saved_keys,
+            )
+        except PhotoProcessingError:
+            cleanup()
+            return problem(
+                415,
+                "Fotografía no procesable",
+                "Alguna fotografía no pudo validarse como imagen segura.",
+            )
+        except StorageUnavailableError:
+            cleanup()
+            return problem(
+                503,
+                "Almacenamiento no disponible",
+                "No fue posible resguardar las fotografías; el informe "
+                "no fue registrado.",
+            )
+
+        try:
+            result, created = await data.create_damaged_home_report(
+                report_id=report_id,
                 idempotency_key=idempotency_key,
                 description=payload.description.strip(),
                 department=payload.department.strip(),
@@ -2816,13 +2899,18 @@ def create_app(
                 latitude=payload.latitude,
                 longitude=payload.longitude,
                 account_id=account_id,
+                photos=stored_photos,
             )
         except asyncpg.PostgresError:
+            cleanup()
             return problem(
                 503,
                 "Registro no disponible",
                 "No fue posible registrar el informe del hogar.",
             )
+        if not created:
+            # Reintento idempotente: los binarios de este intento sobran.
+            cleanup()
         return DamagedHomeReportReceipt(**result)
 
     # CHG-153 — Alta de un punto logístico (JSON). La dependencia y la
@@ -2844,13 +2932,26 @@ def create_app(
         actor = resolve_actor(request)
         if isinstance(actor, JSONResponse):
             return actor
-        _actor_kind, account_id = actor
+        actor_kind, account_id = actor
 
         body = await request.body()
         try:
             payload = AidLocationInput.model_validate_json(body)
         except ValidationError as error:
             return invalid_fields_problem(error)
+
+        # CHG-161 (F2) — Refuerzo server-side del portón de sesión: el
+        # acopio local y el punto de distribución exigen una persona
+        # responsable con cuenta. El formulario ya lo impide, pero la
+        # regla vive aquí, como la dependencia y la ciudad.
+        if payload.kind in AID_LOCATION_KINDS_REQUIRING_ACCOUNT and (
+            actor_kind != "authenticated" or account_id is None
+        ):
+            return problem(
+                401,
+                "Sesión requerida",
+                "Este tipo de punto logístico exige una cuenta.",
+            )
 
         try:
             result = await data.create_aid_location(
@@ -2900,11 +3001,13 @@ def create_app(
                     "uno de la misma ciudad."
                 ),
             }
+            # El campo culpable viaja en `fields` (CHG-114) para que el
+            # formulario resalte el selector del centro asociado.
             return problem(
                 422,
                 "Centro asociado inválido",
                 messages.get(result, "Centro asociado inválido."),
-                problem_type="validation-error",
+                fields=["parentId"],
             )
 
         row, _created = result

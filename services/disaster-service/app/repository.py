@@ -2378,9 +2378,15 @@ class PostgresDisasterRepository:
         return dict(row)
 
     # CHG-162 — Alta de «Mi casita partida» (publicación inmediata).
+    # F2: el identificador llega hecho desde la capa HTTP (las fotos ya
+    # se guardaron bajo ese prefijo) y las fotografías entran en la
+    # misma transacción; un reintento idempotente devuelve la constancia
+    # original y avisa con `created=False` para que quien llamó borre
+    # los binarios sobrantes.
     async def create_damaged_home_report(
         self,
         *,
+        report_id: UUID,
         idempotency_key: str,
         description: str,
         department: str,
@@ -2389,35 +2395,65 @@ class PostgresDisasterRepository:
         latitude: float | None,
         longitude: float | None,
         account_id: UUID | None,
-    ) -> dict:
-        row = await self._pool.fetchrow(
-            """
-            INSERT INTO disaster_service.damaged_home_reports (
-                idempotency_key, account_id, description, department,
-                municipality, address, latitude, longitude
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            ON CONFLICT (idempotency_key) DO NOTHING
-            RETURNING id, created_at
-            """,
-            idempotency_key,
-            account_id,
-            description,
-            department,
-            municipality,
-            address,
-            latitude,
-            longitude,
-        )
-        if row is None:
-            row = await self._pool.fetchrow(
-                """
-                SELECT id, created_at
-                FROM disaster_service.damaged_home_reports
-                WHERE idempotency_key = $1
-                """,
-                idempotency_key,
-            )
-        return dict(row)
+        photos: list[StoredPhoto] | None = None,
+    ) -> tuple[dict, bool]:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO disaster_service.damaged_home_reports (
+                        id, idempotency_key, account_id, description,
+                        department, municipality, address, latitude,
+                        longitude
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                    RETURNING id, created_at
+                    """,
+                    report_id,
+                    idempotency_key,
+                    account_id,
+                    description,
+                    department,
+                    municipality,
+                    address,
+                    latitude,
+                    longitude,
+                )
+                if row is None:
+                    existing = await connection.fetchrow(
+                        """
+                        SELECT id, created_at
+                        FROM disaster_service.damaged_home_reports
+                        WHERE idempotency_key = $1
+                        """,
+                        idempotency_key,
+                    )
+                    return dict(existing), False
+                for photo in photos or []:
+                    await connection.execute(
+                        """
+                        INSERT INTO
+                            disaster_service.damaged_home_report_photos (
+                            id, report_id, position, object_key,
+                            derived_object_key, content_type,
+                            size_bytes, sha256, malware_scan,
+                            exif_removed
+                        ) VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                        )
+                        """,
+                        photo.id,
+                        report_id,
+                        photo.position,
+                        photo.storage_key,
+                        photo.derived_storage_key,
+                        photo.content_type,
+                        photo.size_bytes,
+                        photo.sha256,
+                        photo.malware_scan,
+                        photo.exif_removed,
+                    )
+                return dict(row), True
 
     async def operational_map_overview(
         self,
@@ -7092,6 +7128,15 @@ class PostgresDisasterRepository:
                         _OFFER_PUBLICATION_HIDE_SQL,
                         submission_id,
                     )
+                # CHG-162 (F2): el informe de vivienda nace publicado;
+                # la decisión recalcula si sigue en el mapa.
+                if kind == "damaged_home_report" and action in (
+                    "accept", "reject", "archive", "restore"
+                ):
+                    await connection.execute(
+                        _DAMAGED_HOME_VISIBILITY_SQL,
+                        submission_id,
+                    )
 
                 audit_event_id = await self._admin_audit(
                     connection,
@@ -7366,6 +7411,42 @@ _ADMIN_UNIFIED_CTE = """
         0,
         o.account_id
     FROM disaster_service.aid_offers o
+    UNION ALL
+    -- CHG-162 (F2) — «Mi casita partida» en el tema Infraestructura.
+    SELECT
+        d.id,
+        'damaged_home_report',
+        'CASA-' || upper(left(d.id::text, 8)),
+        'Hogar en malas condiciones',
+        d.municipality || ', ' || d.department,
+        CASE
+            WHEN d.account_id IS NOT NULL THEN 'Reporte con cuenta'
+            ELSE 'Reporte anónimo'
+        END,
+        d.moderation_status::text,
+        d.needs_information,
+        d.archived_at,
+        d.created_at,
+        d.updated_at,
+        d.version,
+        (SELECT COUNT(*)
+         FROM disaster_service.damaged_home_report_photos p
+         WHERE p.report_id = d.id)::int,
+        d.account_id
+    FROM disaster_service.damaged_home_reports d
+"""
+
+# CHG-162 (F2) — La visibilidad en el mapa se deriva del estado
+# resultante, no de la acción: publicado mientras no esté rechazado ni
+# archivado (CHG-075 lo hace nacer publicado). Así, restaurar algo que
+# quedó rechazado no lo devuelve al mapa por accidente.
+_DAMAGED_HOME_VISIBILITY_SQL = """
+    UPDATE disaster_service.damaged_home_reports
+    SET visible = (
+            moderation_status <> 'rejected' AND archived_at IS NULL
+        ),
+        updated_at = NOW()
+    WHERE id = $1
 """
 
 # Proyección del estado del dominio al estado administrativo unificado
@@ -7738,6 +7819,27 @@ _ADMIN_TABLES: dict[str, dict[str, str | None]] = {
         "derived_column": "derived_storage_key",
         "detail_sql": (
             "SELECT * FROM disaster_service.missing_person_reports "
+            "WHERE id = $1"
+        ),
+    },
+    # CHG-162 (F2) — «Mi casita partida» entra en la bandeja del tema
+    # Infraestructura. Nace publicada, así que la decisión solo mueve su
+    # visibilidad en el mapa (efecto en admin_mutate_submission).
+    "damaged_home_report": {
+        "table": "disaster_service.damaged_home_reports",
+        "status_column": "moderation_status",
+        "accepted_value": "accepted",
+        "rejected_value": "rejected",
+        "decided_columns": (
+            "moderated_at = NOW(), moderated_by = 'super_admin'"
+        ),
+        "photo_table": (
+            "disaster_service.damaged_home_report_photos"
+        ),
+        "photo_fk": "report_id",
+        "derived_column": "derived_object_key",
+        "detail_sql": (
+            "SELECT * FROM disaster_service.damaged_home_reports "
             "WHERE id = $1"
         ),
     },
