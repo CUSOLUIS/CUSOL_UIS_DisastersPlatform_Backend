@@ -38,6 +38,14 @@ from .models import (
     DamagedHomeReportReceipt,
     HumanitarianTransportReceipt,
     ActiveTransportsResponse,
+    # CHG-174: aceptación de ruta Centro Local ↔ Mulera.
+    MyTransportsResponse,
+    RouteAcceptanceReceipt,
+    RouteCodeValidationReceipt,
+    TransportCenterRequestsResponse,
+    TransportRequestDecisionReceipt,
+    TransportRouteCodeReceipt,
+    TransportRouteStatesResponse,
     TransportCitiesResponse,
     TransportJourneyReceipt,
     AdminSubmissionTheme,
@@ -4101,6 +4109,385 @@ def create_app(
             transport_position_limiter,
             "transport-position",
             body=await request.body(),
+        )
+
+    # ------------------------------------------------------------------
+    # CHG-174 — Aceptación inicial de ruta Centro Local ↔ Mulera.
+    # Todo exige sesión; la autorización fina (responsable del centro o
+    # dueño del transporte) la resuelve disaster-service contra la base
+    # de datos, nunca contra un identificador enviado por el cliente
+    # (§58-§60).
+    # ------------------------------------------------------------------
+
+    async def route_acceptance_call(
+        request: Request,
+        upstream: httpx.AsyncClient,
+        identity: httpx.AsyncClient,
+        path: str,
+        model,
+        *,
+        method: str = "GET",
+        body: bytes | None = None,
+        mutation: bool = False,
+    ):
+        if mutation:
+            forbidden = origin_not_allowed(request)
+            if forbidden is not None:
+                return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if mutation and not account_contribution_limiter.allow(
+            f"route-acceptance:{account.id}"
+        ):
+            return rate_limited_response(
+                "Se superó el límite de acciones por minuto."
+            )
+        headers = {
+            "x-actor-kind": "authenticated",
+            "x-account-id": str(account.id),
+            # El rol viaja para que el super_admin pueda administrar
+            # cualquier centro; el responsable real se resuelve abajo.
+            "x-actor-role": account.assigned_role,
+        }
+        if body is not None:
+            headers["content-type"] = "application/json"
+        try:
+            if method == "POST":
+                response = await upstream.post(
+                    path, content=body, headers=headers
+                )
+            else:
+                response = await upstream.get(path, headers=headers)
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                content=model.model_validate(response.json()).model_dump(
+                    mode="json", by_alias=True
+                ),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible completar la operación en este momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.get(
+        "/api/v1/me/center-transport-requests",
+        response_model=TransportCenterRequestsResponse,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_center_transport_requests(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await route_acceptance_call(
+            request,
+            upstream,
+            identity,
+            "/internal/v1/me/center-transport-requests",
+            TransportCenterRequestsResponse,
+        )
+
+    @application.post(
+        "/api/v1/me/center-transport-requests/{request_id}/decision",
+        response_model=TransportRequestDecisionReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Centro u origen sin permiso"},
+            404: {"description": "Solicitud inexistente"},
+            409: {"description": "Solicitud ya procesada"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def decide_center_transport_request(
+        request_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await route_acceptance_call(
+            request,
+            upstream,
+            identity,
+            f"/internal/v1/me/center-transport-requests/{request_id}"
+            "/decision",
+            TransportRequestDecisionReceipt,
+            method="POST",
+            body=await request.body(),
+            mutation=True,
+        )
+
+    @application.get(
+        "/api/v1/me/center-route-acceptances",
+        response_model=TransportRouteStatesResponse,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_center_route_acceptances(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await route_acceptance_call(
+            request,
+            upstream,
+            identity,
+            "/internal/v1/me/center-route-acceptances",
+            TransportRouteStatesResponse,
+        )
+
+    @application.post(
+        "/api/v1/me/transports/{transport_id}/route-acceptance",
+        response_model=TransportRouteCodeReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Centro u origen sin permiso"},
+            404: {"description": "Transporte inexistente"},
+            409: {"description": "Aceptaciones pendientes"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def start_local_route_acceptance(
+        transport_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await route_acceptance_call(
+            request,
+            upstream,
+            identity,
+            f"/internal/v1/me/humanitarian-transports/{transport_id}"
+            "/route-acceptance",
+            TransportRouteCodeReceipt,
+            method="POST",
+            mutation=True,
+        )
+
+    # CHG-175 — Etapa 2: Mulera ↔ Centro de Acopio Receptor. Espejo de
+    # la etapa 1, con su propio código; el orden lo impone el backend.
+    @application.post(
+        "/api/v1/me/transports/{transport_id}/reception-route-acceptance",
+        response_model=TransportRouteCodeReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Centro u origen sin permiso"},
+            404: {"description": "Transporte inexistente"},
+            409: {
+                "description": (
+                    "Aceptaciones pendientes o etapa previa incompleta"
+                )
+            },
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def start_reception_route_acceptance(
+        transport_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await route_acceptance_call(
+            request,
+            upstream,
+            identity,
+            f"/internal/v1/me/humanitarian-transports/{transport_id}"
+            "/reception-route-acceptance",
+            TransportRouteCodeReceipt,
+            method="POST",
+            mutation=True,
+        )
+
+    @application.post(
+        "/api/v1/me/transports/{transport_id}/reception-route-code/validate",
+        response_model=RouteCodeValidationReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Cuenta u origen sin permiso"},
+            409: {"description": "Etapa sin código o código ya usado"},
+            422: {"description": "Código inválido para esta aceptación"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def validate_reception_route_code(
+        transport_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await route_acceptance_call(
+            request,
+            upstream,
+            identity,
+            f"/internal/v1/me/humanitarian-transports/{transport_id}"
+            "/reception-route-code/validate",
+            RouteCodeValidationReceipt,
+            method="POST",
+            body=await request.body(),
+            mutation=True,
+        )
+
+    @application.post(
+        "/api/v1/me/transports/{transport_id}/reception-route-accept",
+        response_model=RouteAcceptanceReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Cuenta u origen sin permiso"},
+            409: {"description": "Etapa sin código o código ya usado"},
+            422: {"description": "Código inválido para esta aceptación"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def accept_reception_route_by_mule(
+        transport_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await route_acceptance_call(
+            request,
+            upstream,
+            identity,
+            f"/internal/v1/me/humanitarian-transports/{transport_id}"
+            "/reception-route-accept",
+            RouteAcceptanceReceipt,
+            method="POST",
+            body=await request.body(),
+            mutation=True,
+        )
+
+    @application.get(
+        "/api/v1/me/transports",
+        response_model=MyTransportsResponse,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_my_transports(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await route_acceptance_call(
+            request,
+            upstream,
+            identity,
+            "/internal/v1/me/humanitarian-transports",
+            MyTransportsResponse,
+        )
+
+    @application.post(
+        "/api/v1/me/transports/{transport_id}/route-code/validate",
+        response_model=RouteCodeValidationReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Cuenta u origen sin permiso"},
+            409: {"description": "Ruta sin código o código ya usado"},
+            422: {"description": "Código inválido"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def validate_route_code(
+        transport_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await route_acceptance_call(
+            request,
+            upstream,
+            identity,
+            f"/internal/v1/me/humanitarian-transports/{transport_id}"
+            "/route-code/validate",
+            RouteCodeValidationReceipt,
+            method="POST",
+            body=await request.body(),
+            mutation=True,
+        )
+
+    @application.post(
+        "/api/v1/me/transports/{transport_id}/route-accept",
+        response_model=RouteAcceptanceReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Cuenta u origen sin permiso"},
+            409: {"description": "Ruta sin código o código ya usado"},
+            422: {"description": "Código inválido"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def accept_route_by_mule(
+        transport_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await route_acceptance_call(
+            request,
+            upstream,
+            identity,
+            f"/internal/v1/me/humanitarian-transports/{transport_id}"
+            "/route-accept",
+            RouteAcceptanceReceipt,
+            method="POST",
+            body=await request.body(),
+            mutation=True,
         )
 
     # CHG-162 — Alta de «Mi casita partida» (anónimo permitido, como

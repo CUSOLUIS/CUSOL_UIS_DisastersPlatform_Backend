@@ -1281,71 +1281,92 @@ class PostgresDisasterRepository:
         ):
             return "destination_unavailable"
 
-        row = await self._pool.fetchrow(
-            """
-            INSERT INTO disaster_service.humanitarian_transports (
-                idempotency_key, kind, account_id,
-                origin_municipality, destination_municipality,
-                origin_location_id, destination_location_id,
-                supplies_summary,
-                driver_full_name, driver_document_type,
-                driver_document_number_encrypted, driver_phone_encrypted,
-                tractor_plate, trailer_plate,
-                vessel_registration, vessel_name, vessel_type,
-                vehicle_visible_characteristics
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                      $12, $13, $14, $15, $16, $17, $18)
-            ON CONFLICT (idempotency_key) DO NOTHING
-            RETURNING id, kind, status, origin_location_id,
-                      destination_location_id, created_at
-            """,
-            idempotency_key,
-            kind,
-            account_id,
-            origin_municipality.strip(),
-            destination_municipality.strip(),
-            origin_location_id,
-            destination_location_id,
-            supplies_summary,
-            driver_full_name,
-            driver_document_type,
-            driver_document_number_encrypted,
-            driver_phone_encrypted,
-            tractor_plate,
-            trailer_plate,
-            vessel_registration,
-            vessel_name,
-            vessel_type,
-            vehicle_visible_characteristics,
-        )
-        if row is None:
-            # Reintento idempotente: devolver el alta original.
-            row = await self._pool.fetchrow(
-                """
-                SELECT id, kind, status, origin_location_id,
-                       destination_location_id, created_at
-                FROM disaster_service.humanitarian_transports
-                WHERE idempotency_key = $1
-                """,
-                idempotency_key,
-            )
-        else:
-            # CHG-171 §60: el alta queda en la auditoría comunitaria
-            # existente (sin datos sensibles del conductor).
-            await self._pool.execute(
-                """
-                INSERT INTO
-                    disaster_service.community_contribution_audit (
-                    event_type, contribution_kind, contribution_id,
-                    detail
-                ) VALUES ($1, $2, $3, $4)
-                """,
-                "humanitarian_transport_registered",
-                "humanitarian_transport",
-                row["id"],
-                f"cuenta={account_id} origen={origin_location_id} "
-                f"destino={destination_location_id} kind={kind}",
-            )
+        # CHG-174 §7/§53: el alta y las solicitudes a los dos centros
+        # viajan en una sola transacción — no puede existir un
+        # transporte nuevo sin que sus centros sepan de él.
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO disaster_service.humanitarian_transports (
+                        idempotency_key, kind, account_id,
+                        origin_municipality, destination_municipality,
+                        origin_location_id, destination_location_id,
+                        supplies_summary,
+                        driver_full_name, driver_document_type,
+                        driver_document_number_encrypted,
+                        driver_phone_encrypted,
+                        tractor_plate, trailer_plate,
+                        vessel_registration, vessel_name, vessel_type,
+                        vehicle_visible_characteristics
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                              $12, $13, $14, $15, $16, $17, $18)
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                    RETURNING id, kind, status, origin_location_id,
+                              destination_location_id, created_at
+                    """,
+                    idempotency_key,
+                    kind,
+                    account_id,
+                    origin_municipality.strip(),
+                    destination_municipality.strip(),
+                    origin_location_id,
+                    destination_location_id,
+                    supplies_summary,
+                    driver_full_name,
+                    driver_document_type,
+                    driver_document_number_encrypted,
+                    driver_phone_encrypted,
+                    tractor_plate,
+                    trailer_plate,
+                    vessel_registration,
+                    vessel_name,
+                    vessel_type,
+                    vehicle_visible_characteristics,
+                )
+                if row is None:
+                    # Reintento idempotente: devolver el alta original.
+                    row = await connection.fetchrow(
+                        """
+                        SELECT id, kind, status, origin_location_id,
+                               destination_location_id, created_at
+                        FROM disaster_service.humanitarian_transports
+                        WHERE idempotency_key = $1
+                        """,
+                        idempotency_key,
+                    )
+                    return dict(row)
+                # CHG-174 §7: una solicitud por lado, contra el mismo
+                # transport_id (nunca se duplica el transporte).
+                await connection.executemany(
+                    """
+                    INSERT INTO
+                        disaster_service.transport_center_requests (
+                        transport_id, center_id, center_role
+                    ) VALUES ($1, $2, $3)
+                    ON CONFLICT (transport_id, center_id) DO NOTHING
+                    """,
+                    [
+                        (row["id"], origin_location_id, "local"),
+                        (row["id"], destination_location_id, "reception"),
+                    ],
+                )
+                # CHG-171 §60: el alta queda en la auditoría comunitaria
+                # existente (sin datos sensibles del conductor).
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.community_contribution_audit (
+                        event_type, contribution_kind, contribution_id,
+                        detail
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    "humanitarian_transport_registered",
+                    "humanitarian_transport",
+                    row["id"],
+                    f"cuenta={account_id} origen={origin_location_id} "
+                    f"destino={destination_location_id} kind={kind}",
+                )
         return dict(row)
 
     # CHG-171 §50 — Catálogo de ciudades: sembrado (044) UNIDO con los
@@ -1597,6 +1618,764 @@ class PostgresDisasterRepository:
         for transport in transports:
             transport["trail"] = by_transport.get(transport["id"], [])
         return transports
+
+    # ------------------------------------------------------------------
+    # CHG-174 — Aceptación inicial de ruta Centro de Acopio Local ↔
+    # Mulera. Dos etapas separadas (§4): la solicitud («acepto que esta
+    # Mulera use mi centro») y la ruta («esta es la ruta que vamos a
+    # iniciar», con código único).
+    # ------------------------------------------------------------------
+
+    # §58: responsable de un centro es la cuenta que lo registró; el
+    # super_admin administra todos. Los centros históricos tienen
+    # `created_by_account_id` en NULL y solo los ve el super_admin.
+    _CENTER_STEWARD_SQL = """
+        (a.created_by_account_id = $1 OR $2::boolean)
+    """
+
+    async def list_center_transport_requests(
+        self, *, account_id: UUID, is_super_admin: bool
+    ) -> list[dict]:
+        """Bandeja del centro: solicitudes de transporte de SUS centros.
+
+        §65: primero las pendientes y, dentro de cada grupo, las más
+        recientes arriba. Incluye los datos del conductor porque es una
+        vista administrativa autorizada (§12-§13); el filtrado por
+        centro responsable ocurre en el WHERE, no en el cliente.
+        """
+        rows = await self._pool.fetch(
+            f"""
+            SELECT r.id, r.transport_id, r.center_id,
+                   r.center_role::text AS center_role,
+                   r.status::text AS status,
+                   r.requested_at, r.decided_at,
+                   a.name AS center_name,
+                   a.municipality AS center_municipality,
+                   t.kind::text AS transport_kind,
+                   t.origin_municipality, t.destination_municipality,
+                   t.supplies_summary, t.created_at AS transport_created_at,
+                   t.driver_full_name, t.driver_document_type,
+                   t.driver_document_number_encrypted,
+                   t.driver_phone_encrypted,
+                   t.tractor_plate, t.trailer_plate,
+                   t.vessel_registration, t.vessel_name, t.vessel_type,
+                   t.vehicle_visible_characteristics,
+                   o.name AS origin_center_name,
+                   d.name AS destination_center_name
+            FROM disaster_service.transport_center_requests r
+            INNER JOIN disaster_service.aid_locations a
+                ON a.id = r.center_id
+            INNER JOIN disaster_service.humanitarian_transports t
+                ON t.id = r.transport_id
+            INNER JOIN disaster_service.aid_locations o
+                ON o.id = t.origin_location_id
+            INNER JOIN disaster_service.aid_locations d
+                ON d.id = t.destination_location_id
+            WHERE {self._CENTER_STEWARD_SQL}
+            ORDER BY (r.status = 'pending') DESC, r.requested_at DESC
+            LIMIT 200
+            """,
+            account_id,
+            is_super_admin,
+        )
+        return [dict(row) for row in rows]
+
+    async def decide_center_transport_request(
+        self,
+        *,
+        request_id: UUID,
+        account_id: UUID,
+        is_super_admin: bool,
+        accept: bool,
+    ) -> dict | str:
+        """ACEPTAR / DECLINAR una solicitud (§16-§17).
+
+        Devuelve una cadena de error si no existe, si la cuenta no es
+        responsable del centro (§58) o si ya fue decidida (§66-§67).
+        """
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                current = await connection.fetchrow(
+                    f"""
+                    SELECT r.id, r.transport_id, r.center_id,
+                           r.status::text AS status,
+                           {self._CENTER_STEWARD_SQL} AS is_steward
+                    FROM disaster_service.transport_center_requests r
+                    INNER JOIN disaster_service.aid_locations a
+                        ON a.id = r.center_id
+                    WHERE r.id = $3
+                    FOR UPDATE OF r
+                    """,
+                    account_id,
+                    is_super_admin,
+                    request_id,
+                )
+                if current is None:
+                    return "not_found"
+                if not current["is_steward"]:
+                    return "forbidden"
+                if current["status"] != "pending":
+                    return "already_decided"
+                updated = await connection.fetchrow(
+                    """
+                    UPDATE disaster_service.transport_center_requests
+                    SET status = $2::disaster_service
+                                 .transport_request_status,
+                        decided_at = NOW(),
+                        decided_by = $3
+                    WHERE id = $1
+                    RETURNING id, transport_id, center_id,
+                              status::text AS status, decided_at
+                    """,
+                    request_id,
+                    "accepted" if accept else "declined",
+                    account_id,
+                )
+                await self._transport_audit(
+                    connection,
+                    (
+                        "transport_request_accepted"
+                        if accept
+                        else "transport_request_declined"
+                    ),
+                    current["transport_id"],
+                    f"cuenta={account_id} centro={current['center_id']} "
+                    f"estado=pending->{updated['status']}",
+                )
+        return dict(updated)
+
+    async def _transport_audit(
+        self, connection, event_type: str, transport_id: UUID, detail: str
+    ) -> None:
+        """Auditoría comunitaria de los hitos del transporte (§61-§62).
+
+        El código de ruta NUNCA entra aquí.
+        """
+        await connection.execute(
+            """
+            INSERT INTO disaster_service.community_contribution_audit (
+                event_type, contribution_kind, contribution_id, detail
+            ) VALUES ($1, $2, $3, $4)
+            """,
+            event_type,
+            "humanitarian_transport",
+            transport_id,
+            detail,
+        )
+
+    _ROUTE_STATE_SQL = """
+        SELECT t.id AS transport_id, t.kind::text AS transport_kind,
+               t.origin_location_id, t.destination_location_id,
+               t.origin_municipality, t.destination_municipality,
+               t.created_at AS transport_created_at,
+               t.account_id AS mule_account_id,
+               o.name AS origin_center_name,
+               d.name AS destination_center_name,
+               local_req.status::text AS local_status,
+               reception_req.status::text AS reception_status,
+               ra.confirmation_code, ra.status::text AS route_status,
+               ra.mule_accepted_at, ra.mule_code_validated_at,
+               ra.local_accepted_at,
+               -- CHG-175: etapa 2 en la misma fila, distinguible.
+               ra.reception_confirmation_code,
+               ra.reception_started_at,
+               ra.reception_mule_code_validated_at,
+               ra.reception_mule_accepted_at,
+               ra.route_accepted_at
+        FROM disaster_service.humanitarian_transports t
+        INNER JOIN disaster_service.aid_locations o
+            ON o.id = t.origin_location_id
+        INNER JOIN disaster_service.aid_locations d
+            ON d.id = t.destination_location_id
+        LEFT JOIN disaster_service.transport_center_requests local_req
+            ON local_req.transport_id = t.id
+           AND local_req.center_id = t.origin_location_id
+        LEFT JOIN disaster_service.transport_center_requests reception_req
+            ON reception_req.transport_id = t.id
+           AND reception_req.center_id = t.destination_location_id
+        LEFT JOIN disaster_service.transport_route_acceptances ra
+            ON ra.transport_id = t.id
+           AND ra.local_center_id = t.origin_location_id
+    """
+
+    async def list_center_route_acceptances(
+        self, *, account_id: UUID, is_super_admin: bool
+    ) -> list[dict]:
+        """«Definición y aceptación de ruta» de cualquiera de los dos
+        centros (CHG-174 §68, ampliado por CHG-175 §15-§16).
+
+        Cada responsable ve el estado completo de la ruta, pero solo el
+        código de SU etapa: el centro local no ve el del receptor ni al
+        revés (§48-§49, §63). El super_admin administra ambos y ve los
+        dos.
+        """
+        rows = await self._pool.fetch(
+            f"""
+            {self._ROUTE_STATE_SQL}
+            INNER JOIN disaster_service.aid_locations origin_center
+                ON origin_center.id = t.origin_location_id
+            INNER JOIN disaster_service.aid_locations destination_center
+                ON destination_center.id = t.destination_location_id
+            WHERE (origin_center.created_by_account_id = $1 OR $2::boolean)
+               OR (destination_center.created_by_account_id = $1
+                   OR $2::boolean)
+            ORDER BY t.created_at DESC
+            LIMIT 200
+            """,
+            account_id,
+            is_super_admin,
+        )
+        items = []
+        for row in rows:
+            item = dict(row)
+            stewardship = await self._route_stewardship(
+                account_id=account_id,
+                is_super_admin=is_super_admin,
+                origin_location_id=item["origin_location_id"],
+                destination_location_id=item["destination_location_id"],
+            )
+            item["is_local_steward"] = stewardship["local"]
+            item["is_reception_steward"] = stewardship["reception"]
+            if not stewardship["local"]:
+                item["confirmation_code"] = None
+            if not stewardship["reception"]:
+                item["reception_confirmation_code"] = None
+            items.append(item)
+        return items
+
+    async def _route_stewardship(
+        self,
+        *,
+        account_id: UUID,
+        is_super_admin: bool,
+        origin_location_id: UUID,
+        destination_location_id: UUID,
+    ) -> dict:
+        """De cuál de los dos centros es responsable esta cuenta."""
+        row = await self._pool.fetchrow(
+            """
+            SELECT
+                bool_or(id = $3 AND (created_by_account_id = $1 OR $2))
+                    AS local,
+                bool_or(id = $4 AND (created_by_account_id = $1 OR $2))
+                    AS reception
+            FROM disaster_service.aid_locations
+            WHERE id IN ($3, $4)
+            """,
+            account_id,
+            is_super_admin,
+            origin_location_id,
+            destination_location_id,
+        )
+        return {
+            "local": bool(row["local"]),
+            "reception": bool(row["reception"]),
+        }
+
+    async def start_local_route_acceptance(
+        self,
+        *,
+        transport_id: UUID,
+        account_id: UUID,
+        is_super_admin: bool,
+        generate_code,
+    ) -> dict | str:
+        """ACEPTAR RUTA del Centro Local (§27).
+
+        Valida de nuevo en backend que ambos centros aceptaron (§56),
+        que la cuenta es responsable del centro local (§58) y que no
+        existe ya un proceso activo: el doble clic devuelve el mismo
+        código, no uno nuevo (§52).
+        """
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                # Se bloquea el transporte, no el LEFT JOIN: Postgres no
+                # admite FOR UPDATE sobre el lado nulable de un outer
+                # join, y bloquear el transporte ya serializa las
+                # peticiones simultáneas de esta ruta (§53).
+                state = await connection.fetchrow(
+                    f"""
+                    {self._ROUTE_STATE_SQL}
+                    WHERE t.id = $1
+                    FOR UPDATE OF t
+                    """,
+                    transport_id,
+                )
+                if state is None:
+                    return "not_found"
+                steward = await connection.fetchval(
+                    """
+                    SELECT (created_by_account_id = $1 OR $2::boolean)
+                    FROM disaster_service.aid_locations
+                    WHERE id = $3
+                    """,
+                    account_id,
+                    is_super_admin,
+                    state["origin_location_id"],
+                )
+                if not steward:
+                    return "forbidden"
+                if state["confirmation_code"] is not None:
+                    # §52: proceso ya activo — se conserva, no se
+                    # duplica ni se reemplaza el código.
+                    return {
+                        "transport_id": transport_id,
+                        "confirmation_code": state["confirmation_code"],
+                        "status": state["route_status"],
+                        "reused": True,
+                    }
+                if (
+                    state["local_status"] != "accepted"
+                    or state["reception_status"] != "accepted"
+                ):
+                    return "not_ready"
+                code = generate_code()
+                created = await connection.fetchrow(
+                    """
+                    INSERT INTO
+                        disaster_service.transport_route_acceptances (
+                        transport_id, local_center_id, confirmation_code,
+                        local_accepted_by
+                    ) VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (transport_id, local_center_id)
+                        DO NOTHING
+                    RETURNING confirmation_code, status::text AS status
+                    """,
+                    transport_id,
+                    state["origin_location_id"],
+                    code,
+                    account_id,
+                )
+                if created is None:
+                    # Carrera con otra petición simultánea (§53): gana
+                    # la primera y se devuelve su código.
+                    existing = await connection.fetchrow(
+                        """
+                        SELECT confirmation_code, status::text AS status
+                        FROM disaster_service
+                             .transport_route_acceptances
+                        WHERE transport_id = $1 AND local_center_id = $2
+                        """,
+                        transport_id,
+                        state["origin_location_id"],
+                    )
+                    return {
+                        "transport_id": transport_id,
+                        "confirmation_code": existing["confirmation_code"],
+                        "status": existing["status"],
+                        "reused": True,
+                    }
+                await self._transport_audit(
+                    connection,
+                    "local_route_code_generated",
+                    transport_id,
+                    f"cuenta={account_id} "
+                    f"centro={state['origin_location_id']} "
+                    f"estado=none->code_issued",
+                )
+        return {
+            "transport_id": transport_id,
+            "confirmation_code": created["confirmation_code"],
+            "status": created["status"],
+            "reused": False,
+        }
+
+    # ------------------------------------------------------------------
+    # CHG-175 — Etapa 2: Mulera ↔ Centro de Acopio Receptor. Espejo de la
+    # etapa 1, con su propio código y su propia secuencia.
+    # ------------------------------------------------------------------
+
+    async def start_reception_route_acceptance(
+        self,
+        *,
+        transport_id: UUID,
+        account_id: UUID,
+        is_super_admin: bool,
+        generate_code,
+    ) -> dict | str:
+        """ACEPTAR RUTA del Centro Receptor (§23).
+
+        El orden importa: esta etapa no existe hasta que la anterior
+        está completada (§18-§21), y el backend lo revalida aunque el
+        cliente diga lo contrario (§20, §87).
+        """
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                state = await connection.fetchrow(
+                    f"""
+                    {self._ROUTE_STATE_SQL}
+                    WHERE t.id = $1
+                    FOR UPDATE OF t
+                    """,
+                    transport_id,
+                )
+                if state is None:
+                    return "not_found"
+                steward = await connection.fetchval(
+                    """
+                    SELECT (created_by_account_id = $1 OR $2::boolean)
+                    FROM disaster_service.aid_locations
+                    WHERE id = $3
+                    """,
+                    account_id,
+                    is_super_admin,
+                    state["destination_location_id"],
+                )
+                if not steward:
+                    return "forbidden"
+                if state["reception_confirmation_code"] is not None:
+                    # §57-§58: el doble clic conserva el proceso.
+                    return {
+                        "transport_id": transport_id,
+                        "confirmation_code": state[
+                            "reception_confirmation_code"
+                        ],
+                        "status": (
+                            "accepted"
+                            if state["reception_mule_accepted_at"]
+                            else "code_issued"
+                        ),
+                        "reused": True,
+                    }
+                if (
+                    state["local_status"] != "accepted"
+                    or state["reception_status"] != "accepted"
+                ):
+                    return "not_ready"
+                # §18: y además la etapa 1 debe estar COMPLETADA.
+                if state["route_status"] != "accepted":
+                    return "local_stage_pending"
+                code = generate_code()
+                updated = await connection.fetchrow(
+                    """
+                    UPDATE disaster_service.transport_route_acceptances
+                    SET reception_center_id = $2,
+                        reception_confirmation_code = $3,
+                        reception_started_at = NOW(),
+                        reception_started_by = $4,
+                        updated_at = NOW()
+                    WHERE transport_id = $1
+                      AND reception_confirmation_code IS NULL
+                    RETURNING reception_confirmation_code
+                    """,
+                    transport_id,
+                    state["destination_location_id"],
+                    code,
+                    account_id,
+                )
+                if updated is None:
+                    # Carrera con otra petición: gana la primera (§59).
+                    existing = await connection.fetchval(
+                        """
+                        SELECT reception_confirmation_code
+                        FROM disaster_service
+                             .transport_route_acceptances
+                        WHERE transport_id = $1
+                        """,
+                        transport_id,
+                    )
+                    return {
+                        "transport_id": transport_id,
+                        "confirmation_code": existing,
+                        "status": "code_issued",
+                        "reused": True,
+                    }
+                await self._transport_audit(
+                    connection,
+                    "reception_route_code_generated",
+                    transport_id,
+                    f"cuenta={account_id} "
+                    f"centro={state['destination_location_id']} "
+                    f"estado=none->code_issued",
+                )
+        return {
+            "transport_id": transport_id,
+            "confirmation_code": updated["reception_confirmation_code"],
+            "status": "code_issued",
+            "reused": False,
+        }
+
+    async def validate_reception_route_code(
+        self, *, transport_id: UUID, account_id: UUID, code: str
+    ) -> dict | str:
+        """Valida el código del receptor sin aceptar nada (§35, §40)."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                checked = await self._check_reception_code(
+                    connection, transport_id, account_id, code
+                )
+                if isinstance(checked, str):
+                    return checked
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.transport_route_acceptances
+                    SET reception_mule_code_validated_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    checked["id"],
+                )
+                await self._transport_audit(
+                    connection,
+                    "reception_route_code_validated",
+                    transport_id,
+                    f"cuenta={account_id} "
+                    f"centro={checked['reception_center_id']}",
+                )
+        return {
+            "transport_id": transport_id,
+            "validated": True,
+            "origin_center_name": checked["origin_center_name"],
+            "destination_center_name": checked["destination_center_name"],
+        }
+
+    async def accept_reception_route_by_mule(
+        self, *, transport_id: UUID, account_id: UUID, code: str
+    ) -> dict | str:
+        """Confirmación de la Mulera con el receptor (§41).
+
+        Si con esto las DOS relaciones quedan completas, sella el estado
+        global de la ruta y lo audita (§45-§46, §69).
+        """
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                checked = await self._check_reception_code(
+                    connection, transport_id, account_id, code
+                )
+                if isinstance(checked, str):
+                    return checked
+                accepted = await connection.fetchrow(
+                    """
+                    UPDATE disaster_service.transport_route_acceptances
+                    SET reception_mule_accepted_at = NOW(),
+                        reception_mule_accepted_by = $2,
+                        reception_code_used_at = NOW(),
+                        -- §46: la ruta global solo se sella si la etapa
+                        -- 1 ya estaba completada.
+                        route_accepted_at = CASE
+                            WHEN mule_accepted_at IS NOT NULL THEN NOW()
+                            ELSE route_accepted_at
+                        END,
+                        updated_at = NOW()
+                    WHERE id = $1 AND reception_code_used_at IS NULL
+                    RETURNING reception_mule_accepted_at, route_accepted_at
+                    """,
+                    checked["id"],
+                    account_id,
+                )
+                if accepted is None:
+                    return "code_used"
+                await self._transport_audit(
+                    connection,
+                    "mule_reception_route_accepted",
+                    transport_id,
+                    f"cuenta={account_id} "
+                    f"centro={checked['reception_center_id']} "
+                    f"estado=code_issued->accepted",
+                )
+                if accepted["route_accepted_at"] is not None:
+                    # §69: el paso a ruta aceptada tiene su propio
+                    # evento, con la transición explícita.
+                    await self._transport_audit(
+                        connection,
+                        "route_fully_accepted",
+                        transport_id,
+                        "estado=local_mule_accepted->route_accepted",
+                    )
+        return {
+            "transport_id": transport_id,
+            "status": "accepted",
+            "mule_accepted_at": accepted["reception_mule_accepted_at"],
+            "route_accepted_at": accepted["route_accepted_at"],
+        }
+
+    async def _check_reception_code(
+        self, connection, transport_id: UUID, account_id: UUID, code: str
+    ) -> dict | str:
+        """Comprobaciones del §35, todas en backend.
+
+        El código del Centro Local cae aquí como `invalid_code` porque
+        se compara contra el del receptor y solo contra ese: los dos
+        procesos no son intercambiables (§26, §37).
+        """
+        row = await connection.fetchrow(
+            """
+            SELECT ra.id, ra.reception_confirmation_code,
+                   ra.reception_code_used_at, ra.reception_center_id,
+                   ra.mule_accepted_at AS local_mule_accepted_at,
+                   t.account_id, o.name AS origin_center_name,
+                   d.name AS destination_center_name
+            FROM disaster_service.humanitarian_transports t
+            INNER JOIN disaster_service.aid_locations o
+                ON o.id = t.origin_location_id
+            INNER JOIN disaster_service.aid_locations d
+                ON d.id = t.destination_location_id
+            LEFT JOIN disaster_service.transport_route_acceptances ra
+                ON ra.transport_id = t.id
+            WHERE t.id = $1
+            FOR UPDATE OF t
+            """,
+            transport_id,
+        )
+        if row is None:
+            return "not_found"
+        if row["account_id"] != account_id:
+            return "not_owner"
+        if row["id"] is None or row["reception_confirmation_code"] is None:
+            return "not_issued"
+        if row["reception_code_used_at"] is not None:
+            return "code_used"
+        if row["reception_confirmation_code"] != code.strip().upper():
+            return "invalid_code"
+        return dict(row)
+
+    async def list_my_transports(self, *, account_id: UUID) -> list[dict]:
+        """Transportes de la cuenta (§35 y deuda nº 2 de CHG-171).
+
+        Incluye el estado de la aceptación de ruta pero NUNCA el
+        código: ese lo entrega el Centro Local por fuera (§32).
+        """
+        rows = await self._pool.fetch(
+            f"""
+            {self._ROUTE_STATE_SQL}
+            WHERE t.account_id = $1
+            ORDER BY t.created_at DESC
+            LIMIT 100
+            """,
+            account_id,
+        )
+        items = []
+        for row in rows:
+            item = dict(row)
+            # Ningún código viaja hacia la Mulera: los entregan los
+            # centros por fuera (CHG-174 §32, CHG-175 §29).
+            item.pop("confirmation_code", None)
+            item.pop("reception_confirmation_code", None)
+            items.append(item)
+        return items
+
+    async def validate_route_code(
+        self, *, transport_id: UUID, account_id: UUID, code: str
+    ) -> dict | str:
+        """Valida el código sin aceptar la ruta (§38-§41)."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                checked = await self._check_route_code(
+                    connection, transport_id, account_id, code
+                )
+                if isinstance(checked, str):
+                    return checked
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.transport_route_acceptances
+                    SET mule_code_validated_at = NOW(), updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    checked["id"],
+                )
+                await self._transport_audit(
+                    connection,
+                    "mule_route_code_validated",
+                    transport_id,
+                    f"cuenta={account_id} "
+                    f"centro={checked['local_center_id']}",
+                )
+        return {
+            "transport_id": transport_id,
+            "validated": True,
+            "origin_center_name": checked["origin_center_name"],
+            "destination_center_name": checked["destination_center_name"],
+        }
+
+    async def accept_route_by_mule(
+        self, *, transport_id: UUID, account_id: UUID, code: str
+    ) -> dict | str:
+        """Confirmación explícita de la Mulera (§42).
+
+        Marca el código como usado en la misma transacción, de modo que
+        dos peticiones simultáneas no puedan aceptar dos veces (§53).
+        """
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                checked = await self._check_route_code(
+                    connection, transport_id, account_id, code
+                )
+                if isinstance(checked, str):
+                    return checked
+                accepted = await connection.fetchrow(
+                    """
+                    UPDATE disaster_service.transport_route_acceptances
+                    SET status = 'accepted',
+                        mule_accepted_at = NOW(),
+                        mule_accepted_by = $2,
+                        code_used_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = $1 AND code_used_at IS NULL
+                    RETURNING status::text AS status, mule_accepted_at
+                    """,
+                    checked["id"],
+                    account_id,
+                )
+                if accepted is None:
+                    return "code_used"
+                await self._transport_audit(
+                    connection,
+                    "local_mule_route_accepted",
+                    transport_id,
+                    f"cuenta={account_id} "
+                    f"centro={checked['local_center_id']} "
+                    f"estado=code_issued->accepted",
+                )
+        return {
+            "transport_id": transport_id,
+            "status": accepted["status"],
+            "mule_accepted_at": accepted["mule_accepted_at"],
+        }
+
+    async def _check_route_code(
+        self, connection, transport_id: UUID, account_id: UUID, code: str
+    ) -> dict | str:
+        """Comprobaciones comunes del §38, todas en backend.
+
+        El transporte debe ser de esta cuenta, el código debe ser el de
+        ESTA ruta y no puede haberse usado. Un código de otra Mulera
+        cae aquí como `invalid_code` sin revelar a quién pertenece
+        (§39, §55).
+        """
+        row = await connection.fetchrow(
+            """
+            SELECT ra.id, ra.confirmation_code, ra.code_used_at,
+                   ra.status::text AS status, ra.local_center_id,
+                   t.account_id, o.name AS origin_center_name,
+                   d.name AS destination_center_name
+            FROM disaster_service.humanitarian_transports t
+            INNER JOIN disaster_service.aid_locations o
+                ON o.id = t.origin_location_id
+            INNER JOIN disaster_service.aid_locations d
+                ON d.id = t.destination_location_id
+            LEFT JOIN disaster_service.transport_route_acceptances ra
+                ON ra.transport_id = t.id
+               AND ra.local_center_id = t.origin_location_id
+            WHERE t.id = $1
+            -- Se bloquea el transporte: FOR UPDATE no puede aplicarse al
+            -- lado nulable de un outer join, y bloquearlo serializa
+            -- igualmente validación y aceptación de esta ruta (§53).
+            FOR UPDATE OF t
+            """,
+            transport_id,
+        )
+        if row is None:
+            return "not_found"
+        if row["account_id"] != account_id:
+            return "not_owner"
+        if row["id"] is None:
+            # §57: la Mulera no puede adelantarse a la emisión.
+            return "not_issued"
+        if row["code_used_at"] is not None:
+            return "code_used"
+        if row["confirmation_code"] != code.strip().upper():
+            return "invalid_code"
+        return dict(row)
 
     # CHG-162 — Alta de «Mi casita partida» (publicación inmediata).
     async def create_damaged_home_report(

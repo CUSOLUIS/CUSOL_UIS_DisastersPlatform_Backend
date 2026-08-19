@@ -57,6 +57,19 @@ from .models import (
     TransportCity,
     TransportJourneyReceipt,
     TransportPositionInput,
+    # CHG-174: aceptación de ruta Centro Local ↔ Mulera.
+    MyTransport,
+    MyTransportsResponse,
+    RouteAcceptanceReceipt,
+    RouteCodeInput,
+    RouteCodeValidationReceipt,
+    TransportCenterRequest,
+    TransportCenterRequestsResponse,
+    TransportRequestDecisionInput,
+    TransportRequestDecisionReceipt,
+    TransportRouteCodeReceipt,
+    TransportRouteState,
+    TransportRouteStatesResponse,
     AidLocationParentCandidate,
     AidLocationParentCandidatesResponse,
     AidLocationRatingInput,
@@ -239,6 +252,24 @@ def generate_help_request_code(now: datetime) -> str:
 def generate_food_offer_code(now: datetime) -> str:
     """Código público de oferta de comida (CHG-163)."""
     return f"FO-{now.year}-{secrets.token_hex(4).upper()}"
+
+
+def generate_reception_route_code(now: datetime) -> str:
+    """Código de la etapa 2, Mulera ↔ Centro Receptor (CHG-175 §24).
+
+    Prefijo propio: los dos códigos de un mismo transporte no se
+    parecen y no son intercambiables (§25-§26).
+    """
+    return f"RR-{now.year}-{secrets.token_hex(4).upper()}"
+
+
+def generate_route_code(now: datetime) -> str:
+    """Código de registro de ruta Local ↔ Mulera (CHG-174 §28).
+
+    Lo genera SIEMPRE el backend, no es predecible y no se reutiliza:
+    su unicidad la garantiza además un índice único.
+    """
+    return f"RT-{now.year}-{secrets.token_hex(4).upper()}"
 
 
 # CHG-036 — Campos del detalle administrativo por tipo:
@@ -2355,6 +2386,381 @@ def create_app(
         if failure is not None:
             return failure
         return TransportJourneyReceipt(**result)
+
+    # ------------------------------------------------------------------
+    # CHG-174 — Aceptación inicial de ruta Centro Local ↔ Mulera.
+    # ------------------------------------------------------------------
+
+    def _steward_actor(request: Request):
+        """Cuenta que actúa por un centro, y si además es super_admin.
+
+        §58: la autorización real es por centro y la resuelve el
+        repositorio; aquí solo se identifica al actor.
+        """
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401,
+                "Sesión requerida",
+                "La gestión de solicitudes exige una cuenta.",
+            )
+        is_super_admin = (
+            request.headers.get("x-actor-role", "").strip() == "super_admin"
+        )
+        return account_id, is_super_admin
+
+    def _route_problem(result) -> JSONResponse | None:
+        messages = {
+            "not_found": (
+                404,
+                "Solicitud no encontrada",
+                "La solicitud o el transporte no existe.",
+            ),
+            "forbidden": (
+                403,
+                "Centro sin permiso",
+                "Solo el responsable de ese centro puede decidir esta "
+                "solicitud.",
+            ),
+            "already_decided": (
+                409,
+                "Solicitud ya procesada",
+                "Esta solicitud ya fue aceptada o declinada.",
+            ),
+            "not_ready": (
+                409,
+                "Aceptaciones pendientes",
+                "La ruta exige que los dos centros hayan aceptado la "
+                "solicitud.",
+            ),
+            "not_owner": (
+                403,
+                "Cuenta sin permiso",
+                "Solo la cuenta que registró el transporte puede "
+                "aceptar su ruta.",
+            ),
+            "local_stage_pending": (
+                409,
+                "Etapa previa pendiente",
+                "La aceptación entre el Centro de Acopio Local y la "
+                "Mulera debe completarse antes de esta.",
+            ),
+            "not_issued": (
+                409,
+                "Ruta sin código",
+                "El Centro de Acopio Local todavía no inició la "
+                "aceptación de ruta.",
+            ),
+            # §39: nunca se revela a qué transporte pertenece un código.
+            "invalid_code": (
+                422,
+                "Código inválido",
+                "El código ingresado no es válido para esta ruta.",
+            ),
+            "code_used": (
+                409,
+                "Código ya utilizado",
+                "Ese código ya fue utilizado y no puede reutilizarse.",
+            ),
+        }
+        if isinstance(result, str) and result in messages:
+            status_code, title, detail = messages[result]
+            return problem(status_code, title, detail)
+        return None
+
+    def _protected_text(value) -> str | None:
+        if value is None:
+            return None
+        try:
+            return fernet.decrypt(bytes(value)).decode()
+        except Exception:
+            return "[contenido protegido no legible]"
+
+    @application.get(
+        "/internal/v1/me/center-transport-requests",
+        response_model=TransportCenterRequestsResponse,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_center_transport_requests(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = _steward_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        account_id, is_super_admin = actor
+        rows = await data.list_center_transport_requests(
+            account_id=account_id, is_super_admin=is_super_admin
+        )
+        items = []
+        for row in rows:
+            record = dict(row)
+            # §12: la vista autorizada muestra al conductor; los
+            # sensibles se descifran aquí y solo aquí.
+            record["driver_document_number"] = _protected_text(
+                record.pop("driver_document_number_encrypted", None)
+            )
+            record["driver_phone"] = _protected_text(
+                record.pop("driver_phone_encrypted", None)
+            )
+            items.append(TransportCenterRequest(**record))
+        return TransportCenterRequestsResponse(
+            items=items, total=len(items)
+        )
+
+    @application.post(
+        "/internal/v1/me/center-transport-requests/{request_id}/decision",
+        response_model=TransportRequestDecisionReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def decide_center_transport_request(
+        request_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = _steward_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        account_id, is_super_admin = actor
+        try:
+            payload = TransportRequestDecisionInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        result = await data.decide_center_transport_request(
+            request_id=request_id,
+            account_id=account_id,
+            is_super_admin=is_super_admin,
+            accept=payload.decision == "accept",
+        )
+        failure = _route_problem(result)
+        if failure is not None:
+            return failure
+        return TransportRequestDecisionReceipt(**result)
+
+    @application.get(
+        "/internal/v1/me/center-route-acceptances",
+        response_model=TransportRouteStatesResponse,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_center_route_acceptances(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = _steward_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        account_id, is_super_admin = actor
+        rows = await data.list_center_route_acceptances(
+            account_id=account_id, is_super_admin=is_super_admin
+        )
+        items = [TransportRouteState(**row) for row in rows]
+        return TransportRouteStatesResponse(items=items, total=len(items))
+
+    @application.post(
+        "/internal/v1/me/humanitarian-transports/{transport_id}"
+        "/route-acceptance",
+        response_model=TransportRouteCodeReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def start_local_route_acceptance(
+        transport_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = _steward_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        account_id, is_super_admin = actor
+        result = await data.start_local_route_acceptance(
+            transport_id=transport_id,
+            account_id=account_id,
+            is_super_admin=is_super_admin,
+            generate_code=lambda: generate_route_code(datetime.now(UTC)),
+        )
+        failure = _route_problem(result)
+        if failure is not None:
+            return failure
+        return TransportRouteCodeReceipt(**result)
+
+    # CHG-175 — Etapa 2: Mulera ↔ Centro de Acopio Receptor.
+    @application.post(
+        "/internal/v1/me/humanitarian-transports/{transport_id}"
+        "/reception-route-acceptance",
+        response_model=TransportRouteCodeReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def start_reception_route_acceptance(
+        transport_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = _steward_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        account_id, is_super_admin = actor
+        result = await data.start_reception_route_acceptance(
+            transport_id=transport_id,
+            account_id=account_id,
+            is_super_admin=is_super_admin,
+            generate_code=lambda: generate_reception_route_code(
+                datetime.now(UTC)
+            ),
+        )
+        failure = _route_problem(result)
+        if failure is not None:
+            return failure
+        return TransportRouteCodeReceipt(**result)
+
+    @application.post(
+        "/internal/v1/me/humanitarian-transports/{transport_id}"
+        "/reception-route-code/validate",
+        response_model=RouteCodeValidationReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def validate_reception_route_code(
+        transport_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = _journey_actor(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        try:
+            payload = RouteCodeInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        result = await data.validate_reception_route_code(
+            transport_id=transport_id,
+            account_id=account_id,
+            code=payload.code,
+        )
+        failure = _route_problem(result)
+        if failure is not None:
+            return failure
+        return RouteCodeValidationReceipt(**result)
+
+    @application.post(
+        "/internal/v1/me/humanitarian-transports/{transport_id}"
+        "/reception-route-accept",
+        response_model=RouteAcceptanceReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def accept_reception_route_by_mule(
+        transport_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = _journey_actor(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        try:
+            payload = RouteCodeInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        result = await data.accept_reception_route_by_mule(
+            transport_id=transport_id,
+            account_id=account_id,
+            code=payload.code,
+        )
+        failure = _route_problem(result)
+        if failure is not None:
+            return failure
+        return RouteAcceptanceReceipt(**result)
+
+    @application.get(
+        "/internal/v1/me/humanitarian-transports",
+        response_model=MyTransportsResponse,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_my_transports(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = _journey_actor(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        rows = await data.list_my_transports(account_id=account_id)
+        items = [MyTransport(**row) for row in rows]
+        return MyTransportsResponse(items=items, total=len(items))
+
+    @application.post(
+        "/internal/v1/me/humanitarian-transports/{transport_id}"
+        "/route-code/validate",
+        response_model=RouteCodeValidationReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def validate_route_code(
+        transport_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = _journey_actor(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        try:
+            payload = RouteCodeInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        result = await data.validate_route_code(
+            transport_id=transport_id,
+            account_id=account_id,
+            code=payload.code,
+        )
+        failure = _route_problem(result)
+        if failure is not None:
+            return failure
+        return RouteCodeValidationReceipt(**result)
+
+    @application.post(
+        "/internal/v1/me/humanitarian-transports/{transport_id}"
+        "/route-accept",
+        response_model=RouteAcceptanceReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def accept_route_by_mule(
+        transport_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = _journey_actor(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        try:
+            payload = RouteCodeInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        result = await data.accept_route_by_mule(
+            transport_id=transport_id,
+            account_id=account_id,
+            code=payload.code,
+        )
+        failure = _route_problem(result)
+        if failure is not None:
+            return failure
+        return RouteAcceptanceReceipt(**result)
 
     # CHG-171 — Feed público del mapa: viajes vivos y llegadas
     # recientes con su rastro; nunca datos del conductor (§30).

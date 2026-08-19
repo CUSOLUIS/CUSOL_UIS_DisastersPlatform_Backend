@@ -1215,6 +1215,134 @@ class ActiveTransportsResponse(ApiModel):
     total: int = Field(ge=0)
 
 
+# CHG-174 — Aceptación inicial de ruta Centro de Acopio Local ↔ Mulera.
+TransportRequestStatus = Literal["pending", "accepted", "declined"]
+TransportCenterRole = Literal["local", "reception"]
+RouteAcceptanceStatus = Literal["code_issued", "accepted"]
+
+
+class TransportCenterRequest(ApiModel):
+    """Solicitud del centro: vista administrativa autorizada (§12-§13).
+
+    Los datos del conductor llegan descifrados desde disaster-service y
+    solo se sirven a quien es responsable del centro.
+    """
+
+    id: UUID
+    transport_id: UUID
+    center_id: UUID
+    center_role: TransportCenterRole
+    status: TransportRequestStatus
+    requested_at: datetime
+    decided_at: datetime | None = None
+    center_name: str
+    center_municipality: str
+    transport_kind: TransportKind
+    origin_center_name: str
+    destination_center_name: str
+    origin_municipality: str
+    destination_municipality: str
+    supplies_summary: str | None = None
+    transport_created_at: datetime
+    driver_full_name: str | None = None
+    driver_document_type: str | None = None
+    driver_document_number: str | None = None
+    driver_phone: str | None = None
+    tractor_plate: str | None = None
+    trailer_plate: str | None = None
+    vessel_registration: str | None = None
+    vessel_name: str | None = None
+    vessel_type: str | None = None
+    vehicle_visible_characteristics: str | None = None
+
+
+class TransportCenterRequestsResponse(ApiModel):
+    items: list[TransportCenterRequest]
+    total: int = Field(ge=0)
+
+
+class TransportRequestDecisionReceipt(ApiModel):
+    id: UUID
+    transport_id: UUID
+    center_id: UUID
+    status: TransportRequestStatus
+    decided_at: datetime | None = None
+
+
+class TransportRouteState(ApiModel):
+    transport_id: UUID
+    transport_kind: TransportKind
+    transport_created_at: datetime
+    origin_center_name: str
+    destination_center_name: str
+    origin_municipality: str
+    destination_municipality: str
+    local_status: TransportRequestStatus | None = None
+    reception_status: TransportRequestStatus | None = None
+    route_status: RouteAcceptanceStatus | None = None
+    confirmation_code: str | None = None
+    local_accepted_at: datetime | None = None
+    mule_code_validated_at: datetime | None = None
+    mule_accepted_at: datetime | None = None
+    # CHG-175 — Etapa 2, con su propio código y sus propios hitos. La
+    # ruta global solo se considera aceptada con las DOS completas.
+    reception_confirmation_code: str | None = None
+    reception_started_at: datetime | None = None
+    reception_mule_code_validated_at: datetime | None = None
+    reception_mule_accepted_at: datetime | None = None
+    route_accepted_at: datetime | None = None
+    is_local_steward: bool = False
+    is_reception_steward: bool = False
+
+
+class TransportRouteStatesResponse(ApiModel):
+    items: list[TransportRouteState]
+    total: int = Field(ge=0)
+
+
+class TransportRouteCodeReceipt(ApiModel):
+    transport_id: UUID
+    confirmation_code: str
+    status: RouteAcceptanceStatus
+    reused: bool = False
+
+
+class MyTransport(ApiModel):
+    transport_id: UUID
+    transport_kind: TransportKind
+    transport_created_at: datetime
+    origin_center_name: str
+    destination_center_name: str
+    origin_municipality: str
+    destination_municipality: str
+    local_status: TransportRequestStatus | None = None
+    reception_status: TransportRequestStatus | None = None
+    route_status: RouteAcceptanceStatus | None = None
+    mule_code_validated_at: datetime | None = None
+    mule_accepted_at: datetime | None = None
+
+
+class MyTransportsResponse(ApiModel):
+    items: list[MyTransport]
+    total: int = Field(ge=0)
+
+
+class RouteCodeValidationReceipt(ApiModel):
+    transport_id: UUID
+    validated: bool
+    origin_center_name: str
+    destination_center_name: str
+
+
+class RouteAcceptanceReceipt(ApiModel):
+    transport_id: UUID
+    status: RouteAcceptanceStatus
+    mule_accepted_at: datetime | None = None
+    # CHG-175 §45: sello del estado global, presente solo cuando las DOS
+    # relaciones quedaron completas.
+    route_accepted_at: datetime | None = None
+
+
 # CHG-162 — «Mi casita partida».
 class DamagedHomeReportReceipt(ApiModel):
     id: UUID
