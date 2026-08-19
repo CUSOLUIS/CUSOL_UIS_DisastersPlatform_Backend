@@ -904,6 +904,33 @@ class HelpRequestAttendReceipt(ApiModel):
     attending: bool
 
 
+# CHG-163 — «Ofrecer comida» (espejo del disaster-service).
+class FoodOfferReceipt(ApiModel):
+    id: UUID
+    public_code: str
+    status: Literal["active"]
+    received_at: datetime
+    expires_at: datetime
+
+
+class ActiveFoodOffer(ApiModel):
+    id: UUID
+    description: str
+    address: str
+    # Null cuando la oferta llegó solo con dirección escrita.
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    notification_radius_km: int | None = Field(default=None, ge=1, le=100)
+    created_at: datetime
+    expires_at: datetime
+
+
+class FoodOfferPage(ApiModel):
+    items: list[ActiveFoodOffer] = Field(max_length=50)
+    total: int = Field(ge=0)
+    generated_at: datetime
+
+
 # CHG-138 — Gestión admin de solicitudes (espejo del disaster-service).
 class AdminHelpRequest(ApiModel):
     id: UUID

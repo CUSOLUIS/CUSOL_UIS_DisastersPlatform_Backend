@@ -1655,6 +1655,97 @@ class HelpRequestAttendReceipt(ApiModel):
     attending: bool
 
 
+# CHG-163 — «Ofrecer comida»: oferta comunitaria de alimentos con las
+# reglas de «Necesitamos ayuda» (CHG-125/127/130/131): creación
+# anónima o con cuenta, vigencia server-side 1-720 horas, coordenadas
+# opcionales en par y radio de aviso que exige punto. Sin datos de
+# contacto: descripción, dirección y coordenadas son públicas por
+# diseño (mostrar dónde hay comida es el propósito).
+FOOD_OFFER_MIN_HOURS = HELP_REQUEST_MIN_HOURS
+FOOD_OFFER_MAX_HOURS = HELP_REQUEST_MAX_HOURS
+# La descripción de una oferta es breve por naturaleza («Sancocho
+# comunitario para 40 personas»): mismo umbral que las solicitudes.
+FOOD_OFFER_MIN_DISTINCT_WORDS = HELP_REQUEST_MIN_DISTINCT_WORDS
+
+
+class FoodOfferInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    description: str = Field(min_length=10, max_length=1000)
+    address: str = Field(min_length=5, max_length=300)
+    # La dirección escrita basta; las coordenadas son opcionales, pero
+    # si viajan van las dos (regla DEC-127-01).
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    duration_hours: int = Field(
+        ge=FOOD_OFFER_MIN_HOURS, le=FOOD_OFFER_MAX_HOURS
+    )
+    # Radio de aviso en la app instalada, en km a la redonda del punto;
+    # exige coordenadas (regla DEC-131-01).
+    notification_radius_km: int | None = Field(default=None, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def _coordinates_pair(self):
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError(
+                "latitude y longitude deben enviarse juntas o ambas "
+                "ausentes"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _radius_needs_coordinates(self):
+        if self.notification_radius_km is not None and self.latitude is None:
+            raise ValueError(
+                "notificationRadiusKm exige latitude y longitude: sin "
+                "punto no hay distancias que medir"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _description_is_readable(self):
+        try:
+            validate_community_text(
+                self.description,
+                "description",
+                min_distinct_words=FOOD_OFFER_MIN_DISTINCT_WORDS,
+            )
+        except TextQualityError as error:
+            raise ValueError(str(error)) from error
+        return self
+
+
+class FoodOfferReceipt(ApiModel):
+    id: UUID
+    public_code: str
+    status: Literal["active"]
+    received_at: datetime
+    expires_at: datetime
+
+
+class ActiveFoodOffer(ApiModel):
+    id: UUID
+    description: str
+    address: str
+    # Null cuando la oferta llegó solo con dirección escrita.
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    notification_radius_km: int | None = Field(default=None, ge=1, le=100)
+    created_at: datetime
+    expires_at: datetime
+
+
+class FoodOfferPage(ApiModel):
+    items: list[ActiveFoodOffer] = Field(max_length=50)
+    total: int = Field(ge=0)
+    generated_at: datetime
+
+
 # CHG-138 — Gestión de solicitudes desde la superadministración: se ve
 # TODO (activas y expiradas) y se puede borrar una a una o vaciar.
 class AdminHelpRequest(ApiModel):

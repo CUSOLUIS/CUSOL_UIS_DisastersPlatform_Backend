@@ -39,6 +39,10 @@ class Settings:
     help_request_rate_limit_per_minute: int = 5
     help_request_read_rate_limit_per_minute: int = 60
     help_attend_rate_limit_per_minute: int = 30
+    # CHG-163: ofertas «Ofrecer comida» — el alta comparte los
+    # limitadores de contribución; la lectura tiene el suyo (el
+    # dashboard sondea cada 30 s, como las solicitudes).
+    food_offer_read_rate_limit_per_minute: int = 60
     # CHG-036: límites administrativos por cuenta autenticada.
     admin_rate_limit_per_minute: int = 240
     admin_evidence_rate_limit_per_minute: int = 30
@@ -149,6 +153,11 @@ class Settings:
             ),
             help_attend_rate_limit_per_minute=int(
                 os.getenv("HELP_ATTEND_RATE_LIMIT_PER_MINUTE", "30")
+            ),
+            food_offer_read_rate_limit_per_minute=int(
+                os.getenv(
+                    "FOOD_OFFER_READ_RATE_LIMIT_PER_MINUTE", "60"
+                )
             ),
             admin_rate_limit_per_minute=int(
                 os.getenv("ADMIN_RATE_LIMIT_PER_MINUTE", "240")

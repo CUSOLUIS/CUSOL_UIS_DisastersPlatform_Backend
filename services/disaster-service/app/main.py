@@ -109,6 +109,10 @@ from .models import (
     HelpRequestVolunteerInput,
     HelpRequestPage,
     HelpRequestReceipt,
+    ActiveFoodOffer,
+    FoodOfferInput,
+    FoodOfferPage,
+    FoodOfferReceipt,
 )
 from .photos import (
     MalwareScanner,
@@ -215,6 +219,11 @@ def generate_public_tracking_code(now: datetime) -> str:
 def generate_help_request_code(now: datetime) -> str:
     """Código público de solicitud de ayuda (CHG-125)."""
     return f"HR-{now.year}-{secrets.token_hex(4).upper()}"
+
+
+def generate_food_offer_code(now: datetime) -> str:
+    """Código público de oferta de comida (CHG-163)."""
+    return f"FO-{now.year}-{secrets.token_hex(4).upper()}"
 
 
 # CHG-036 — Campos del detalle administrativo por tipo:
@@ -3343,6 +3352,99 @@ def create_app(
         )
         return HelpRequestPage(
             items=[active_help_request_model(row) for row in rows],
+            total=total,
+            generated_at=datetime.now(UTC),
+        )
+
+    # CHG-163 — «Ofrecer comida»: mismas reglas que las solicitudes de
+    # ayuda (anónimo permitido, vigencia server-side, JSON sin fotos en
+    # F1). El mapa la pinta desde el endpoint dedicado (DEC-125-10).
+    @application.post(
+        "/internal/v1/food-offers",
+        status_code=201,
+        response_model=FoodOfferReceipt,
+        response_model_by_alias=True,
+        tags=["FoodOffers"],
+    )
+    async def create_food_offer(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        _actor_kind, reporter_account_id = actor
+        try:
+            payload = FoodOfferInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        received_at = datetime.now(UTC)
+        try:
+            row, _created = await data.create_food_offer(
+                idempotency_key=idempotency_key,
+                public_code=generate_food_offer_code(received_at),
+                reporter_account_id=reporter_account_id,
+                description=payload.description.strip(),
+                address=payload.address.strip(),
+                latitude=payload.latitude,
+                longitude=payload.longitude,
+                notification_radius_km=payload.notification_radius_km,
+                duration_hours=payload.duration_hours,
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible registrar la oferta; ningún dato "
+                "quedó publicado.",
+            )
+        return FoodOfferReceipt(
+            id=row["id"],
+            public_code=row["public_code"],
+            status="active",
+            received_at=row["created_at"],
+            expires_at=row["expires_at"],
+        )
+
+    @application.get(
+        "/internal/v1/food-offers",
+        response_model=FoodOfferPage,
+        response_model_by_alias=True,
+        tags=["FoodOffers"],
+    )
+    async def list_active_food_offers(
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        if limit not in (10, 25, 50):
+            return problem(
+                422,
+                "Tamaño de página inválido",
+                "El tamaño de página debe ser 10, 25 o 50.",
+            )
+        rows, total = await data.list_active_food_offers(limit, offset)
+        return FoodOfferPage(
+            items=[
+                ActiveFoodOffer(
+                    id=row["id"],
+                    description=row["description"],
+                    address=row["address"],
+                    latitude=row["latitude"],
+                    longitude=row["longitude"],
+                    notification_radius_km=row.get(
+                        "notification_radius_km"
+                    ),
+                    created_at=row["created_at"],
+                    expires_at=row["expires_at"],
+                )
+                for row in rows
+            ],
             total=total,
             generated_at=datetime.now(UTC),
         )

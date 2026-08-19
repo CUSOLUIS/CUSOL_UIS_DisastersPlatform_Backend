@@ -85,6 +85,8 @@ from .models import (
     UnverifiedBuildingReportReceipt,
     VerificationStatus,
     HelpRequestAttendReceipt,
+    FoodOfferPage,
+    FoodOfferReceipt,
     HelpRequestPage,
     HelpRequestReceipt,
 )
@@ -275,6 +277,10 @@ def create_app(
     )
     help_attend_limiter = SlidingWindowRateLimiter(
         resolved_settings.help_attend_rate_limit_per_minute
+    )
+    # CHG-163: lectura de ofertas «Ofrecer comida».
+    food_offer_read_limiter = SlidingWindowRateLimiter(
+        resolved_settings.food_offer_read_rate_limit_per_minute
     )
     building_reports_limiter = SlidingWindowRateLimiter(
         resolved_settings.building_reports_rate_limit_per_minute
@@ -3946,6 +3952,129 @@ def create_app(
             return problem_response(
                 "No fue posible registrar el informe en este momento.",
                 title="Servicio no disponible",
+            )
+
+    # CHG-163 — «Ofrecer comida»: alta pública (anónima o con cuenta)
+    # con las reglas de «Necesitamos ayuda»; sin fotos en F1, cuerpo
+    # JSON como «Mi casita partida».
+    @application.post(
+        "/api/v1/food-offers",
+        status_code=201,
+        response_model=FoodOfferReceipt,
+        response_model_by_alias=True,
+        responses={
+            422: {"description": "Oferta inválida"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["FoodOffers"],
+    )
+    async def create_food_offer(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        account = await resolve_optional_account(request, identity)
+        if account is not None:
+            if not account_contribution_limiter.allow(
+                f"account:{account.id}"
+            ):
+                return rate_limited_response(
+                    "Se superó el límite de registros por minuto."
+                )
+        elif not anonymous_contribution_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de registros por minuto."
+            )
+        headers = {
+            "content-type": request.headers.get(
+                "content-type", "application/json"
+            ),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": (
+                "authenticated" if account is not None else "anonymous"
+            ),
+        }
+        if account is not None:
+            headers["x-account-id"] = str(account.id)
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                "/internal/v1/food-offers",
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=201,
+                content=FoodOfferReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible registrar la oferta en este momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.get(
+        "/api/v1/food-offers",
+        response_model=FoodOfferPage,
+        response_model_by_alias=True,
+        responses={
+            422: {"description": "Paginación inválida"},
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["FoodOffers"],
+    )
+    async def list_active_food_offers(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        if not food_offer_read_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        if limit not in (10, 25, 50):
+            return problem_response(
+                "El tamaño de página debe ser 10, 25 o 50.",
+                title="Tamaño de página inválido",
+                status_code=422,
+                problem_type="invalid-parameters",
+            )
+        try:
+            response = await upstream.get(
+                "/internal/v1/food-offers",
+                params={"limit": limit, "offset": offset},
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return FoodOfferPage.model_validate(response.json())
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar las ofertas en este momento.",
+                title="Servicio de ofertas no disponible",
             )
 
     # CHG-153 — Candidatos a centro asociado para los formularios de

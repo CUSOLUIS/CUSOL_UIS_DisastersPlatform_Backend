@@ -4325,6 +4325,95 @@ class PostgresDisasterRepository:
         )
         return [dict(row) for row in rows], int(total)
 
+    # CHG-163 — «Ofrecer comida»: mismas reglas de vigencia que las
+    # solicitudes de ayuda (expires_at manda, nada se borra al expirar).
+
+    async def create_food_offer(
+        self,
+        *,
+        idempotency_key: str,
+        public_code: str,
+        reporter_account_id: UUID | None,
+        description: str,
+        address: str,
+        latitude: float | None,
+        longitude: float | None,
+        notification_radius_km: int | None,
+        duration_hours: int,
+    ) -> tuple[dict, bool]:
+        """Inserta la oferta calculando expires_at en servidor.
+
+        El reintento con la misma Idempotency-Key devuelve la fila
+        original con created=False (mismo pacto que los reportes).
+        """
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO disaster_service.food_offers (
+                idempotency_key, public_code, reporter_account_id,
+                description, address, latitude, longitude,
+                notification_radius_km, duration_hours, expires_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                NOW() + make_interval(hours => $9)
+            )
+            ON CONFLICT (idempotency_key) DO NOTHING
+            RETURNING id, public_code, created_at, expires_at
+            """,
+            idempotency_key,
+            public_code,
+            reporter_account_id,
+            description,
+            address,
+            latitude,
+            longitude,
+            notification_radius_km,
+            duration_hours,
+        )
+        if row is not None:
+            return dict(row), True
+        existing = await self._pool.fetchrow(
+            """
+            SELECT id, public_code, created_at, expires_at
+            FROM disaster_service.food_offers
+            WHERE idempotency_key = $1
+            """,
+            idempotency_key,
+        )
+        return dict(existing), False
+
+    async def list_active_food_offers(
+        self,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict], int]:
+        rows = await self._pool.fetch(
+            """
+            SELECT
+                fo.id,
+                fo.description,
+                fo.address,
+                fo.latitude,
+                fo.longitude,
+                fo.notification_radius_km,
+                fo.created_at,
+                fo.expires_at
+            FROM disaster_service.food_offers fo
+            WHERE fo.expires_at > NOW()
+            ORDER BY fo.created_at DESC, fo.id DESC
+            LIMIT $1 OFFSET $2
+            """,
+            limit,
+            offset,
+        )
+        total = await self._pool.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM disaster_service.food_offers
+            WHERE expires_at > NOW()
+            """
+        )
+        return [dict(row) for row in rows], int(total)
+
     async def attend_help_request(
         self, request_id: UUID, account_id: UUID
     ) -> dict | None:
