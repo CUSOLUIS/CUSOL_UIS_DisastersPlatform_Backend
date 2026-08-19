@@ -267,3 +267,231 @@ async def test_list_rejects_unknown_page_size():
     )
 
     assert response.status_code == 422
+
+
+# CHG-176 — La oferta de comida gana lo mismo que un centro de acopio:
+# comentarios con estrellas, denuncias con sus umbrales y borrado admin.
+OFFER_ID = UUID("ffffffff-ffff-4fff-8fff-fffffffff176")
+COMMENT_ID = UUID("ffffffff-ffff-4fff-8fff-fffffffff177")
+ADMIN_HEADERS = {
+    "X-Actor-Role": "super_admin",
+    "X-Actor-Account-Id": str(ACCOUNT_ID),
+    "X-Actor-Display": "YWRtaW4=",
+}
+COMMENT_HEADERS = {
+    "Idempotency-Key": "clave-comentario-comida-01",
+    "X-Actor-Kind": "anonymous",
+}
+REPORT_HEADERS = {
+    "Idempotency-Key": "clave-denuncia-comida-01",
+    "X-Actor-Kind": "anonymous",
+    "X-Denouncer-Key": "fp:abcdef0123456789",
+}
+
+
+class FakeFoodCommunityRepository(FakeFoodOffersRepository):
+    def __init__(self, *, missing=False, reporters=1, disabled=False):
+        super().__init__()
+        self.missing = missing
+        self.reporters = reporters
+        self.disabled = disabled
+        self.community_calls: list[tuple[str, dict]] = []
+
+    async def list_food_offer_comments(self, **kwargs):
+        self.community_calls.append(("list", kwargs))
+        if self.missing:
+            return None
+        return {
+            "items": [
+                {
+                    "id": COMMENT_ID,
+                    "account_id": None,
+                    "author_display_name": None,
+                    "actor_kind": "anonymous",
+                    "content": "Nos atendieron muy bien, comida caliente.",
+                    "rating": 5,
+                    "created_at": CREATED_AT,
+                }
+            ],
+            "total": 1,
+            "rating_average": 4.5,
+            "rating_count": 2,
+        }
+
+    async def create_food_offer_comment(self, **kwargs):
+        self.community_calls.append(("comment", kwargs))
+        if self.missing:
+            return None
+        return {
+            "id": COMMENT_ID,
+            "account_id": None,
+            "author_display_name": None,
+            "actor_kind": "anonymous",
+            "content": kwargs["content"],
+            "rating": kwargs["rating"],
+            "created_at": CREATED_AT,
+        }
+
+    async def create_food_offer_report(self, **kwargs):
+        self.community_calls.append(("report", kwargs))
+        if self.missing:
+            return None
+        return {
+            "reports_count": self.reporters,
+            "under_observation": self.reporters >= 10 and not self.disabled,
+            "disabled": self.disabled,
+        }
+
+    async def admin_delete_food_offer_comment(self, **kwargs):
+        self.community_calls.append(("delete_comment", kwargs))
+        return 0 if self.missing else 1
+
+    async def admin_delete_food_offer(self, **kwargs):
+        self.community_calls.append(("delete_offer", kwargs))
+        return 0 if self.missing else 1
+
+
+def community_app(repository=None):
+    return create_app(
+        repository=repository or FakeFoodCommunityRepository(),
+        storage=FakeStorage(),
+    )
+
+
+@pytest.mark.anyio
+async def test_food_offer_comments_publish_the_average():
+    response = await request_app(
+        community_app(),
+        "GET",
+        f"/internal/v1/food-offers/{OFFER_ID}/comments",
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    # El promedio se calcula en servidor, igual que en los acopios.
+    assert body["ratingAverage"] == 4.5
+    assert body["ratingCount"] == 2
+    assert body["items"][0]["rating"] == 5
+
+
+@pytest.mark.anyio
+async def test_food_offer_comment_requires_a_star_rating():
+    response = await request_app(
+        community_app(),
+        "POST",
+        f"/internal/v1/food-offers/{OFFER_ID}/comments",
+        headers=COMMENT_HEADERS,
+        json={"content": "Comida abundante y bien servida."},
+    )
+    # CHG-166 rige igual aquí: sin estrellas no hay comentario.
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_food_offer_comment_is_published_anonymously():
+    repository = FakeFoodCommunityRepository()
+    response = await request_app(
+        community_app(repository),
+        "POST",
+        f"/internal/v1/food-offers/{OFFER_ID}/comments",
+        headers=COMMENT_HEADERS,
+        json={
+            "content": "Comida abundante y bien servida.",
+            "rating": 4,
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["rating"] == 4
+    call = dict(repository.community_calls[0][1])
+    assert call["food_offer_id"] == OFFER_ID
+    assert call["actor_kind"] == "anonymous"
+
+
+@pytest.mark.anyio
+async def test_food_offer_report_needs_the_denouncer_key():
+    response = await request_app(
+        community_app(),
+        "POST",
+        f"/internal/v1/food-offers/{OFFER_ID}/reports",
+        headers={k: v for k, v in REPORT_HEADERS.items()
+                 if k != "X-Denouncer-Key"},
+        json={"category": "informacion_falsa", "reason": "No existe."},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_food_offer_report_reports_the_threshold_state():
+    repository = FakeFoodCommunityRepository(reporters=20, disabled=True)
+    response = await request_app(
+        community_app(repository),
+        "POST",
+        f"/internal/v1/food-offers/{OFFER_ID}/reports",
+        headers=REPORT_HEADERS,
+        json={
+            "category": "informacion_falsa",
+            "reason": "La dirección no corresponde con la realidad.",
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    # Al alcanzar el umbral la oferta deja de publicarse.
+    assert body["disabled"] is True
+    assert body["reportsCount"] == 20
+    assert body["foodOfferId"] == str(OFFER_ID)
+
+
+@pytest.mark.anyio
+async def test_admin_deletes_a_food_offer_comment_and_the_offer():
+    repository = FakeFoodCommunityRepository()
+    app = community_app(repository)
+
+    comment = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/admin/food-offers/{OFFER_ID}/comments/{COMMENT_ID}",
+        headers=ADMIN_HEADERS,
+    )
+    assert comment.status_code == 200
+    assert comment.json()["deleted"] == 1
+
+    offer = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/admin/food-offers/{OFFER_ID}",
+        headers=ADMIN_HEADERS,
+    )
+    assert offer.status_code == 200
+    assert offer.json()["deleted"] == 1
+
+
+@pytest.mark.anyio
+async def test_admin_endpoints_refuse_a_plain_account():
+    response = await request_app(
+        community_app(),
+        "DELETE",
+        f"/internal/v1/admin/food-offers/{OFFER_ID}",
+        headers={"X-Actor-Role": "user", "X-Actor-Account-Id": str(ACCOUNT_ID)},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_community_endpoints_404_on_a_missing_offer():
+    app = community_app(FakeFoodCommunityRepository(missing=True))
+
+    listing = await request_app(
+        app, "GET", f"/internal/v1/food-offers/{OFFER_ID}/comments"
+    )
+    assert listing.status_code == 404
+
+    report = await request_app(
+        app,
+        "POST",
+        f"/internal/v1/food-offers/{OFFER_ID}/reports",
+        headers=REPORT_HEADERS,
+        json={"category": "informacion_falsa", "reason": "No existe."},
+    )
+    assert report.status_code == 404

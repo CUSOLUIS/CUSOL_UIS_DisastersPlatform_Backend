@@ -74,6 +74,8 @@ from .models import (
     AidLocationParentCandidatesResponse,
     AidLocationRatingInput,
     AidLocationCommentDeleteReceipt,
+    FoodOfferDeleteReceipt,
+    FoodOfferReportReceipt,
     AdminAidLocationActionReceipt,
     AdminAidLocationDeleteReceipt,
     AdminAidLocationSummary,
@@ -2980,6 +2982,228 @@ def create_app(
             disabled=result.get("disabled", False),
         )
 
+    # ------------------------------------------------------------------
+    # CHG-176 — La misma comunidad para «Ofrecer comida»: comentarios
+    # con estrellas, denuncias con sus umbrales y borrado admin. Comparte
+    # tablas, reglas y modelos con los acopios.
+    # ------------------------------------------------------------------
+
+    @application.get(
+        "/internal/v1/food-offers/{food_offer_id}/comments",
+        response_model=AidLocationCommentsResponse,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_food_offer_comments(
+        food_offer_id: UUID,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        limit: int = 50,
+    ):
+        page = await data.list_food_offer_comments(
+            food_offer_id=food_offer_id, limit=max(1, min(limit, 100))
+        )
+        if page is None:
+            return problem(
+                404, "Oferta no disponible", "La oferta no existe."
+            )
+        return AidLocationCommentsResponse(
+            items=[
+                AidLocationComment(
+                    id=row["id"],
+                    author_display_name=row["author_display_name"],
+                    actor_kind=row["actor_kind"],
+                    content=row["content"],
+                    rating=row.get("rating"),
+                    created_at=row["created_at"],
+                )
+                for row in page["items"]
+            ],
+            total=page["total"],
+            rating_average=page["rating_average"],
+            rating_count=page["rating_count"],
+        )
+
+    @application.post(
+        "/internal/v1/food-offers/{food_offer_id}/comments",
+        status_code=201,
+        response_model=AidLocationComment,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_food_offer_comment(
+        food_offer_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        author_display_name: str | None = None
+        if actor_kind == "authenticated":
+            display_raw = request.headers.get("x-actor-display", "").strip()
+            if display_raw:
+                try:
+                    author_display_name = (
+                        base64.b64decode(display_raw.encode()).decode()[:161]
+                        or None
+                    )
+                except Exception:
+                    author_display_name = None
+        try:
+            payload = AidLocationCommentInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        try:
+            row = await data.create_food_offer_comment(
+                idempotency_key=idempotency_key,
+                food_offer_id=food_offer_id,
+                actor_kind=actor_kind,
+                account_id=account_id,
+                author_display_name=author_display_name,
+                content=payload.content.strip(),
+                rating=payload.rating,
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible publicar el comentario.",
+            )
+        if row is None:
+            return problem(
+                404, "Oferta no disponible", "La oferta no existe."
+            )
+        return AidLocationComment(
+            id=row["id"],
+            author_display_name=row["author_display_name"],
+            actor_kind=row["actor_kind"],
+            content=row["content"],
+            rating=row.get("rating"),
+            created_at=row["created_at"],
+        )
+
+    @application.post(
+        "/internal/v1/food-offers/{food_offer_id}/reports",
+        status_code=202,
+        response_model=FoodOfferReportReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_food_offer_report(
+        food_offer_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        denouncer_key = request.headers.get("x-denouncer-key", "").strip()
+        if not denouncer_key:
+            return problem(
+                422,
+                "Denunciante no resuelto",
+                "Falta la clave de denunciante resuelta por el gateway.",
+            )
+        try:
+            payload = AidLocationReportInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        try:
+            result = await data.create_food_offer_report(
+                idempotency_key=idempotency_key,
+                food_offer_id=food_offer_id,
+                actor_kind=actor_kind,
+                account_id=account_id,
+                denouncer_key=denouncer_key,
+                reason_category=payload.category,
+                reason_encrypted=encrypt(payload.reason.strip()),
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible registrar la denuncia.",
+            )
+        if result is None:
+            return problem(
+                404, "Oferta no disponible", "La oferta no existe."
+            )
+        return FoodOfferReportReceipt(
+            food_offer_id=food_offer_id,
+            reports_count=result["reports_count"],
+            under_observation=result["under_observation"],
+            disabled=result["disabled"],
+        )
+
+    @application.delete(
+        "/internal/v1/admin/food-offers/{food_offer_id}/comments"
+        "/{comment_id}",
+        response_model=AidLocationCommentDeleteReceipt,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_delete_food_offer_comment(
+        food_offer_id: UUID,
+        comment_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display_name = actor
+        deleted = await data.admin_delete_food_offer_comment(
+            food_offer_id=food_offer_id,
+            comment_id=comment_id,
+            actor_account_id=actor_account_id,
+            actor_display_name=actor_display_name,
+        )
+        if deleted == 0:
+            return problem(
+                404,
+                "Comentario no encontrado",
+                "El comentario no existe en esa oferta.",
+            )
+        return AidLocationCommentDeleteReceipt(deleted=deleted)
+
+    @application.delete(
+        "/internal/v1/admin/food-offers/{food_offer_id}",
+        response_model=FoodOfferDeleteReceipt,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_delete_food_offer(
+        food_offer_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display_name = actor
+        deleted = await data.admin_delete_food_offer(
+            food_offer_id=food_offer_id,
+            actor_account_id=actor_account_id,
+            actor_display_name=actor_display_name,
+        )
+        if deleted == 0:
+            return problem(
+                404, "Oferta no encontrada", "La oferta no existe."
+            )
+        return FoodOfferDeleteReceipt(deleted=deleted)
+
     # CHG-165 §4-8 — Comentarios públicos de un lugar de ayuda: los ve
     # cualquiera; comentan anónimos y cuentas por igual.
     @application.get(
@@ -4144,6 +4368,13 @@ def create_app(
                     ),
                     created_at=row["created_at"],
                     expires_at=row["expires_at"],
+                    # CHG-176: sin esto la puntuación se quedaba en la
+                    # consulta y nunca llegaba al mapa.
+                    comment_rating_average=row.get(
+                        "comment_rating_average"
+                    ),
+                    comment_rating_count=row.get("comment_rating_count")
+                    or 0,
                 )
                 for row in rows
             ],

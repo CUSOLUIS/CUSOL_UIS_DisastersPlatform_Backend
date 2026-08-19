@@ -752,6 +752,21 @@ class AidLocationReportReceipt(ApiModel):
     disabled: bool = False
 
 
+# CHG-176 — Constancia de la denuncia a una oferta de comida. Misma
+# forma que la del acopio, con su propio identificador: la oferta no
+# tiene estado operativo, así que «deshabilitada» significa que deja de
+# publicarse.
+class FoodOfferReportReceipt(ApiModel):
+    food_offer_id: UUID
+    reports_count: int = Field(ge=1)
+    under_observation: bool
+    disabled: bool = False
+
+
+class FoodOfferDeleteReceipt(ApiModel):
+    deleted: int = Field(ge=0)
+
+
 # CHG-165 — Comentario público de un Centro de Acopio Local (§4-8).
 # account_id NULL = anónimo; el nombre visible se congela al publicar y
 # nunca incluye correo/teléfono/datos privados.
@@ -1879,6 +1894,10 @@ class ActiveFoodOffer(ApiModel):
     notification_radius_km: int | None = Field(default=None, ge=1, le=100)
     created_at: datetime
     expires_at: datetime
+    # CHG-176: la puntuación viaja con la oferta porque el mapa la
+    # fusiona en cliente, igual que el resto de sus datos.
+    comment_rating_average: float | None = Field(default=None, ge=1, le=5)
+    comment_rating_count: int = Field(default=0, ge=0)
 
 
 class FoodOfferPage(ApiModel):

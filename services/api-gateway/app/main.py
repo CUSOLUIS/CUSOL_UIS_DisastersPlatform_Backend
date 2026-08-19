@@ -68,6 +68,8 @@ from .models import (
     AidLocationAvailability,
     AidLocationComment,
     AidLocationCommentDeleteReceipt,
+    FoodOfferDeleteReceipt,
+    FoodOfferReportReceipt,
     AidLocationCommentsResponse,
     AidLocationParentCandidatesResponse,
     AidLocationReceipt,
@@ -4998,6 +5000,320 @@ def create_app(
                 "No fue posible publicar el comentario en este momento.",
                 title="Servicio no disponible",
             )
+
+    # ------------------------------------------------------------------
+    # CHG-176 — La misma comunidad para «Ofrecer comida». Autorización
+    # idéntica a la de acopios: leer es público, comentar exige Origin e
+    # Idempotency-Key (anónimo permitido), denunciar tiene su variante
+    # anónima y con cuenta, y borrar exige super_admin.
+    # ------------------------------------------------------------------
+
+    async def _forward_food_offer_report(
+        food_offer_id: UUID,
+        request: Request,
+        upstream: httpx.AsyncClient,
+        actor_kind: str,
+        denouncer_key: str,
+        account_id: UUID | None,
+    ) -> JSONResponse:
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        headers = {
+            "content-type": request.headers.get(
+                "content-type", "application/json"
+            ),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": actor_kind,
+            "x-denouncer-key": denouncer_key,
+        }
+        if account_id is not None:
+            headers["x-account-id"] = str(account_id)
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                f"/internal/v1/food-offers/{food_offer_id}/reports",
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=202,
+                content=FoodOfferReportReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible registrar la denuncia en este momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.post(
+        "/api/v1/public/food-offers/{food_offer_id}/reports",
+        status_code=202,
+        response_model=FoodOfferReportReceipt,
+        response_model_by_alias=True,
+        responses={
+            404: {"description": "Oferta inexistente"},
+            422: {"description": "Datos inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_anonymous_food_offer_report(
+        food_offer_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        if not anonymous_contribution_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de denuncias por minuto."
+            )
+        return await _forward_food_offer_report(
+            food_offer_id,
+            request,
+            upstream,
+            "anonymous",
+            _denouncer_key_anonymous(request),
+            None,
+        )
+
+    @application.post(
+        "/api/v1/me/food-offers/{food_offer_id}/reports",
+        status_code=202,
+        response_model=FoodOfferReportReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Origen no permitido"},
+            404: {"description": "Oferta inexistente"},
+            422: {"description": "Datos inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_account_food_offer_report(
+        food_offer_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not account_contribution_limiter.allow(f"account:{account.id}"):
+            return rate_limited_response(
+                "Se superó el límite de denuncias por minuto."
+            )
+        return await _forward_food_offer_report(
+            food_offer_id,
+            request,
+            upstream,
+            "authenticated",
+            f"account:{account.id}",
+            account.id,
+        )
+
+    @application.get(
+        "/api/v1/food-offers/{food_offer_id}/comments",
+        response_model=AidLocationCommentsResponse,
+        response_model_by_alias=True,
+        responses={
+            404: {"description": "Oferta inexistente"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_food_offer_comments(
+        food_offer_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    ):
+        if not directory_search_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        try:
+            response = await upstream.get(
+                f"/internal/v1/food-offers/{food_offer_id}/comments",
+                params={"limit": limit},
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return AidLocationCommentsResponse.model_validate(
+                response.json()
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar los comentarios en este "
+                "momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.post(
+        "/api/v1/food-offers/{food_offer_id}/comments",
+        status_code=201,
+        response_model=AidLocationComment,
+        response_model_by_alias=True,
+        responses={
+            403: {"description": "Origen no permitido"},
+            404: {"description": "Oferta inexistente"},
+            422: {"description": "Datos inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_food_offer_comment(
+        food_offer_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        account = await resolve_optional_account(request, identity)
+        if account is not None:
+            if not account_contribution_limiter.allow(
+                f"account:{account.id}"
+            ):
+                return rate_limited_response(
+                    "Se superó el límite de comentarios por minuto."
+                )
+        elif not anonymous_contribution_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de comentarios por minuto."
+            )
+        headers = {
+            "content-type": request.headers.get(
+                "content-type", "application/json"
+            ),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": (
+                "authenticated" if account is not None else "anonymous"
+            ),
+        }
+        if account is not None:
+            headers["x-account-id"] = str(account.id)
+            headers["x-actor-display"] = base64.b64encode(
+                account.display_name.encode()
+            ).decode()
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                f"/internal/v1/food-offers/{food_offer_id}/comments",
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=201,
+                content=AidLocationComment.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible publicar el comentario en este momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.delete(
+        "/api/v1/admin/food-offers/{food_offer_id}/comments/{comment_id}",
+        response_model=AidLocationCommentDeleteReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Rol insuficiente u origen no permitido"},
+            404: {"description": "Comentario inexistente"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_delete_food_offer_comment(
+        food_offer_id: UUID,
+        comment_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "DELETE",
+            f"/internal/v1/admin/food-offers/{food_offer_id}"
+            f"/comments/{comment_id}",
+            AidLocationCommentDeleteReceipt,
+        )
+
+    @application.delete(
+        "/api/v1/admin/food-offers/{food_offer_id}",
+        response_model=FoodOfferDeleteReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Rol insuficiente u origen no permitido"},
+            404: {"description": "Oferta inexistente"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_delete_food_offer(
+        food_offer_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "DELETE",
+            f"/internal/v1/admin/food-offers/{food_offer_id}",
+            FoodOfferDeleteReceipt,
+        )
 
     # CHG-165 §15, §21-24 — Consola super_admin: bandeja de
     # verificaciones, decisión y reactivación de acopios locales.

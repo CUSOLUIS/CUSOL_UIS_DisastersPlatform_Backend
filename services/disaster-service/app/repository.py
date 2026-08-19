@@ -4097,6 +4097,304 @@ class PostgresDisasterRepository:
                     )
         return dict(row) if row is not None else None
 
+    # ------------------------------------------------------------------
+    # CHG-176 — La misma comunidad para las ofertas de «Ofrecer comida».
+    # Comparten tabla con los acopios: cada fila apunta a un objetivo y
+    # solo a uno, así que el promedio, la deduplicación de denunciantes
+    # y los umbrales son el mismo código, no una copia.
+    # ------------------------------------------------------------------
+
+    async def list_food_offer_comments(
+        self, *, food_offer_id: UUID, limit: int
+    ) -> dict | None:
+        """Comentarios públicos de la oferta, los más recientes primero.
+
+        None si la oferta no existe.
+        """
+        async with self._pool.acquire() as connection:
+            exists = await connection.fetchval(
+                "SELECT 1 FROM disaster_service.food_offers WHERE id = $1",
+                food_offer_id,
+            )
+            if exists is None:
+                return None
+            rows = await connection.fetch(
+                """
+                SELECT id, account_id, author_display_name,
+                       actor_kind::text AS actor_kind, content, rating,
+                       created_at
+                FROM disaster_service.aid_location_comments
+                WHERE food_offer_id = $1
+                ORDER BY created_at DESC, id DESC
+                LIMIT $2
+                """,
+                food_offer_id,
+                limit,
+            )
+            total = int(
+                await connection.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM disaster_service.aid_location_comments
+                    WHERE food_offer_id = $1
+                    """,
+                    food_offer_id,
+                )
+            )
+            aggregate = await connection.fetchrow(
+                """
+                SELECT ROUND(AVG(rating)::numeric, 1)::float8 AS average,
+                       COUNT(rating) AS count
+                FROM disaster_service.aid_location_comments
+                WHERE food_offer_id = $1 AND rating IS NOT NULL
+                """,
+                food_offer_id,
+            )
+        return {
+            "items": [dict(row) for row in rows],
+            "total": total,
+            "rating_average": aggregate["average"],
+            "rating_count": int(aggregate["count"]),
+        }
+
+    async def create_food_offer_comment(
+        self,
+        *,
+        idempotency_key: str,
+        food_offer_id: UUID,
+        actor_kind: str,
+        account_id: UUID | None,
+        author_display_name: str | None,
+        content: str,
+        rating: int,
+    ) -> dict | None:
+        """Publica un comentario con estrellas, anónimo o con cuenta."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                exists = await connection.fetchval(
+                    "SELECT 1 FROM disaster_service.food_offers "
+                    "WHERE id = $1",
+                    food_offer_id,
+                )
+                if exists is None:
+                    return None
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO disaster_service.aid_location_comments (
+                        idempotency_key, food_offer_id, account_id,
+                        author_display_name, actor_kind, content, rating
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                    RETURNING id, account_id, author_display_name,
+                              actor_kind::text AS actor_kind, content,
+                              rating, created_at
+                    """,
+                    idempotency_key,
+                    food_offer_id,
+                    account_id,
+                    author_display_name,
+                    actor_kind,
+                    content,
+                    rating,
+                )
+                if row is None:
+                    row = await connection.fetchrow(
+                        """
+                        SELECT id, account_id, author_display_name,
+                               actor_kind::text AS actor_kind, content,
+                               rating, created_at
+                        FROM disaster_service.aid_location_comments
+                        WHERE idempotency_key = $1
+                        """,
+                        idempotency_key,
+                    )
+        return dict(row) if row is not None else None
+
+    async def create_food_offer_report(
+        self,
+        *,
+        idempotency_key: str,
+        food_offer_id: UUID,
+        actor_kind: str,
+        account_id: UUID | None,
+        denouncer_key: str,
+        reason_encrypted: bytes | None,
+        reason_category: str,
+    ) -> dict | None:
+        """Denuncia una oferta, con los mismos umbrales que un acopio.
+
+        Un mismo denunciante no cuenta dos veces dentro del ciclo vivo.
+        Al llegar al umbral de deshabilitación la oferta deja de
+        publicarse: en algo efímero no hay estado que reactivar, así que
+        «en observación» se informa pero no persiste columna.
+        """
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                # Se bloquea la oferta para serializar el conteo.
+                target = await connection.fetchrow(
+                    """
+                    SELECT id, disabled_at
+                    FROM disaster_service.food_offers
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    food_offer_id,
+                )
+                if target is None:
+                    return None
+                await connection.execute(
+                    """
+                    INSERT INTO disaster_service.aid_location_reports (
+                        idempotency_key, food_offer_id, actor_kind,
+                        account_id, denouncer_key, reason_encrypted,
+                        reason_category
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    -- El predicado debe coincidir EXACTAMENTE con el
+                    -- del índice parcial, o Postgres no lo infiere.
+                    ON CONFLICT (food_offer_id, denouncer_key)
+                        WHERE archived_at IS NULL
+                          AND food_offer_id IS NOT NULL
+                        DO NOTHING
+                    """,
+                    idempotency_key,
+                    food_offer_id,
+                    actor_kind,
+                    account_id,
+                    denouncer_key,
+                    reason_encrypted,
+                    reason_category,
+                )
+                reporters = int(
+                    await connection.fetchval(
+                        """
+                        SELECT COUNT(*)
+                        FROM disaster_service.aid_location_reports
+                        WHERE food_offer_id = $1
+                          AND archived_at IS NULL
+                          AND moderation_status <> 'rejected'
+                        """,
+                        food_offer_id,
+                    )
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.community_contribution_audit (
+                        event_type, contribution_kind, contribution_id,
+                        detail
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    "food_offer_reported",
+                    "food_offer",
+                    food_offer_id,
+                    f"denuncias_vivas={reporters} categoria={reason_category}",
+                )
+                disabled = target["disabled_at"] is not None
+                if (
+                    reporters >= AID_LOCATION_DISABLE_THRESHOLD
+                    and target["disabled_at"] is None
+                ):
+                    await connection.execute(
+                        """
+                        UPDATE disaster_service.food_offers
+                        SET disabled_at = NOW()
+                        WHERE id = $1
+                        """,
+                        food_offer_id,
+                    )
+                    disabled = True
+                    await connection.execute(
+                        """
+                        INSERT INTO
+                            disaster_service.community_contribution_audit (
+                            event_type, contribution_kind,
+                            contribution_id, detail
+                        ) VALUES ($1, $2, $3, $4)
+                        """,
+                        "food_offer_disabled_by_reports",
+                        "food_offer",
+                        food_offer_id,
+                        f"denuncias_vivas={reporters}",
+                    )
+        return {
+            "reports_count": reporters,
+            "under_observation": (
+                reporters >= AID_LOCATION_REPORT_THRESHOLD and not disabled
+            ),
+            "disabled": disabled,
+        }
+
+    async def admin_delete_food_offer_comment(
+        self,
+        *,
+        food_offer_id: UUID,
+        comment_id: UUID,
+        actor_account_id: UUID,
+        actor_display_name: str,
+    ) -> int:
+        """Borra un comentario suelto de la oferta y lo audita."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                deleted = await connection.fetchval(
+                    """
+                    DELETE FROM disaster_service.aid_location_comments
+                    WHERE id = $1 AND food_offer_id = $2
+                    RETURNING id
+                    """,
+                    comment_id,
+                    food_offer_id,
+                )
+                if deleted is None:
+                    return 0
+                await self._admin_audit(
+                    connection,
+                    actor_account_id,
+                    actor_display_name,
+                    "food_offer_comment_deleted",
+                    "food_offer_comment",
+                    comment_id,
+                    "success",
+                    None,
+                    ["deleted"],
+                    None,
+                )
+        return 1
+
+    async def admin_delete_food_offer(
+        self,
+        *,
+        food_offer_id: UUID,
+        actor_account_id: UUID,
+        actor_display_name: str,
+    ) -> int:
+        """Borra la oferta entera; comentarios y denuncias caen por
+        CASCADE, igual que al borrar un acopio."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                deleted = await connection.fetchval(
+                    """
+                    DELETE FROM disaster_service.food_offers
+                    WHERE id = $1
+                    RETURNING id
+                    """,
+                    food_offer_id,
+                )
+                if deleted is None:
+                    return 0
+                await self._admin_audit(
+                    connection,
+                    actor_account_id,
+                    actor_display_name,
+                    "food_offer_deleted",
+                    "food_offer",
+                    food_offer_id,
+                    "success",
+                    None,
+                    ["deleted"],
+                    None,
+                )
+        return 1
+
     async def admin_delete_aid_location_comment(
         self,
         *,
@@ -6039,9 +6337,22 @@ class PostgresDisasterRepository:
                 fo.longitude,
                 fo.notification_radius_km,
                 fo.created_at,
-                fo.expires_at
+                fo.expires_at,
+                -- CHG-176: la puntuación viaja con la oferta porque el
+                -- mapa las fusiona en cliente; el mismo cálculo que
+                -- usan los acopios.
+                ( SELECT ROUND(AVG(c.rating)::numeric, 1)::float8
+                  FROM disaster_service.aid_location_comments c
+                  WHERE c.food_offer_id = fo.id AND c.rating IS NOT NULL
+                ) AS comment_rating_average,
+                ( SELECT COUNT(*)
+                  FROM disaster_service.aid_location_comments c
+                  WHERE c.food_offer_id = fo.id AND c.rating IS NOT NULL
+                ) AS comment_rating_count
             FROM disaster_service.food_offers fo
-            WHERE fo.expires_at > NOW()
+            -- CHG-176: una oferta deshabilitada por denuncias deja de
+            -- publicarse, igual que un acopio sale del mapa.
+            WHERE fo.expires_at > NOW() AND fo.disabled_at IS NULL
             ORDER BY fo.created_at DESC, fo.id DESC
             LIMIT $1 OFFSET $2
             """,
@@ -6052,7 +6363,7 @@ class PostgresDisasterRepository:
             """
             SELECT COUNT(*)
             FROM disaster_service.food_offers
-            WHERE expires_at > NOW()
+            WHERE expires_at > NOW() AND disabled_at IS NULL
             """
         )
         return [dict(row) for row in rows], int(total)
