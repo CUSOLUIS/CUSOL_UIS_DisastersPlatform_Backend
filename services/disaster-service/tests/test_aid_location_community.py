@@ -185,15 +185,20 @@ class FakeCommunityRepository:
             self.center["operational_status"] == "under_observation"
         )
         disabled = self.center["disabled_at"] is not None
+        # CHG-168: los umbrales aplican por igual a locales y
+        # receptores; recolección/distribución no saltan de estado.
+        threshold_kinds = ("collection_center", "receiver_center")
         if (
-            count >= AID_LOCATION_REPORT_THRESHOLD
+            self.center["kind"] in threshold_kinds
+            and count >= AID_LOCATION_REPORT_THRESHOLD
             and self.center["operational_status"]
             not in ("under_observation", "inactive")
         ):
             self.center["operational_status"] = "under_observation"
             under_observation = True
         if (
-            count >= AID_LOCATION_DISABLE_THRESHOLD
+            self.center["kind"] in threshold_kinds
+            and count >= AID_LOCATION_DISABLE_THRESHOLD
             and self.center["disabled_at"] is None
         ):
             self.center["operational_status"] = "inactive"
@@ -219,14 +224,18 @@ class FakeCommunityRepository:
         }
 
     async def admin_list_aid_location_verifications(self):
+        # CHG-168: la bandeja lista locales y receptores.
+        console_kinds = ("collection_center", "receiver_center")
         pending = (
             [self._summary()]
-            if self.center["verification_status"] == "unverified"
+            if self.center["kind"] in console_kinds
+            and self.center["verification_status"] == "unverified"
             else []
         )
         disabled = (
             [self._summary()]
-            if self.center["disabled_at"] is not None
+            if self.center["kind"] in console_kinds
+            and self.center["disabled_at"] is not None
             else []
         )
         return {"pending": pending, "disabled": disabled}
@@ -716,3 +725,74 @@ async def test_deleting_comment_requires_admin_role():
     assert without_role.status_code == 403
     assert as_moderator.status_code == 403
     assert len(repository.comments) == 1
+
+
+# --- CHG-168: paridad local/receptor ---------------------------------
+
+
+@pytest.mark.anyio
+async def test_twentieth_report_disables_a_receiver_center():
+    repository = FakeCommunityRepository(
+        center=center_row(
+            kind="receiver_center",
+            name="Acopio Receptor Santander",
+            operational_status="under_observation",
+        ),
+        live_reports=AID_LOCATION_DISABLE_THRESHOLD - 1,
+    )
+    app = community_app(repository)
+
+    response = await request_app(
+        app,
+        "POST",
+        REPORTS_PATH,
+        headers={
+            **idempotency("r9"),
+            "X-Actor-Kind": "anonymous",
+            "X-Denouncer-Key": "fp:huella-receptor-20",
+        },
+        json={
+            "category": "funcionamiento_irregular",
+            "reason": "El receptor lleva días sin operar.",
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["disabled"] is True
+    assert repository.center["operational_status"] == "inactive"
+    assert repository.center["disabled_at"] is not None
+
+
+@pytest.mark.anyio
+async def test_receiver_center_appears_in_verifications_and_comments_work():
+    repository = FakeCommunityRepository(
+        center=center_row(
+            kind="receiver_center", name="Acopio Receptor Santander"
+        )
+    )
+    app = community_app(repository)
+
+    listing = await request_app(
+        app, "GET", VERIFICATIONS_PATH, headers=ADMIN_HEADERS
+    )
+    comment = await request_app(
+        app,
+        "POST",
+        COMMENTS_PATH,
+        headers={**idempotency("rc1"), "X-Actor-Kind": "anonymous"},
+        json={"content": "El receptor recibe camiones sin demora.", "rating": 5},
+    )
+    deleted = await request_app(
+        app,
+        "DELETE",
+        comment_delete_path(comment.json()["id"]),
+        headers=ADMIN_HEADERS,
+    )
+
+    assert listing.status_code == 200
+    assert listing.json()["pending"][0]["kind"] == "receiver_center"
+    assert comment.status_code == 201
+    assert comment.json()["rating"] == 5
+    assert deleted.status_code == 200
+    assert repository.comments == []

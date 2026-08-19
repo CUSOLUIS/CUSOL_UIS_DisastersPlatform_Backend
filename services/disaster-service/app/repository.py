@@ -2866,11 +2866,12 @@ class PostgresDisasterRepository:
                         location_id,
                     )
                     under_observation = True
-                # CHG-165 §13: el umbral de 20 deshabilita el Centro de
-                # Acopio Local (sale del mapa; nada se borra). Solo el
-                # super_admin lo reactiva.
+                # CHG-165 §13: el umbral de 20 deshabilita el acopio
+                # (sale del mapa; nada se borra). Solo el super_admin
+                # lo reactiva. CHG-168: paridad local/receptor.
                 if (
-                    target["kind"] == "collection_center"
+                    target["kind"]
+                    in ("collection_center", "receiver_center")
                     and count >= AID_LOCATION_DISABLE_THRESHOLD
                     and target["disabled_at"] is None
                 ):
@@ -3091,13 +3092,14 @@ class PostgresDisasterRepository:
     """
 
     async def admin_list_aid_location_verifications(self) -> dict:
-        """CHG-165 §22: bandeja de verificación — acopios locales
-        pendientes de decisión y los deshabilitados por denuncias."""
+        """CHG-165 §22: bandeja de verificación — acopios (locales y
+        receptores, CHG-168) pendientes de decisión y los
+        deshabilitados por denuncias."""
         async with self._pool.acquire() as connection:
             pending = await connection.fetch(
                 self._ADMIN_AID_LOCATION_SUMMARY_SQL
                 + """
-                WHERE a.kind = 'collection_center'
+                WHERE a.kind IN ('collection_center', 'receiver_center')
                   AND a.verification_status = 'unverified'
                 ORDER BY a.created_at ASC
                 """
@@ -3105,7 +3107,7 @@ class PostgresDisasterRepository:
             disabled = await connection.fetch(
                 self._ADMIN_AID_LOCATION_SUMMARY_SQL
                 + """
-                WHERE a.kind = 'collection_center'
+                WHERE a.kind IN ('collection_center', 'receiver_center')
                   AND a.disabled_at IS NOT NULL
                 ORDER BY a.disabled_at DESC
                 """
