@@ -847,6 +847,11 @@ class AidLocationCommentDeleteReceipt(ApiModel):
     deleted: int = Field(ge=0)
 
 
+# CHG-170 — Borrado admin del acopio completo desde su ficha.
+class AdminAidLocationDeleteReceipt(ApiModel):
+    deleted: int = Field(ge=0)
+
+
 # CHG-044 — Ofertas comunitarias de comida y alojamiento (FEATURE-010).
 AidOfferKind = Literal["community_meal", "temporary_shelter"]
 AidOfferAvailability = Literal[

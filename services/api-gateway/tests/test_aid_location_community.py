@@ -432,3 +432,86 @@ async def test_admin_comment_delete_requires_session_and_role():
     assert anonymous.status_code == 401
     assert as_user.status_code == 403
     assert calls == []
+
+
+# --- CHG-170: borrado del acopio completo ----------------------------
+
+LOCATION_DELETE_PATH = f"/api/v1/admin/aid-locations/{LOCATION_ID}"
+
+
+@pytest.mark.anyio
+async def test_admin_center_delete_forwards_actor_and_receipt():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["role"] = request.headers.get("x-actor-role")
+        return httpx.Response(200, json={"deleted": 1})
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app, "DELETE", LOCATION_DELETE_PATH, headers=ADMIN_COOKIE
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": 1}
+    assert seen["method"] == "DELETE"
+    assert seen["path"] == (
+        f"/internal/v1/admin/aid-locations/{LOCATION_ID}"
+    )
+    assert seen["role"] == "super_admin"
+
+
+@pytest.mark.anyio
+async def test_admin_center_delete_requires_session_and_role():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"deleted": 1})
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    anonymous = await request_gateway(app, "DELETE", LOCATION_DELETE_PATH)
+    as_user = await request_gateway(
+        app, "DELETE", LOCATION_DELETE_PATH, headers=USER_COOKIE
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert anonymous.status_code == 401
+    assert as_user.status_code == 403
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_admin_center_delete_passes_conflict_through():
+    async def handler(request: httpx.Request):
+        return httpx.Response(
+            409,
+            json={
+                "type": "about:blank",
+                "title": "Acopio con transportes asociados",
+                "status": 409,
+                "detail": "El acopio tiene transportes humanitarios "
+                "registrados y no puede eliminarse mientras existan.",
+            },
+        )
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app, "DELETE", LOCATION_DELETE_PATH, headers=ADMIN_COOKIE
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 409
+    assert response.json()["title"] == "Acopio con transportes asociados"

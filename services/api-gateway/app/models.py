@@ -461,6 +461,11 @@ class AidLocationCommentDeleteReceipt(ApiModel):
     deleted: int = Field(ge=0)
 
 
+# CHG-170 — Borrado admin del acopio completo desde su ficha.
+class AdminAidLocationDeleteReceipt(ApiModel):
+    deleted: int = Field(ge=0)
+
+
 # CHG-153 — Candidatos a centro asociado (espejo del contrato).
 class AidLocationParentCandidate(ApiModel):
     id: UUID

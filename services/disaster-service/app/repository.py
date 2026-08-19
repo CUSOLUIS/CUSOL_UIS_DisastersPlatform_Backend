@@ -3061,6 +3061,102 @@ class PostgresDisasterRepository:
                 )
         return 1
 
+    async def admin_delete_aid_location(
+        self,
+        *,
+        location_id: UUID,
+        actor_account_id: UUID,
+        actor_display_name: str,
+    ) -> dict | str | None:
+        """CHG-170: borra definitivamente un acopio (desde su ficha de
+        VER MÁS) y audita el acto. None si no existe; "has_transports"
+        si algún transporte humanitario lo referencia (FK RESTRICT,
+        trazabilidad CHG-161). Comentarios y denuncias caen por
+        CASCADE; las valoraciones legadas se borran aquí y sus fotos
+        devuelven las claves para limpiar el storage; los dependientes
+        se DESVINCULAN (parent_id NULL) sin borrarse — refina CHG-153
+        §25: sigue sin haber cascade destructivo sobre hijos."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                target = await connection.fetchrow(
+                    """
+                    SELECT kind::text AS kind
+                    FROM disaster_service.aid_locations
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    location_id,
+                )
+                if target is None:
+                    return None
+                transports = await connection.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM disaster_service.humanitarian_transports
+                    WHERE origin_location_id = $1
+                       OR destination_location_id = $1
+                    """,
+                    location_id,
+                )
+                if transports:
+                    return "has_transports"
+                photo_keys = [
+                    key
+                    for row in await connection.fetch(
+                        """
+                        SELECT p.storage_key, p.derived_storage_key
+                        FROM disaster_service.aid_location_rating_photos p
+                        INNER JOIN disaster_service.aid_location_ratings r
+                            ON r.id = p.rating_id
+                        WHERE r.location_id = $1
+                        """,
+                        location_id,
+                    )
+                    for key in (
+                        row["storage_key"],
+                        row["derived_storage_key"],
+                    )
+                ]
+                await connection.execute(
+                    """
+                    DELETE FROM disaster_service.aid_location_ratings
+                    WHERE location_id = $1
+                    """,
+                    location_id,
+                )
+                detached = await connection.execute(
+                    """
+                    UPDATE disaster_service.aid_locations
+                    SET parent_id = NULL, updated_at = NOW()
+                    WHERE parent_id = $1
+                    """,
+                    location_id,
+                )
+                await connection.execute(
+                    """
+                    DELETE FROM disaster_service.aid_locations
+                    WHERE id = $1
+                    """,
+                    location_id,
+                )
+                await self._admin_audit(
+                    connection,
+                    actor_account_id,
+                    actor_display_name,
+                    "aid_location_deleted",
+                    "aid_location",
+                    location_id,
+                    "success",
+                    None,
+                    [
+                        f"kind:{target['kind']}",
+                        "deleted",
+                        f"hijos_desvinculados:{detached.split(' ')[-1]}",
+                    ],
+                    None,
+                )
+        return {"deleted": 1, "photo_keys": photo_keys}
+
     # CHG-165 — Consola super_admin de Centros de Acopio Local.
     _ADMIN_AID_LOCATION_SUMMARY_SQL = """
         SELECT
@@ -3127,7 +3223,9 @@ class PostgresDisasterRepository:
         reason_encrypted: bytes | None,
     ) -> dict | None:
         """CHG-165 §23-24: aprueba (verified) o rechaza (rejected) la
-        verificación; audita la decisión. None si el lugar no existe."""
+        verificación; audita la decisión. None si el lugar no existe.
+        CHG-169: el rechazo además deshabilita el acopio (inactive +
+        disabled_at), que sale del mapa y entra a DESHABILITADOS."""
         new_status = "verified" if decision == "approve" else "rejected"
         async with self._pool.acquire() as connection:
             async with connection.transaction():
@@ -3141,20 +3239,50 @@ class PostgresDisasterRepository:
                 )
                 if row is None:
                     return None
-                await connection.execute(
-                    """
-                    UPDATE disaster_service.aid_locations
-                    SET verification_status = $2::
-                            disaster_service.verification_status,
-                        verified_at = NOW(),
-                        verified_by = $3,
-                        updated_at = NOW()
-                    WHERE id = $1
-                    """,
-                    location_id,
-                    new_status,
-                    actor_account_id,
-                )
+                if decision == "approve":
+                    await connection.execute(
+                        """
+                        UPDATE disaster_service.aid_locations
+                        SET verification_status = $2::
+                                disaster_service.verification_status,
+                            verified_at = NOW(),
+                            verified_by = $3,
+                            updated_at = NOW()
+                        WHERE id = $1
+                        """,
+                        location_id,
+                        new_status,
+                        actor_account_id,
+                    )
+                    changed_fields = [
+                        "verification_status",
+                        "verified_at",
+                        "verified_by",
+                    ]
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE disaster_service.aid_locations
+                        SET verification_status = $2::
+                                disaster_service.verification_status,
+                            verified_at = NOW(),
+                            verified_by = $3,
+                            operational_status = 'inactive',
+                            disabled_at = NOW(),
+                            updated_at = NOW()
+                        WHERE id = $1
+                        """,
+                        location_id,
+                        new_status,
+                        actor_account_id,
+                    )
+                    changed_fields = [
+                        "verification_status",
+                        "verified_at",
+                        "verified_by",
+                        "operational_status:->inactive",
+                        "disabled_at",
+                    ]
                 await self._admin_audit(
                     connection,
                     actor_account_id,
@@ -3168,7 +3296,7 @@ class PostgresDisasterRepository:
                     location_id,
                     "success",
                     reason_encrypted,
-                    ["verification_status", "verified_at", "verified_by"],
+                    changed_fields,
                     None,
                 )
                 summary = await connection.fetchrow(
@@ -3186,16 +3314,20 @@ class PostgresDisasterRepository:
         actor_display_name: str,
         reason_encrypted: bytes | None,
     ) -> dict | str | None:
-        """CHG-165 §15-17: reactiva un centro deshabilitado por
-        denuncias — vuelve a `open`, archiva el ciclo vivo de denuncias
-        (contador a 0 SIN borrar histórico) y audita con estado anterior
-        y nuevo. None si no existe; "not_disabled" si no estaba
-        deshabilitado por denuncias."""
+        """CHG-165 §15-17: reactiva un centro deshabilitado (por
+        denuncias o por rechazo, CHG-169) — vuelve a `open`, archiva el
+        ciclo vivo de denuncias (contador a 0 SIN borrar histórico) y
+        audita con estado anterior y nuevo. CHG-169: si estaba
+        `rejected`, vuelve a `unverified` (regresa al mapa como «Sin
+        verificar» y a PENDIENTES; no existen rechazados activos).
+        None si no existe; "not_disabled" si no estaba deshabilitado."""
         async with self._pool.acquire() as connection:
             async with connection.transaction():
                 target = await connection.fetchrow(
                     """
                     SELECT operational_status::text AS operational_status,
+                           verification_status::text
+                               AS verification_status,
                            disabled_at
                     FROM disaster_service.aid_locations
                     WHERE id = $1
@@ -3212,6 +3344,12 @@ class PostgresDisasterRepository:
                     UPDATE disaster_service.aid_locations
                     SET operational_status = 'open',
                         disabled_at = NULL,
+                        verification_status = CASE
+                            WHEN verification_status = 'rejected'
+                                THEN 'unverified'::
+                                    disaster_service.verification_status
+                            ELSE verification_status
+                        END,
                         updated_at = NOW()
                     WHERE id = $1
                     """,
@@ -3240,7 +3378,13 @@ class PostgresDisasterRepository:
                         f"{target['operational_status']}->open",
                         "disabled_at",
                         f"denuncias_archivadas:{archived.split(' ')[-1]}",
-                    ],
+                    ]
+                    + (
+                        # CHG-169: el rechazo se levanta al reactivar.
+                        ["verification_status:rejected->unverified"]
+                        if target["verification_status"] == "rejected"
+                        else []
+                    ),
                     None,
                 )
                 summary = await connection.fetchrow(

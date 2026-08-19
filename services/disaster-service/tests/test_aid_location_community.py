@@ -64,12 +64,15 @@ def center_row(**overrides) -> dict:
 class FakeCommunityRepository:
     """Réplica en memoria de las reglas CHG-153/CHG-165."""
 
-    def __init__(self, *, center=None, live_reports=0):
+    def __init__(self, *, center=None, live_reports=0, transports=0):
         self.center = center or center_row()
         self.comments: list[dict] = []
         self.reports: list[dict] = []
         self.audit: list[tuple[str, str]] = []
         self.admin_audit: list[str] = []
+        # CHG-170: transportes que referencian el acopio (FK RESTRICT).
+        self.transports = transports
+        self.deleted = False
         for index in range(live_reports):
             self.reports.append(
                 {
@@ -144,6 +147,22 @@ class FakeCommunityRepository:
                 self.admin_audit.append("aid_location_comment_deleted")
                 return 1
         return 0
+
+    # CHG-170: borrado definitivo del acopio completo, auditado.
+    async def admin_delete_aid_location(
+        self,
+        *,
+        location_id,
+        actor_account_id,
+        actor_display_name,
+    ):
+        if location_id != self.center["id"] or self.deleted:
+            return None
+        if self.transports:
+            return "has_transports"
+        self.deleted = True
+        self.admin_audit.append("aid_location_deleted")
+        return {"deleted": 1, "photo_keys": []}
 
     # --- denuncias ---
 
@@ -255,6 +274,10 @@ class FakeCommunityRepository:
             "verified" if decision == "approve" else "rejected"
         )
         self.center["verified_at"] = BASE_AT
+        # CHG-169: el rechazo deshabilita el acopio (sale del mapa).
+        if decision == "reject":
+            self.center["operational_status"] = "inactive"
+            self.center["disabled_at"] = BASE_AT
         self.admin_audit.append(
             "aid_location_verification_approved"
             if decision == "approve"
@@ -279,6 +302,9 @@ class FakeCommunityRepository:
                 report["archived_at"] = BASE_AT
         self.center["operational_status"] = "open"
         self.center["disabled_at"] = None
+        # CHG-169: reactivar un rechazado lo devuelve a la cola.
+        if self.center["verification_status"] == "rejected":
+            self.center["verification_status"] = "unverified"
         self.admin_audit.append("aid_location_reactivated")
         return self._summary()
 
@@ -605,9 +631,13 @@ async def test_rejecting_verification_marks_rejected():
     )
 
     assert response.status_code == 200
-    assert response.json()["verificationStatus"] == "rejected"
-    # §25: rechazar la verificación no toca el estado operativo.
-    assert response.json()["operationalStatus"] == "open"
+    body = response.json()
+    assert body["verificationStatus"] == "rejected"
+    # CHG-169 (reemplaza §25): el rechazo deshabilita el acopio y lo
+    # saca del mapa del dashboard principal.
+    assert body["operationalStatus"] == "inactive"
+    assert body["disabledAt"] is not None
+    assert repository.center["disabled_at"] is not None
 
 
 @pytest.mark.anyio
@@ -796,3 +826,119 @@ async def test_receiver_center_appears_in_verifications_and_comments_work():
     assert comment.json()["rating"] == 5
     assert deleted.status_code == 200
     assert repository.comments == []
+
+
+# --- CHG-169: el rechazo deshabilita y la reactivación lo deshace ----
+
+
+@pytest.mark.anyio
+async def test_rejected_center_lands_in_disabled_tray():
+    repository = FakeCommunityRepository()
+    app = community_app(repository)
+
+    await request_app(
+        app,
+        "POST",
+        VERIFICATION_PATH,
+        headers=ADMIN_HEADERS,
+        json={"decision": "reject", "reason": "Dirección inexistente."},
+    )
+    listing = await request_app(
+        app, "GET", VERIFICATIONS_PATH, headers=ADMIN_HEADERS
+    )
+
+    assert listing.status_code == 200
+    body = listing.json()
+    # Ya no está pendiente (dejó de ser unverified) y aparece entre los
+    # deshabilitados, desde donde puede reactivarse.
+    assert body["pending"] == []
+    assert body["disabled"][0]["verificationStatus"] == "rejected"
+    assert body["disabled"][0]["operationalStatus"] == "inactive"
+
+
+@pytest.mark.anyio
+async def test_reactivating_a_rejected_center_returns_it_to_queue():
+    repository = FakeCommunityRepository()
+    app = community_app(repository)
+    await request_app(
+        app,
+        "POST",
+        VERIFICATION_PATH,
+        headers=ADMIN_HEADERS,
+        json={"decision": "reject"},
+    )
+
+    response = await request_app(
+        app, "POST", REACTIVATE_PATH, headers=ADMIN_HEADERS
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    # CHG-169: vuelve al mapa como «Sin verificar» y a PENDIENTES; no
+    # existen acopios rechazados activos.
+    assert body["verificationStatus"] == "unverified"
+    assert body["operationalStatus"] == "open"
+    assert body["disabledAt"] is None
+
+
+# --- CHG-170: borrado del acopio completo desde su ficha -------------
+
+LOCATION_DELETE_PATH = f"/internal/v1/admin/aid-locations/{LOCATION_ID}"
+
+
+@pytest.mark.anyio
+async def test_admin_deletes_the_whole_center_and_audits():
+    repository = FakeCommunityRepository()
+    app = community_app(repository)
+
+    response = await request_app(
+        app, "DELETE", LOCATION_DELETE_PATH, headers=ADMIN_HEADERS
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": 1}
+    assert repository.deleted is True
+    assert repository.admin_audit == ["aid_location_deleted"]
+
+
+@pytest.mark.anyio
+async def test_deleting_unknown_center_is_404():
+    app = community_app()
+
+    response = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/admin/aid-locations/{uuid4()}",
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_center_with_transports_cannot_be_deleted():
+    repository = FakeCommunityRepository(transports=2)
+    app = community_app(repository)
+
+    response = await request_app(
+        app, "DELETE", LOCATION_DELETE_PATH, headers=ADMIN_HEADERS
+    )
+
+    assert response.status_code == 409
+    assert "transportes" in response.json()["detail"]
+    assert repository.deleted is False
+
+
+@pytest.mark.anyio
+async def test_deleting_center_requires_admin_role():
+    repository = FakeCommunityRepository()
+    app = community_app(repository)
+
+    without_role = await request_app(app, "DELETE", LOCATION_DELETE_PATH)
+    as_moderator = await request_app(
+        app, "DELETE", LOCATION_DELETE_PATH, headers=MODERATOR_HEADERS
+    )
+
+    assert without_role.status_code == 403
+    assert as_moderator.status_code == 403
+    assert repository.deleted is False

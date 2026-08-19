@@ -52,6 +52,7 @@ from .models import (
     AdminSubmissionPage,
     AdminSystemMetrics,
     AdminAidLocationActionReceipt,
+    AdminAidLocationDeleteReceipt,
     AdminAidLocationVerificationsResponse,
     AidLocationAvailability,
     AidLocationComment,
@@ -4482,6 +4483,39 @@ def create_app(
             f"/internal/v1/admin/aid-locations/{location_id}/reactivate",
             account,
             AdminAidLocationActionReceipt,
+        )
+
+    # CHG-170 — Borrado admin del acopio completo desde su ficha de
+    # VER MÁS. Muta: va por admin_mutation (Origin + super_admin +
+    # limitador); 409 si tiene transportes asociados.
+    @application.delete(
+        "/api/v1/admin/aid-locations/{location_id}",
+        response_model=AdminAidLocationDeleteReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Rol u origen insuficiente"},
+            404: {"description": "Acopio inexistente"},
+            409: {"description": "Acopio con transportes asociados"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_delete_aid_location(
+        location_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "DELETE",
+            f"/internal/v1/admin/aid-locations/{location_id}",
+            AdminAidLocationDeleteReceipt,
         )
 
     # CHG-167 — Borrado admin de un comentario de acopio local. Muta:

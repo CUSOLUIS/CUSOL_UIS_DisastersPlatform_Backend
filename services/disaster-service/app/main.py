@@ -56,6 +56,7 @@ from .models import (
     AidLocationRatingInput,
     AidLocationCommentDeleteReceipt,
     AdminAidLocationActionReceipt,
+    AdminAidLocationDeleteReceipt,
     AdminAidLocationSummary,
     AdminAidLocationVerificationDecision,
     AdminAidLocationVerificationsResponse,
@@ -4336,6 +4337,47 @@ def create_app(
                 "El comentario no existe o ya fue borrado.",
             )
         return AidLocationCommentDeleteReceipt(deleted=deleted)
+
+    # CHG-170 — Borrado admin del acopio completo (desde su ficha de
+    # VER MÁS): definitivo y auditado; los dependientes quedan
+    # desvinculados y las fotos de valoraciones salen del storage.
+    @application.delete(
+        "/internal/v1/admin/aid-locations/{location_id}",
+        response_model=AdminAidLocationDeleteReceipt,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_delete_aid_location(
+        location_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display = actor
+        result = await data.admin_delete_aid_location(
+            location_id=location_id,
+            actor_account_id=actor_account_id,
+            actor_display_name=actor_display,
+        )
+        if result is None:
+            return problem(
+                404,
+                "Acopio no encontrado",
+                "El centro de acopio no existe o ya fue eliminado.",
+            )
+        if result == "has_transports":
+            return problem(
+                409,
+                "Acopio con transportes asociados",
+                "El acopio tiene transportes humanitarios registrados "
+                "(trazabilidad CHG-161) y no puede eliminarse mientras "
+                "existan.",
+            )
+        for key in result["photo_keys"]:
+            object_storage.delete(key)
+        return AdminAidLocationDeleteReceipt(deleted=result["deleted"])
 
     # CHG-154 — Gestión admin de registros de personas: listar (con
     # ocultos), ocultar (reversible), restaurar y editar. Nada se
