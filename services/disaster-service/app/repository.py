@@ -8,6 +8,7 @@ import asyncpg
 
 from .models import (
     AID_LOCATION_PARENT_KIND,
+    AID_LOCATION_DISABLE_THRESHOLD,
     AID_LOCATION_REPORT_THRESHOLD,
     AidLocationAvailability,
     AidLocationDirectoryCard,
@@ -63,7 +64,14 @@ _LOGISTICS_MAP_PROJECTION_SQL = """
         a.location_label,
         a.latitude,
         a.longitude,
-        a.verification_status,
+        -- CHG-165 §24: un rechazo administrativo se muestra al público
+        -- como «Sin verificar», nunca como «Rechazado»; el estado real
+        -- queda para la consola admin.
+        CASE
+            WHEN a.verification_status = 'rejected'
+                THEN 'unverified'::disaster_service.verification_status
+            ELSE a.verification_status
+        END AS verification_status,
         NULL::uuid AS related_disaster_id,
         a.description,
         a.data_classification,
@@ -2753,38 +2761,51 @@ class PostgresDisasterRepository:
         actor_kind: str,
         account_id: UUID | None,
         denouncer_key: str,
+        reason_category: str | None,
         reason_encrypted: bytes | None,
     ) -> dict | None:
-        """CHG-153: registra una denuncia (dedup por denunciante) y, si
-        el lugar es un centro de acopio con >= 10 denunciantes distintos
-        vivos, lo pasa a `under_observation`. Devuelve el conteo y si
-        quedó en observación, o None si el lugar no existe.
+        """CHG-153: registra una denuncia (dedup por denunciante del
+        ciclo vivo) y, si el lugar es un centro de acopio con >= 10
+        denunciantes distintos vivos, lo pasa a `under_observation`.
+        CHG-165: con >= 20 un Centro de Acopio Local queda DESHABILITADO
+        (inactive + disabled_at) dentro de esta misma transacción; el
+        FOR UPDATE del lugar serializa denuncias concurrentes para que
+        el umbral no se escape entre conteos (§30). Devuelve el conteo
+        y los estados, o None si el lugar no existe.
         """
         async with self._pool.acquire() as connection:
             async with connection.transaction():
                 target = await connection.fetchrow(
                     """
-                    SELECT kind::text AS kind
+                    SELECT kind::text AS kind,
+                           operational_status::text AS operational_status,
+                           disabled_at
                     FROM disaster_service.aid_locations
                     WHERE id = $1
+                    FOR UPDATE
                     """,
                     location_id,
                 )
                 if target is None:
                     return None
-                await connection.execute(
+                inserted = await connection.fetchrow(
                     """
                     INSERT INTO disaster_service.aid_location_reports (
                         idempotency_key, location_id, actor_kind,
-                        account_id, denouncer_key, reason_encrypted
-                    ) VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (location_id, denouncer_key) DO NOTHING
+                        account_id, denouncer_key, reason_category,
+                        reason_encrypted
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (location_id, denouncer_key)
+                        WHERE archived_at IS NULL
+                        DO NOTHING
+                    RETURNING id
                     """,
                     idempotency_key,
                     location_id,
                     actor_kind,
                     account_id,
                     denouncer_key,
+                    reason_category,
                     reason_encrypted,
                 )
                 count = int(
@@ -2792,12 +2813,32 @@ class PostgresDisasterRepository:
                         _AID_LOCATION_REPORTERS_COUNT_SQL, location_id
                     )
                 )
+                if inserted is not None:
+                    await connection.execute(
+                        """
+                        INSERT INTO
+                            disaster_service.community_contribution_audit (
+                            event_type, contribution_kind,
+                            contribution_id, detail
+                        ) VALUES ($1, $2, $3, $4)
+                        """,
+                        "aid_location_report_received",
+                        "aid_location_report",
+                        inserted["id"],
+                        f"lugar={location_id} motivo={reason_category} "
+                        f"actor={actor_kind} vivas={count}",
+                    )
                 # §12: solo los centros de acopio saltan a observación
                 # por umbral; recolección/distribución no.
-                under_observation = False
+                under_observation = (
+                    target["operational_status"] == "under_observation"
+                )
+                disabled = target["disabled_at"] is not None
                 if (
                     target["kind"] in ("collection_center", "receiver_center")
                     and count >= AID_LOCATION_REPORT_THRESHOLD
+                    and target["operational_status"]
+                    not in ("under_observation", "inactive")
                 ):
                     await connection.execute(
                         """
@@ -2805,26 +2846,333 @@ class PostgresDisasterRepository:
                         SET operational_status = 'under_observation',
                             updated_at = NOW()
                         WHERE id = $1
-                          AND operational_status <> 'under_observation'
                         """,
                         location_id,
                     )
                     under_observation = True
-                else:
-                    current = await connection.fetchval(
+                # CHG-165 §13: el umbral de 20 deshabilita el Centro de
+                # Acopio Local (sale del mapa; nada se borra). Solo el
+                # super_admin lo reactiva.
+                if (
+                    target["kind"] == "collection_center"
+                    and count >= AID_LOCATION_DISABLE_THRESHOLD
+                    and target["disabled_at"] is None
+                ):
+                    await connection.execute(
                         """
-                        SELECT operational_status::text
-                        FROM disaster_service.aid_locations
+                        UPDATE disaster_service.aid_locations
+                        SET operational_status = 'inactive',
+                            disabled_at = NOW(),
+                            updated_at = NOW()
                         WHERE id = $1
                         """,
                         location_id,
                     )
-                    under_observation = current == "under_observation"
+                    disabled = True
+                    under_observation = False
+                    await connection.execute(
+                        """
+                        INSERT INTO
+                            disaster_service.community_contribution_audit (
+                            event_type, contribution_kind,
+                            contribution_id, detail
+                        ) VALUES ($1, $2, $3, $4)
+                        """,
+                        "aid_location_disabled_by_reports",
+                        "aid_location_report",
+                        location_id,
+                        f"denuncias_vivas={count} umbral="
+                        f"{AID_LOCATION_DISABLE_THRESHOLD}",
+                    )
         return {
             "id": location_id,
             "reports_count": count,
             "under_observation": under_observation,
+            "disabled": disabled,
         }
+
+    async def list_aid_location_comments(
+        self, *, location_id: UUID, limit: int
+    ) -> dict | None:
+        """CHG-165 §6: comentarios públicos del lugar, los más
+        recientes primero. None si el lugar no existe."""
+        async with self._pool.acquire() as connection:
+            exists = await connection.fetchval(
+                """
+                SELECT 1 FROM disaster_service.aid_locations
+                WHERE id = $1
+                """,
+                location_id,
+            )
+            if exists is None:
+                return None
+            rows = await connection.fetch(
+                """
+                SELECT id, account_id, author_display_name,
+                       actor_kind::text AS actor_kind, content, created_at
+                FROM disaster_service.aid_location_comments
+                WHERE location_id = $1
+                ORDER BY created_at DESC, id DESC
+                LIMIT $2
+                """,
+                location_id,
+                limit,
+            )
+            total = int(
+                await connection.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM disaster_service.aid_location_comments
+                    WHERE location_id = $1
+                    """,
+                    location_id,
+                )
+            )
+        return {"items": [dict(row) for row in rows], "total": total}
+
+    async def create_aid_location_comment(
+        self,
+        *,
+        idempotency_key: str,
+        location_id: UUID,
+        actor_kind: str,
+        account_id: UUID | None,
+        author_display_name: str | None,
+        content: str,
+    ) -> dict | None:
+        """CHG-165 §5: publica un comentario (anónimo o con cuenta) de
+        forma idempotente. None si el lugar no existe."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                exists = await connection.fetchval(
+                    """
+                    SELECT 1 FROM disaster_service.aid_locations
+                    WHERE id = $1
+                    """,
+                    location_id,
+                )
+                if exists is None:
+                    return None
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO disaster_service.aid_location_comments (
+                        idempotency_key, location_id, account_id,
+                        author_display_name, actor_kind, content
+                    ) VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                    RETURNING id, account_id, author_display_name,
+                              actor_kind::text AS actor_kind, content,
+                              created_at
+                    """,
+                    idempotency_key,
+                    location_id,
+                    account_id,
+                    author_display_name,
+                    actor_kind,
+                    content,
+                )
+                if row is None:
+                    # Reintento con la misma llave: devolver lo ya
+                    # publicado, sin duplicar.
+                    row = await connection.fetchrow(
+                        """
+                        SELECT id, account_id, author_display_name,
+                               actor_kind::text AS actor_kind, content,
+                               created_at
+                        FROM disaster_service.aid_location_comments
+                        WHERE idempotency_key = $1
+                        """,
+                        idempotency_key,
+                    )
+        return dict(row) if row is not None else None
+
+    # CHG-165 — Consola super_admin de Centros de Acopio Local.
+    _ADMIN_AID_LOCATION_SUMMARY_SQL = """
+        SELECT
+            a.id,
+            a.kind::text AS kind,
+            a.name,
+            a.location_label,
+            a.municipality,
+            a.department,
+            a.latitude,
+            a.longitude,
+            a.description,
+            a.schedule,
+            a.contact,
+            a.created_at,
+            a.created_by_account_id,
+            a.verification_status::text AS verification_status,
+            a.operational_status::text AS operational_status,
+            a.disabled_at,
+            a.verified_at,
+            (
+                SELECT COUNT(*)
+                FROM disaster_service.aid_location_reports r
+                WHERE r.location_id = a.id
+                  AND r.archived_at IS NULL
+                  AND r.moderation_status <> 'rejected'
+            ) AS active_reports_count
+        FROM disaster_service.aid_locations a
+    """
+
+    async def admin_list_aid_location_verifications(self) -> dict:
+        """CHG-165 §22: bandeja de verificación — acopios locales
+        pendientes de decisión y los deshabilitados por denuncias."""
+        async with self._pool.acquire() as connection:
+            pending = await connection.fetch(
+                self._ADMIN_AID_LOCATION_SUMMARY_SQL
+                + """
+                WHERE a.kind = 'collection_center'
+                  AND a.verification_status = 'unverified'
+                ORDER BY a.created_at ASC
+                """
+            )
+            disabled = await connection.fetch(
+                self._ADMIN_AID_LOCATION_SUMMARY_SQL
+                + """
+                WHERE a.kind = 'collection_center'
+                  AND a.disabled_at IS NOT NULL
+                ORDER BY a.disabled_at DESC
+                """
+            )
+        return {
+            "pending": [dict(row) for row in pending],
+            "disabled": [dict(row) for row in disabled],
+        }
+
+    async def admin_decide_aid_location_verification(
+        self,
+        *,
+        location_id: UUID,
+        decision: str,
+        actor_account_id: UUID,
+        actor_display_name: str,
+        reason_encrypted: bytes | None,
+    ) -> dict | None:
+        """CHG-165 §23-24: aprueba (verified) o rechaza (rejected) la
+        verificación; audita la decisión. None si el lugar no existe."""
+        new_status = "verified" if decision == "approve" else "rejected"
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    SELECT id FROM disaster_service.aid_locations
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    location_id,
+                )
+                if row is None:
+                    return None
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.aid_locations
+                    SET verification_status = $2::
+                            disaster_service.verification_status,
+                        verified_at = NOW(),
+                        verified_by = $3,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    location_id,
+                    new_status,
+                    actor_account_id,
+                )
+                await self._admin_audit(
+                    connection,
+                    actor_account_id,
+                    actor_display_name,
+                    (
+                        "aid_location_verification_approved"
+                        if decision == "approve"
+                        else "aid_location_verification_rejected"
+                    ),
+                    "aid_location",
+                    location_id,
+                    "success",
+                    reason_encrypted,
+                    ["verification_status", "verified_at", "verified_by"],
+                    None,
+                )
+                summary = await connection.fetchrow(
+                    self._ADMIN_AID_LOCATION_SUMMARY_SQL
+                    + " WHERE a.id = $1",
+                    location_id,
+                )
+        return dict(summary)
+
+    async def admin_reactivate_aid_location(
+        self,
+        *,
+        location_id: UUID,
+        actor_account_id: UUID,
+        actor_display_name: str,
+        reason_encrypted: bytes | None,
+    ) -> dict | str | None:
+        """CHG-165 §15-17: reactiva un centro deshabilitado por
+        denuncias — vuelve a `open`, archiva el ciclo vivo de denuncias
+        (contador a 0 SIN borrar histórico) y audita con estado anterior
+        y nuevo. None si no existe; "not_disabled" si no estaba
+        deshabilitado por denuncias."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                target = await connection.fetchrow(
+                    """
+                    SELECT operational_status::text AS operational_status,
+                           disabled_at
+                    FROM disaster_service.aid_locations
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    location_id,
+                )
+                if target is None:
+                    return None
+                if target["disabled_at"] is None:
+                    return "not_disabled"
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.aid_locations
+                    SET operational_status = 'open',
+                        disabled_at = NULL,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    location_id,
+                )
+                archived = await connection.execute(
+                    """
+                    UPDATE disaster_service.aid_location_reports
+                    SET archived_at = NOW()
+                    WHERE location_id = $1
+                      AND archived_at IS NULL
+                    """,
+                    location_id,
+                )
+                await self._admin_audit(
+                    connection,
+                    actor_account_id,
+                    actor_display_name,
+                    "aid_location_reactivated",
+                    "aid_location",
+                    location_id,
+                    "success",
+                    reason_encrypted,
+                    [
+                        f"operational_status:"
+                        f"{target['operational_status']}->open",
+                        "disabled_at",
+                        f"denuncias_archivadas:{archived.split(' ')[-1]}",
+                    ],
+                    None,
+                )
+                summary = await connection.fetchrow(
+                    self._ADMIN_AID_LOCATION_SUMMARY_SQL
+                    + " WHERE a.id = $1",
+                    location_id,
+                )
+        return dict(summary)
 
     async def create_aid_location_rating(
         self,

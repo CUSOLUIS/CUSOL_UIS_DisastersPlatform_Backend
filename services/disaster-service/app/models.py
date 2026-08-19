@@ -570,6 +570,10 @@ AID_LOCATION_PARENT_KIND: dict[str, str] = {
 }
 # Umbral de denuncias válidas que pone un acopio EN_OBSERVACION (§12).
 AID_LOCATION_REPORT_THRESHOLD = 10
+# CHG-165 — Umbral de denuncias vivas que DESHABILITA un Centro de
+# Acopio Local (inactive + disabled_at): sale del mapa público sin
+# borrar nada; solo super_admin lo reactiva (reinicia el ciclo).
+AID_LOCATION_DISABLE_THRESHOLD = 20
 AidSupplyCategory = Literal[
     "water", "food", "medicine", "clothing", "tools", "shelter", "other"
 ]
@@ -698,9 +702,21 @@ class AidLocationParentCandidatesResponse(ApiModel):
     total: int = Field(ge=0)
 
 
+# CHG-165 — Motivos del selector de denuncia (§10): el usuario dice
+# por qué denuncia además de describir la situación.
+AidLocationReportCategory = Literal[
+    "no_existe",
+    "informacion_falsa",
+    "funcionamiento_irregular",
+    "seguridad",
+    "otro",
+]
+
+
 # CHG-153 — Denuncia sobre un lugar de ayuda (§11-13). Dual anónimo/
-# autenticado; el motivo se cifra (solo super_admin). El umbral de 10
-# denunciantes distintos pone el acopio EN_OBSERVACION.
+# autenticado; la descripción se cifra (solo super_admin). El umbral de
+# 10 denunciantes distintos pone el acopio EN_OBSERVACION; CHG-165 suma
+# el motivo por categorías y el umbral de 20 que deshabilita.
 class AidLocationReportInput(ApiModel):
     model_config = ConfigDict(
         alias_generator=to_camel,
@@ -709,6 +725,9 @@ class AidLocationReportInput(ApiModel):
         extra="forbid",
     )
 
+    # CHG-165: motivo obligatorio del selector; la descripción libre
+    # conserva el campo `reason` histórico (3-1000, cifrada).
+    category: AidLocationReportCategory
     reason: str = Field(min_length=3, max_length=1000)
 
 
@@ -716,6 +735,99 @@ class AidLocationReportReceipt(ApiModel):
     location_id: UUID
     reports_count: int = Field(ge=1)
     under_observation: bool
+    # CHG-165: true cuando esta denuncia dejó (o encontró) el centro
+    # deshabilitado por alcanzar el umbral de 20.
+    disabled: bool = False
+
+
+# CHG-165 — Comentario público de un Centro de Acopio Local (§4-8).
+# account_id NULL = anónimo; el nombre visible se congela al publicar y
+# nunca incluye correo/teléfono/datos privados.
+class AidLocationCommentInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    content: str = Field(min_length=5, max_length=1000)
+
+    # Mismo criterio antibasura que el resto de textos comunitarios;
+    # umbral bajo porque un comentario útil puede ser muy breve.
+    @model_validator(mode="after")
+    def _content_is_readable(self):
+        try:
+            validate_community_text(
+                self.content, "content", min_distinct_words=2
+            )
+        except TextQualityError as error:
+            raise ValueError(str(error)) from error
+        return self
+
+
+class AidLocationComment(ApiModel):
+    id: UUID
+    # NULL → el frontend muestra «Anónimo»; nunca se almacena texto
+    # "anonymous" en lugar de la relación nula (§7).
+    author_display_name: str | None = None
+    actor_kind: ContributionActorKind
+    content: str = Field(min_length=1, max_length=1000)
+    created_at: datetime
+
+
+class AidLocationCommentsResponse(ApiModel):
+    items: list[AidLocationComment]
+    total: int = Field(ge=0)
+
+
+# CHG-165 — Consola super_admin: verificación y reactivación de
+# Centros de Acopio Local (§15, §21-24). Estado operativo y estado de
+# verificación son independientes (§25).
+class AdminAidLocationSummary(ApiModel):
+    id: UUID
+    kind: AidLocationKind
+    name: str
+    location_label: str
+    municipality: str
+    department: str
+    latitude: float | None = None
+    longitude: float | None = None
+    description: str | None = None
+    schedule: str | None = None
+    contact: str | None = None
+    created_at: datetime
+    created_by_account_id: UUID | None = None
+    verification_status: VerificationStatus
+    operational_status: AidLocationOperationalStatus
+    disabled_at: datetime | None = None
+    verified_at: datetime | None = None
+    active_reports_count: int = Field(ge=0)
+
+
+class AdminAidLocationVerificationsResponse(ApiModel):
+    pending: list[AdminAidLocationSummary]
+    disabled: list[AdminAidLocationSummary]
+
+
+class AdminAidLocationVerificationDecision(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    decision: Literal["approve", "reject"]
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class AdminAidLocationActionReceipt(ApiModel):
+    id: UUID
+    verification_status: VerificationStatus
+    operational_status: AidLocationOperationalStatus
+    disabled_at: datetime | None = None
+    active_reports_count: int = Field(ge=0)
 
 
 # CHG-044 — Ofertas comunitarias de comida y alojamiento (FEATURE-010).

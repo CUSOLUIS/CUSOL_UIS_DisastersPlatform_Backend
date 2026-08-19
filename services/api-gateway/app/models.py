@@ -392,6 +392,60 @@ class AidLocationReportReceipt(ApiModel):
     location_id: UUID
     reports_count: int = Field(ge=1)
     under_observation: bool
+    # CHG-165: el centro quedó (o ya estaba) deshabilitado por el
+    # umbral de 20 denuncias.
+    disabled: bool = False
+
+
+# CHG-165 — Comentarios públicos de un Centro de Acopio Local
+# (espejo del contrato). author_display_name NULL = «Anónimo».
+class AidLocationComment(ApiModel):
+    id: UUID
+    author_display_name: str | None = None
+    actor_kind: Literal["anonymous", "authenticated"]
+    content: str = Field(min_length=1, max_length=1000)
+    created_at: datetime
+
+
+class AidLocationCommentsResponse(ApiModel):
+    items: list[AidLocationComment]
+    total: int = Field(ge=0)
+
+
+# CHG-165 — Consola super_admin: verificación/reactivación de acopios
+# locales (espejo del contrato).
+class AdminAidLocationSummary(ApiModel):
+    id: UUID
+    kind: AidLocationKind
+    name: str
+    location_label: str
+    municipality: str
+    department: str
+    latitude: float | None = None
+    longitude: float | None = None
+    description: str | None = None
+    schedule: str | None = None
+    contact: str | None = None
+    created_at: datetime
+    created_by_account_id: UUID | None = None
+    verification_status: VerificationStatus
+    operational_status: AidLocationOperationalStatus
+    disabled_at: datetime | None = None
+    verified_at: datetime | None = None
+    active_reports_count: int = Field(ge=0)
+
+
+class AdminAidLocationVerificationsResponse(ApiModel):
+    pending: list[AdminAidLocationSummary]
+    disabled: list[AdminAidLocationSummary]
+
+
+class AdminAidLocationActionReceipt(ApiModel):
+    id: UUID
+    verification_status: VerificationStatus
+    operational_status: AidLocationOperationalStatus
+    disabled_at: datetime | None = None
+    active_reports_count: int = Field(ge=0)
 
 
 # CHG-153 — Candidatos a centro asociado (espejo del contrato).

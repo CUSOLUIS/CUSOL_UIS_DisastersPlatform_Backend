@@ -266,6 +266,8 @@ services:
       EXPO_PUBLIC_HELP_REQUESTS_DATA_MODE: ${HELP_REQUESTS_DATA_MODE:-api}
       # CHG-163: ofertas «Ofrecer comida» contra la API real.
       EXPO_PUBLIC_FOOD_OFFERS_DATA_MODE: ${FOOD_OFFERS_DATA_MODE:-api}
+      # CHG-165: comentarios/denuncias de acopios locales contra la API real.
+      EXPO_PUBLIC_AID_LOCATION_COMMUNITY_DATA_MODE: ${AID_LOCATION_COMMUNITY_DATA_MODE:-api}
     volumes:
       - ../CUSOL_UIS_DisastersPlatform_Frontend:/app
       - frontend-node-modules:/app/node_modules

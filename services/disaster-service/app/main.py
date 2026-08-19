@@ -54,6 +54,13 @@ from .models import (
     AidLocationParentCandidate,
     AidLocationParentCandidatesResponse,
     AidLocationRatingInput,
+    AdminAidLocationActionReceipt,
+    AdminAidLocationSummary,
+    AdminAidLocationVerificationDecision,
+    AdminAidLocationVerificationsResponse,
+    AidLocationComment,
+    AidLocationCommentInput,
+    AidLocationCommentsResponse,
     AidLocationReceipt,
     AidLocationReportInput,
     AidLocationReportReceipt,
@@ -2368,6 +2375,9 @@ def create_app(
                 actor_kind=actor_kind,
                 account_id=account_id,
                 denouncer_key=denouncer_key,
+                # CHG-165 §10: motivo del selector (en claro, sin PII) +
+                # descripción cifrada.
+                reason_category=payload.category,
                 reason_encrypted=encrypt(payload.reason.strip()),
             )
         except asyncpg.PostgresError:
@@ -2386,6 +2396,110 @@ def create_app(
             location_id=result["id"],
             reports_count=result["reports_count"],
             under_observation=result["under_observation"],
+            disabled=result.get("disabled", False),
+        )
+
+    # CHG-165 §4-8 — Comentarios públicos de un lugar de ayuda: los ve
+    # cualquiera; comentan anónimos y cuentas por igual.
+    @application.get(
+        "/internal/v1/aid-locations/{location_id}/comments",
+        response_model=AidLocationCommentsResponse,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_aid_location_comments(
+        location_id: UUID,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    ):
+        try:
+            result = await data.list_aid_location_comments(
+                location_id=location_id, limit=limit
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Consulta no disponible",
+                "No fue posible consultar los comentarios.",
+            )
+        if result is None:
+            return problem(404, "Lugar no disponible", "El lugar no existe.")
+        return AidLocationCommentsResponse(
+            items=[
+                AidLocationComment(
+                    id=row["id"],
+                    author_display_name=row["author_display_name"],
+                    actor_kind=row["actor_kind"],
+                    content=row["content"],
+                    created_at=row["created_at"],
+                )
+                for row in result["items"]
+            ],
+            total=result["total"],
+        )
+
+    @application.post(
+        "/internal/v1/aid-locations/{location_id}/comments",
+        status_code=201,
+        response_model=AidLocationComment,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_aid_location_comment(
+        location_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        # Nombre visible congelado al publicar; solo llega para cuentas
+        # (el gateway lo resuelve; jamás correo/teléfono, §5).
+        author_display_name: str | None = None
+        if actor_kind == "authenticated":
+            display_raw = request.headers.get("x-actor-display", "").strip()
+            if display_raw:
+                try:
+                    author_display_name = (
+                        base64.b64decode(display_raw.encode()).decode()[:161]
+                        or None
+                    )
+                except Exception:
+                    author_display_name = None
+
+        body = await request.body()
+        try:
+            payload = AidLocationCommentInput.model_validate_json(body)
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+
+        try:
+            row = await data.create_aid_location_comment(
+                idempotency_key=idempotency_key,
+                location_id=location_id,
+                actor_kind=actor_kind,
+                account_id=account_id,
+                author_display_name=author_display_name,
+                content=payload.content.strip(),
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible publicar el comentario.",
+            )
+        if row is None:
+            return problem(404, "Lugar no disponible", "El lugar no existe.")
+        return AidLocationComment(
+            id=row["id"],
+            author_display_name=row["author_display_name"],
+            actor_kind=row["actor_kind"],
+            content=row["content"],
+            created_at=row["created_at"],
         )
 
     @application.post(
@@ -4052,6 +4166,133 @@ def create_app(
                 ],
                 "generatedAt": datetime.now(UTC).isoformat(),
             }
+        )
+
+    # CHG-165 — Verificación y reactivación de Centros de Acopio Local
+    # (solo super_admin). El estado operativo y el de verificación son
+    # independientes (§25); nada se borra jamás (§14).
+    def admin_aid_location_model(row: dict) -> AdminAidLocationSummary:
+        return AdminAidLocationSummary(
+            id=row["id"],
+            kind=row["kind"],
+            name=row["name"],
+            location_label=row["location_label"],
+            municipality=row["municipality"],
+            department=row["department"],
+            latitude=row["latitude"],
+            longitude=row["longitude"],
+            description=row["description"],
+            schedule=row["schedule"],
+            contact=row["contact"],
+            created_at=row["created_at"],
+            created_by_account_id=row["created_by_account_id"],
+            verification_status=row["verification_status"],
+            operational_status=row["operational_status"],
+            disabled_at=row["disabled_at"],
+            verified_at=row["verified_at"],
+            active_reports_count=row["active_reports_count"],
+        )
+
+    @application.get(
+        "/internal/v1/admin/aid-locations/verifications",
+        response_model=AdminAidLocationVerificationsResponse,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_aid_location_verifications(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        result = await data.admin_list_aid_location_verifications()
+        return AdminAidLocationVerificationsResponse(
+            pending=[
+                admin_aid_location_model(row) for row in result["pending"]
+            ],
+            disabled=[
+                admin_aid_location_model(row) for row in result["disabled"]
+            ],
+        )
+
+    @application.post(
+        "/internal/v1/admin/aid-locations/{location_id}/verification",
+        response_model=AdminAidLocationActionReceipt,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_decide_aid_location_verification(
+        location_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_id, actor_display = actor
+        body = await request.body()
+        try:
+            payload = AdminAidLocationVerificationDecision.model_validate_json(
+                body
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        row = await data.admin_decide_aid_location_verification(
+            location_id=location_id,
+            decision=payload.decision,
+            actor_account_id=actor_id,
+            actor_display_name=actor_display,
+            reason_encrypted=encrypt(
+                payload.reason.strip() if payload.reason else None
+            ),
+        )
+        if row is None:
+            return problem(404, "Centro no disponible", "El centro no existe.")
+        return AdminAidLocationActionReceipt(
+            id=row["id"],
+            verification_status=row["verification_status"],
+            operational_status=row["operational_status"],
+            disabled_at=row["disabled_at"],
+            active_reports_count=row["active_reports_count"],
+        )
+
+    @application.post(
+        "/internal/v1/admin/aid-locations/{location_id}/reactivate",
+        response_model=AdminAidLocationActionReceipt,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_reactivate_aid_location(
+        location_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_id, actor_display = actor
+        row = await data.admin_reactivate_aid_location(
+            location_id=location_id,
+            actor_account_id=actor_id,
+            actor_display_name=actor_display,
+            reason_encrypted=None,
+        )
+        if row is None:
+            return problem(404, "Centro no disponible", "El centro no existe.")
+        if row == "not_disabled":
+            return problem(
+                409,
+                "Centro no deshabilitado",
+                "Solo puede reactivarse un centro deshabilitado por "
+                "denuncias.",
+            )
+        return AdminAidLocationActionReceipt(
+            id=row["id"],
+            verification_status=row["verification_status"],
+            operational_status=row["operational_status"],
+            disabled_at=row["disabled_at"],
+            active_reports_count=row["active_reports_count"],
         )
 
     # CHG-154 — Gestión admin de registros de personas: listar (con

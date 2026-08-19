@@ -31,10 +31,13 @@ RECEIPT = {
     "createdAt": "2026-08-18T12:00:00Z",
 }
 
+# CHG-165: el recibo suma `disabled` (umbral de 20 → centro fuera del
+# mapa hasta que el super_admin lo reactive).
 REPORT_RECEIPT = {
     "locationId": LOCATION_ID,
     "reportsCount": 1,
     "underObservation": False,
+    "disabled": False,
 }
 
 USER_ACCOUNT = {
