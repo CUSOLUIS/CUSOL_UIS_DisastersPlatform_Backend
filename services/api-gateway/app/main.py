@@ -37,6 +37,9 @@ from .models import (
     AdminSubmissionDeleteReceipt,
     DamagedHomeReportReceipt,
     HumanitarianTransportReceipt,
+    ActiveTransportsResponse,
+    TransportCitiesResponse,
+    TransportJourneyReceipt,
     AdminSubmissionTheme,
     AdminOverview,
     AdminPeoplePage,
@@ -287,6 +290,13 @@ def create_app(
     # CHG-163: lectura de ofertas «Ofrecer comida».
     food_offer_read_limiter = SlidingWindowRateLimiter(
         resolved_settings.food_offer_read_rate_limit_per_minute
+    )
+    # CHG-171: lecturas de La Mulera y posiciones del conductor.
+    transport_read_limiter = SlidingWindowRateLimiter(
+        resolved_settings.transport_read_rate_limit_per_minute
+    )
+    transport_position_limiter = SlidingWindowRateLimiter(
+        resolved_settings.transport_position_rate_limit_per_minute
     )
     building_reports_limiter = SlidingWindowRateLimiter(
         resolved_settings.building_reports_rate_limit_per_minute
@@ -3879,6 +3889,219 @@ def create_app(
                 "No fue posible registrar el transporte en este momento.",
                 title="Servicio no disponible",
             )
+
+    # CHG-171 §50 — Catálogo de ciudades de La Mulera (público).
+    @application.get(
+        "/api/v1/transports/cities",
+        response_model=TransportCitiesResponse,
+        response_model_by_alias=True,
+        responses={
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_transport_cities(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        if not transport_read_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        try:
+            response = await upstream.get("/internal/v1/transport-cities")
+            response.raise_for_status()
+            return JSONResponse(
+                content=TransportCitiesResponse.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar las ciudades en este momento.",
+                title="Servicio no disponible",
+            )
+
+    # CHG-171 — Feed público del mapa: viajes vivos con su rastro;
+    # nunca datos del conductor (§30).
+    @application.get(
+        "/api/v1/transports/active",
+        response_model=ActiveTransportsResponse,
+        response_model_by_alias=True,
+        responses={
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_active_transports(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        if not transport_read_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        try:
+            response = await upstream.get(
+                "/internal/v1/humanitarian-transports/active"
+            )
+            response.raise_for_status()
+            return JSONResponse(
+                content=ActiveTransportsResponse.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar los viajes en este momento.",
+                title="Servicio no disponible",
+            )
+
+    # CHG-171 (GPS) — Hitos y posiciones del viaje: cuenta del
+    # conductor, Origin válido y limitador propio para las posiciones.
+    async def transport_journey_action(
+        request: Request,
+        upstream: httpx.AsyncClient,
+        identity: httpx.AsyncClient,
+        transport_id: UUID,
+        action: str,
+        limiter,
+        limiter_key_prefix: str,
+        body: bytes | None = None,
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not limiter.allow(f"{limiter_key_prefix}:{account.id}"):
+            return rate_limited_response(
+                "Se superó el límite de reportes del viaje por minuto."
+            )
+        headers = {
+            "x-actor-kind": "authenticated",
+            "x-account-id": str(account.id),
+        }
+        if body is not None:
+            headers["content-type"] = "application/json"
+        try:
+            response = await upstream.post(
+                f"/internal/v1/me/humanitarian-transports/{transport_id}"
+                f"/{action}",
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                content=TransportJourneyReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible actualizar el viaje en este momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.post(
+        "/api/v1/me/transports/{transport_id}/start",
+        response_model=TransportJourneyReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Cuenta u origen sin permiso"},
+            404: {"description": "Transporte inexistente"},
+            409: {"description": "Estado del viaje no compatible"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def start_transport_journey(
+        transport_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await transport_journey_action(
+            request,
+            upstream,
+            identity,
+            transport_id,
+            "start",
+            transport_read_limiter,
+            "transport-journey",
+        )
+
+    @application.post(
+        "/api/v1/me/transports/{transport_id}/arrive",
+        response_model=TransportJourneyReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Cuenta u origen sin permiso"},
+            404: {"description": "Transporte inexistente"},
+            409: {"description": "Estado del viaje no compatible"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def arrive_transport_journey(
+        transport_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await transport_journey_action(
+            request,
+            upstream,
+            identity,
+            transport_id,
+            "arrive",
+            transport_read_limiter,
+            "transport-journey",
+        )
+
+    @application.post(
+        "/api/v1/me/transports/{transport_id}/positions",
+        response_model=TransportJourneyReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Cuenta u origen sin permiso"},
+            404: {"description": "Transporte inexistente"},
+            409: {"description": "Estado del viaje no compatible"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def record_transport_position(
+        transport_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await transport_journey_action(
+            request,
+            upstream,
+            identity,
+            transport_id,
+            "positions",
+            transport_position_limiter,
+            "transport-position",
+            body=await request.body(),
+        )
 
     # CHG-162 — Alta de «Mi casita partida» (anónimo permitido, como
     # los demás reportes ciudadanos).

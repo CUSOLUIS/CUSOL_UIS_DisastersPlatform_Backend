@@ -701,3 +701,142 @@ async def test_damaged_home_allows_anonymous_and_forwards():
     assert response.status_code == 201
     assert seen["path"] == "/internal/v1/damaged-home-reports"
     assert seen["actor"] == "anonymous"
+
+
+# --- CHG-171: catálogo de ciudades, viaje GPS y feed del mapa --------
+
+TRANSPORT_ID = "dddddddd-dddd-4ddd-8ddd-ddddddddddd7"
+
+JOURNEY_RECEIPT = {
+    "id": TRANSPORT_ID,
+    "status": "in_transit",
+    "departedAt": "2026-08-19T12:00:00Z",
+    "arrivedAt": None,
+    "lastPositionAt": None,
+}
+
+
+@pytest.mark.anyio
+async def test_transport_cities_are_public():
+    def disaster_handler(request: httpx.Request):
+        assert request.url.path == "/internal/v1/transport-cities"
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {"name": "Bucaramanga", "department": "Santander"}
+                ],
+                "total": 1,
+            },
+        )
+
+    upstream, identity = make_clients(disaster_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(app, "GET", "/api/v1/transports/cities")
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["name"] == "Bucaramanga"
+
+
+@pytest.mark.anyio
+async def test_active_transports_feed_is_public():
+    def disaster_handler(request: httpx.Request):
+        assert request.url.path == (
+            "/internal/v1/humanitarian-transports/active"
+        )
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": TRANSPORT_ID,
+                        "kind": "mule",
+                        "status": "in_transit",
+                        "originName": "Acopio La Feria",
+                        "originMunicipality": "Bucaramanga",
+                        "destinationName": "Receptor Santander",
+                        "destinationMunicipality": "El Playón",
+                        "createdAt": "2026-08-19T11:00:00Z",
+                        "trail": [],
+                    }
+                ],
+                "total": 1,
+            },
+        )
+
+    upstream, identity = make_clients(disaster_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(app, "GET", "/api/v1/transports/active")
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["status"] == "in_transit"
+
+
+@pytest.mark.anyio
+async def test_journey_actions_require_session_and_forward_account():
+    seen = {}
+
+    def disaster_handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["account"] = request.headers.get("x-account-id")
+        return httpx.Response(200, json=JOURNEY_RECEIPT)
+
+    upstream, identity = make_clients(disaster_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    anonymous = await request_gateway(
+        app, "POST", f"/api/v1/me/transports/{TRANSPORT_ID}/start"
+    )
+    authenticated = await request_gateway(
+        app,
+        "POST",
+        f"/api/v1/me/transports/{TRANSPORT_ID}/positions",
+        headers={"Cookie": "cusol_session=token-user"},
+        json={"latitude": 7.2, "longitude": -73.15},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert anonymous.status_code == 401
+    assert authenticated.status_code == 200
+    assert authenticated.json()["status"] == "in_transit"
+    assert seen["path"] == (
+        f"/internal/v1/me/humanitarian-transports/{TRANSPORT_ID}/positions"
+    )
+    assert seen["account"] == USER_ACCOUNT["id"]
+
+
+@pytest.mark.anyio
+async def test_journey_conflict_passes_through():
+    def disaster_handler(request: httpx.Request):
+        return httpx.Response(
+            409,
+            json={
+                "type": "about:blank",
+                "title": "Estado del viaje no compatible",
+                "status": 409,
+                "detail": "El viaje no admite esta acción en su estado "
+                "actual.",
+            },
+        )
+
+    upstream, identity = make_clients(disaster_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        f"/api/v1/me/transports/{TRANSPORT_ID}/arrive",
+        headers={"Cookie": "cusol_session=token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 409
+    assert response.json()["title"] == "Estado del viaje no compatible"

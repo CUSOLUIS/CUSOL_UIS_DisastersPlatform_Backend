@@ -1215,6 +1215,14 @@ class PostgresDisasterRepository:
         destination_location_id: UUID,
         supplies_summary: str | None,
         account_id: UUID,
+        # CHG-171: conductor (sensibles ya cifrados) y vehículo.
+        driver_full_name: str,
+        driver_document_type: str,
+        driver_document_number_encrypted: bytes | None,
+        driver_phone_encrypted: bytes | None,
+        tractor_plate: str,
+        trailer_plate: str,
+        vehicle_visible_characteristics: str,
     ) -> dict | str:
         async def _center(location_id: UUID) -> dict | None:
             row = await self._pool.fetchrow(
@@ -1274,8 +1282,13 @@ class PostgresDisasterRepository:
                 idempotency_key, kind, account_id,
                 origin_municipality, destination_municipality,
                 origin_location_id, destination_location_id,
-                supplies_summary
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                supplies_summary,
+                driver_full_name, driver_document_type,
+                driver_document_number_encrypted, driver_phone_encrypted,
+                tractor_plate, trailer_plate,
+                vehicle_visible_characteristics
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                      $12, $13, $14, $15)
             ON CONFLICT (idempotency_key) DO NOTHING
             RETURNING id, kind, status, origin_location_id,
                       destination_location_id, created_at
@@ -1288,6 +1301,13 @@ class PostgresDisasterRepository:
             origin_location_id,
             destination_location_id,
             supplies_summary,
+            driver_full_name,
+            driver_document_type,
+            driver_document_number_encrypted,
+            driver_phone_encrypted,
+            tractor_plate,
+            trailer_plate,
+            vehicle_visible_characteristics,
         )
         if row is None:
             # Reintento idempotente: devolver el alta original.
@@ -1300,7 +1320,273 @@ class PostgresDisasterRepository:
                 """,
                 idempotency_key,
             )
+        else:
+            # CHG-171 §60: el alta queda en la auditoría comunitaria
+            # existente (sin datos sensibles del conductor).
+            await self._pool.execute(
+                """
+                INSERT INTO
+                    disaster_service.community_contribution_audit (
+                    event_type, contribution_kind, contribution_id,
+                    detail
+                ) VALUES ($1, $2, $3, $4)
+                """,
+                "humanitarian_transport_registered",
+                "humanitarian_transport",
+                row["id"],
+                f"cuenta={account_id} origen={origin_location_id} "
+                f"destino={destination_location_id} kind={kind}",
+            )
         return dict(row)
+
+    # CHG-171 §50 — Catálogo de ciudades: sembrado (044) UNIDO con los
+    # municipios reales de acopios publicados; se deduplica sin tildes
+    # prefiriendo el nombre oficial del catálogo.
+    async def list_transport_cities(self) -> list[dict]:
+        rows = await self._pool.fetch(
+            """
+            SELECT DISTINCT ON (
+                       unaccent(lower(name)), unaccent(lower(department))
+                   )
+                   name, department
+            FROM (
+                SELECT name, department, 0 AS priority
+                FROM disaster_service.transport_cities
+                UNION ALL
+                SELECT btrim(municipality) AS name,
+                       COALESCE(
+                           NULLIF(btrim(department), ''), 'Colombia'
+                       ) AS department,
+                       1 AS priority
+                FROM disaster_service.aid_locations
+                WHERE publication_status = 'published'
+                  AND operational_status <> 'inactive'
+                  AND kind IN ('collection_center', 'receiver_center')
+                  AND btrim(municipality) <> ''
+            ) united
+            ORDER BY unaccent(lower(name)), unaccent(lower(department)),
+                     priority
+            """
+        )
+        return sorted(
+            (dict(row) for row in rows),
+            key=lambda city: (city["name"], city["department"]),
+        )
+
+    # CHG-171 (GPS) — Hitos del viaje: solo el dueño (que es el
+    # conductor) los mueve. Sentinelas: None (no existe), "not_owner",
+    # "wrong_status".
+    async def _transport_for_update(self, connection, transport_id):
+        return await connection.fetchrow(
+            """
+            SELECT id, account_id, status::text AS status
+            FROM disaster_service.humanitarian_transports
+            WHERE id = $1
+            FOR UPDATE
+            """,
+            transport_id,
+        )
+
+    _JOURNEY_RECEIPT_SQL = """
+        SELECT id, status, departed_at, arrived_at, last_position_at
+        FROM disaster_service.humanitarian_transports
+        WHERE id = $1
+    """
+
+    async def start_transport_journey(
+        self, *, transport_id: UUID, account_id: UUID
+    ) -> dict | str | None:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                row = await self._transport_for_update(
+                    connection, transport_id
+                )
+                if row is None:
+                    return None
+                if row["account_id"] != account_id:
+                    return "not_owner"
+                if row["status"] != "registered":
+                    return "wrong_status"
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.humanitarian_transports
+                    SET status = 'in_transit', departed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    transport_id,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.community_contribution_audit (
+                        event_type, contribution_kind, contribution_id,
+                        detail
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    "humanitarian_transport_departed",
+                    "humanitarian_transport",
+                    transport_id,
+                    f"cuenta={account_id}",
+                )
+                receipt = await connection.fetchrow(
+                    self._JOURNEY_RECEIPT_SQL, transport_id
+                )
+        return dict(receipt)
+
+    async def arrive_transport_journey(
+        self, *, transport_id: UUID, account_id: UUID
+    ) -> dict | str | None:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                row = await self._transport_for_update(
+                    connection, transport_id
+                )
+                if row is None:
+                    return None
+                if row["account_id"] != account_id:
+                    return "not_owner"
+                if row["status"] != "in_transit":
+                    return "wrong_status"
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.humanitarian_transports
+                    SET status = 'arrived', arrived_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    transport_id,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.community_contribution_audit (
+                        event_type, contribution_kind, contribution_id,
+                        detail
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    "humanitarian_transport_arrived",
+                    "humanitarian_transport",
+                    transport_id,
+                    f"cuenta={account_id}",
+                )
+                receipt = await connection.fetchrow(
+                    self._JOURNEY_RECEIPT_SQL, transport_id
+                )
+        return dict(receipt)
+
+    async def record_transport_position(
+        self,
+        *,
+        transport_id: UUID,
+        account_id: UUID,
+        latitude: float,
+        longitude: float,
+    ) -> dict | str | None:
+        """CHG-171: una lectura del GPS del conductor — alimenta el
+        rastro y la última posición mientras el viaje siga vivo."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                row = await self._transport_for_update(
+                    connection, transport_id
+                )
+                if row is None:
+                    return None
+                if row["account_id"] != account_id:
+                    return "not_owner"
+                if row["status"] not in ("registered", "in_transit"):
+                    return "wrong_status"
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.humanitarian_transport_positions
+                        (transport_id, latitude, longitude)
+                    VALUES ($1, $2, $3)
+                    """,
+                    transport_id,
+                    latitude,
+                    longitude,
+                )
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.humanitarian_transports
+                    SET last_latitude = $2, last_longitude = $3,
+                        last_position_at = NOW(), updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    transport_id,
+                    latitude,
+                    longitude,
+                )
+                receipt = await connection.fetchrow(
+                    self._JOURNEY_RECEIPT_SQL, transport_id
+                )
+        return dict(receipt)
+
+    async def list_active_transports(self) -> list[dict]:
+        """CHG-171: viajes para el mapa — vivos y llegados recientes
+        (≤6 h), con su rastro (últimos 200 puntos). SIN datos del
+        conductor (§30)."""
+        rows = await self._pool.fetch(
+            """
+            SELECT t.id, t.kind, t.status::text AS status,
+                   t.supplies_summary, t.tractor_plate, t.trailer_plate,
+                   t.vehicle_visible_characteristics,
+                   t.departed_at, t.arrived_at, t.created_at,
+                   t.last_latitude, t.last_longitude, t.last_position_at,
+                   o.name AS origin_name,
+                   o.municipality AS origin_municipality,
+                   o.latitude AS origin_latitude,
+                   o.longitude AS origin_longitude,
+                   d.name AS destination_name,
+                   d.municipality AS destination_municipality,
+                   d.latitude AS destination_latitude,
+                   d.longitude AS destination_longitude
+            FROM disaster_service.humanitarian_transports t
+            INNER JOIN disaster_service.aid_locations o
+                ON o.id = t.origin_location_id
+            INNER JOIN disaster_service.aid_locations d
+                ON d.id = t.destination_location_id
+            WHERE t.status IN ('registered', 'in_transit')
+               OR (
+                   t.status = 'arrived'
+                   AND t.arrived_at >= NOW() - INTERVAL '6 hours'
+               )
+            ORDER BY t.created_at DESC
+            LIMIT 100
+            """
+        )
+        transports = [dict(row) for row in rows]
+        if not transports:
+            return []
+        trails = await self._pool.fetch(
+            """
+            SELECT transport_id, latitude, longitude, recorded_at
+            FROM (
+                SELECT p.*, ROW_NUMBER() OVER (
+                           PARTITION BY transport_id
+                           ORDER BY recorded_at DESC
+                       ) AS recency
+                FROM disaster_service.humanitarian_transport_positions p
+                WHERE transport_id = ANY($1::uuid[])
+            ) ranked
+            WHERE recency <= 200
+            ORDER BY transport_id, recorded_at ASC
+            """,
+            [transport["id"] for transport in transports],
+        )
+        by_transport: dict = {}
+        for point in trails:
+            by_transport.setdefault(point["transport_id"], []).append(
+                {
+                    "latitude": point["latitude"],
+                    "longitude": point["longitude"],
+                    "recorded_at": point["recorded_at"],
+                }
+            )
+        for transport in transports:
+            transport["trail"] = by_transport.get(transport["id"], [])
+        return transports
 
     # CHG-162 — Alta de «Mi casita partida» (publicación inmediata).
     async def create_damaged_home_report(

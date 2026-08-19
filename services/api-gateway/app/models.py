@@ -1153,6 +1153,63 @@ class HumanitarianTransportReceipt(ApiModel):
     created_at: datetime
 
 
+# CHG-171 §50 — Catálogo de ciudades de La Mulera.
+class TransportCity(ApiModel):
+    name: str
+    department: str
+
+
+class TransportCitiesResponse(ApiModel):
+    items: list[TransportCity]
+    total: int = Field(ge=0)
+
+
+# CHG-171 (GPS) — Hitos y posiciones del viaje del conductor.
+class TransportJourneyReceipt(ApiModel):
+    id: UUID
+    status: TransportStatus
+    departed_at: datetime | None = None
+    arrived_at: datetime | None = None
+    last_position_at: datetime | None = None
+
+
+class TransportTrailPoint(ApiModel):
+    latitude: float
+    longitude: float
+    recorded_at: datetime
+
+
+# Ficha pública del viaje para el mapa: SIN datos del conductor (§30).
+class ActiveTransport(ApiModel):
+    id: UUID
+    kind: TransportKind
+    status: TransportStatus
+    origin_name: str
+    origin_municipality: str
+    origin_latitude: float | None = None
+    origin_longitude: float | None = None
+    destination_name: str
+    destination_municipality: str
+    destination_latitude: float | None = None
+    destination_longitude: float | None = None
+    supplies_summary: str | None = None
+    tractor_plate: str | None = None
+    trailer_plate: str | None = None
+    vehicle_visible_characteristics: str | None = None
+    departed_at: datetime | None = None
+    arrived_at: datetime | None = None
+    last_latitude: float | None = None
+    last_longitude: float | None = None
+    last_position_at: datetime | None = None
+    created_at: datetime
+    trail: list[TransportTrailPoint] = Field(default_factory=list)
+
+
+class ActiveTransportsResponse(ApiModel):
+    items: list[ActiveTransport]
+    total: int = Field(ge=0)
+
+
 # CHG-162 — «Mi casita partida».
 class DamagedHomeReportReceipt(ApiModel):
     id: UUID

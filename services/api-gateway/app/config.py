@@ -43,6 +43,10 @@ class Settings:
     # limitadores de contribución; la lectura tiene el suyo (el
     # dashboard sondea cada 30 s, como las solicitudes).
     food_offer_read_rate_limit_per_minute: int = 60
+    # CHG-171: lectura pública de La Mulera (ciudades + viajes activos,
+    # el mapa sondea) y posiciones del GPS del conductor (~cada 20 s).
+    transport_read_rate_limit_per_minute: int = 60
+    transport_position_rate_limit_per_minute: int = 12
     # CHG-036: límites administrativos por cuenta autenticada.
     admin_rate_limit_per_minute: int = 240
     admin_evidence_rate_limit_per_minute: int = 30
@@ -157,6 +161,14 @@ class Settings:
             food_offer_read_rate_limit_per_minute=int(
                 os.getenv(
                     "FOOD_OFFER_READ_RATE_LIMIT_PER_MINUTE", "60"
+                )
+            ),
+            transport_read_rate_limit_per_minute=int(
+                os.getenv("TRANSPORT_READ_RATE_LIMIT_PER_MINUTE", "60")
+            ),
+            transport_position_rate_limit_per_minute=int(
+                os.getenv(
+                    "TRANSPORT_POSITION_RATE_LIMIT_PER_MINUTE", "12"
                 )
             ),
             admin_rate_limit_per_minute=int(

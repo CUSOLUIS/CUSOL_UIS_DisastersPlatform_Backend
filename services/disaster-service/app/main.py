@@ -49,8 +49,14 @@ from .models import (
     AidLocationInput,
     DamagedHomeReportInput,
     DamagedHomeReportReceipt,
+    ActiveTransport,
+    ActiveTransportsResponse,
     HumanitarianTransportInput,
     HumanitarianTransportReceipt,
+    TransportCitiesResponse,
+    TransportCity,
+    TransportJourneyReceipt,
+    TransportPositionInput,
     AidLocationParentCandidate,
     AidLocationParentCandidatesResponse,
     AidLocationRatingInput,
@@ -2161,6 +2167,19 @@ def create_app(
                     else None
                 ),
                 account_id=account_id,
+                # CHG-171: conductor (documento y teléfono cifrados,
+                # §30/§59) y vehículo.
+                driver_full_name=payload.driver_full_name,
+                driver_document_type=payload.driver_document_type,
+                driver_document_number_encrypted=encrypt(
+                    payload.driver_document_number
+                ),
+                driver_phone_encrypted=encrypt(payload.driver_phone),
+                tractor_plate=payload.tractor_plate,
+                trailer_plate=payload.trailer_plate,
+                vehicle_visible_characteristics=(
+                    payload.vehicle_visible_characteristics.strip()
+                ),
             )
         except asyncpg.PostgresError:
             return problem(
@@ -2199,6 +2218,154 @@ def create_app(
                 422, "Transporte inválido", messages[result]
             )
         return HumanitarianTransportReceipt(**result)
+
+    # CHG-171 §50 — Catálogo de ciudades para los selectores de La
+    # Mulera (público; el frontend lo carga una vez y filtra local).
+    @application.get(
+        "/internal/v1/transport-cities",
+        response_model=TransportCitiesResponse,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_transport_cities(
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        rows = await data.list_transport_cities()
+        return TransportCitiesResponse(
+            items=[TransportCity(**row) for row in rows],
+            total=len(rows),
+        )
+
+    # CHG-171 (GPS) — Hitos y posiciones del viaje: solo el dueño
+    # autenticado (que es el conductor, regla del formulario).
+    def _journey_actor(request: Request):
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401,
+                "Sesión requerida",
+                "El seguimiento del viaje exige la cuenta del "
+                "conductor.",
+            )
+        return account_id
+
+    def _journey_problem(result) -> JSONResponse | None:
+        if result is None:
+            return problem(
+                404,
+                "Transporte no encontrado",
+                "El transporte no existe.",
+            )
+        if result == "not_owner":
+            return problem(
+                403,
+                "Cuenta sin permiso",
+                "Solo la cuenta que registró el transporte (el "
+                "conductor) puede reportar su viaje.",
+            )
+        if result == "wrong_status":
+            return problem(
+                409,
+                "Estado del viaje no compatible",
+                "El viaje no admite esta acción en su estado actual.",
+            )
+        return None
+
+    @application.post(
+        "/internal/v1/me/humanitarian-transports/{transport_id}/start",
+        response_model=TransportJourneyReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def start_transport_journey(
+        transport_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = _journey_actor(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        result = await data.start_transport_journey(
+            transport_id=transport_id, account_id=account_id
+        )
+        failure = _journey_problem(result)
+        if failure is not None:
+            return failure
+        return TransportJourneyReceipt(**result)
+
+    @application.post(
+        "/internal/v1/me/humanitarian-transports/{transport_id}/arrive",
+        response_model=TransportJourneyReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def arrive_transport_journey(
+        transport_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = _journey_actor(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        result = await data.arrive_transport_journey(
+            transport_id=transport_id, account_id=account_id
+        )
+        failure = _journey_problem(result)
+        if failure is not None:
+            return failure
+        return TransportJourneyReceipt(**result)
+
+    @application.post(
+        "/internal/v1/me/humanitarian-transports/{transport_id}"
+        "/positions",
+        response_model=TransportJourneyReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def record_transport_position(
+        transport_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = _journey_actor(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        try:
+            payload = TransportPositionInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        result = await data.record_transport_position(
+            transport_id=transport_id,
+            account_id=account_id,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+        )
+        failure = _journey_problem(result)
+        if failure is not None:
+            return failure
+        return TransportJourneyReceipt(**result)
+
+    # CHG-171 — Feed público del mapa: viajes vivos y llegadas
+    # recientes con su rastro; nunca datos del conductor (§30).
+    @application.get(
+        "/internal/v1/humanitarian-transports/active",
+        response_model=ActiveTransportsResponse,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_active_transports(
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        rows = await data.list_active_transports()
+        return ActiveTransportsResponse(
+            items=[ActiveTransport(**row) for row in rows],
+            total=len(rows),
+        )
 
     # CHG-162 — Alta de «Mi casita partida» (anónimo permitido).
     @application.post(

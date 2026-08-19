@@ -1,8 +1,15 @@
+import re
 from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from .person_options import DOCUMENT_TYPES, NATIONALITIES, SEXES
 from .text_quality import TextQualityError, validate_community_text
@@ -1978,6 +1985,29 @@ TransportStatus = Literal[
 ]
 
 
+# CHG-171 §27: el conductor debe quedar identificado — subconjunto
+# adulto del catálogo CHG-073 (sin «Sin documento» ni documentos de
+# menores de edad).
+TransportDriverDocumentType = Literal[
+    "Cédula de ciudadanía",
+    "Cédula de extranjería",
+    "Pasaporte",
+    "Permiso por protección temporal (PPT)",
+]
+
+# CHG-171 §32-33: placa normalizada (mayúsculas, sin espacios/guiones).
+_PLATE_PATTERN = re.compile(r"^[A-Z0-9]{5,10}$")
+
+
+def _normalize_plate(value: str) -> str:
+    plate = re.sub(r"[\s-]+", "", value.strip().upper())
+    if not _PLATE_PATTERN.fullmatch(plate):
+        raise ValueError(
+            "La placa debe tener entre 5 y 10 letras o números."
+        )
+    return plate
+
+
 class HumanitarianTransportInput(ApiModel):
     model_config = ConfigDict(
         alias_generator=to_camel,
@@ -1992,6 +2022,34 @@ class HumanitarianTransportInput(ApiModel):
     origin_location_id: UUID
     destination_location_id: UUID
     supplies_summary: str | None = Field(default=None, max_length=1000)
+    # CHG-171 §26-29: conductor obligatorio en registros nuevos (los
+    # históricos quedan NULL, §62). Quien registra ES el conductor.
+    driver_full_name: str = Field(min_length=3, max_length=160)
+    driver_document_type: TransportDriverDocumentType
+    # §28: texto, nunca numérico (conserva ceros y letras).
+    driver_document_number: str = Field(min_length=3, max_length=20)
+    driver_phone: str = Field(
+        max_length=PHONE_MAX_LENGTH, pattern=PHONE_PATTERN
+    )
+    # CHG-171 §31-35: identificación del vehículo.
+    tractor_plate: str = Field(min_length=5, max_length=12)
+    trailer_plate: str = Field(min_length=5, max_length=12)
+    vehicle_visible_characteristics: str = Field(
+        min_length=5, max_length=500
+    )
+
+    @field_validator("driver_full_name", "driver_document_number")
+    @classmethod
+    def _trim_driver_field(cls, value: str) -> str:
+        trimmed = value.strip()
+        if len(trimmed) < 3:
+            raise ValueError("El dato del conductor está incompleto.")
+        return trimmed
+
+    @field_validator("tractor_plate", "trailer_plate")
+    @classmethod
+    def _plate(cls, value: str) -> str:
+        return _normalize_plate(value)
 
 
 class HumanitarianTransportReceipt(ApiModel):
@@ -2001,6 +2059,76 @@ class HumanitarianTransportReceipt(ApiModel):
     origin_location_id: UUID
     destination_location_id: UUID
     created_at: datetime
+
+
+# CHG-171 §50: catálogo de ciudades (sembrado + municipios reales de
+# acopios publicados).
+class TransportCity(ApiModel):
+    name: str
+    department: str
+
+
+class TransportCitiesResponse(ApiModel):
+    items: list[TransportCity]
+    total: int = Field(ge=0)
+
+
+# CHG-171 (GPS) — Hitos y posiciones del viaje del conductor.
+class TransportPositionInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+
+
+class TransportJourneyReceipt(ApiModel):
+    id: UUID
+    status: TransportStatus
+    departed_at: datetime | None = None
+    arrived_at: datetime | None = None
+    last_position_at: datetime | None = None
+
+
+class TransportTrailPoint(ApiModel):
+    latitude: float
+    longitude: float
+    recorded_at: datetime
+
+
+# Ficha pública del viaje para el mapa: SIN datos del conductor (§30).
+class ActiveTransport(ApiModel):
+    id: UUID
+    kind: TransportKind
+    status: TransportStatus
+    origin_name: str
+    origin_municipality: str
+    origin_latitude: float | None = None
+    origin_longitude: float | None = None
+    destination_name: str
+    destination_municipality: str
+    destination_latitude: float | None = None
+    destination_longitude: float | None = None
+    supplies_summary: str | None = None
+    tractor_plate: str | None = None
+    trailer_plate: str | None = None
+    vehicle_visible_characteristics: str | None = None
+    departed_at: datetime | None = None
+    arrived_at: datetime | None = None
+    last_latitude: float | None = None
+    last_longitude: float | None = None
+    last_position_at: datetime | None = None
+    created_at: datetime
+    trail: list[TransportTrailPoint] = Field(default_factory=list)
+
+
+class ActiveTransportsResponse(ApiModel):
+    items: list[ActiveTransport]
+    total: int = Field(ge=0)
 
 
 # CHG-162 — «Mi casita partida»: informe de hogar en malas condiciones.
