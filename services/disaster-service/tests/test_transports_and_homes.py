@@ -266,8 +266,13 @@ async def test_transport_rejects_invalid_kind_and_missing_key():
     assert missing_key.status_code == 422
 
 
+# CHG-182 — «Mi casita destruida»: publicar exige cuenta, se cuenta
+# cuánta gente vive en la casa y puede dejarse un medio para recibir
+# ayuda directa.
+
+
 @pytest.mark.anyio
-async def test_damaged_home_accepts_anonymous_report():
+async def test_damaged_home_refuses_an_anonymous_publication():
     repository = FakeTransportsRepository()
     app = transports_app(repository)
 
@@ -276,21 +281,56 @@ async def test_damaged_home_accepts_anonymous_report():
         "POST",
         "/internal/v1/damaged-home-reports",
         headers=ANON_HEADERS,
+        json=DAMAGED_HOME_PAYLOAD,
+    )
+
+    assert response.status_code == 401
+    # La regla corta antes de escribir nada.
+    assert repository.calls == []
+
+
+@pytest.mark.anyio
+async def test_damaged_home_publishes_with_account_and_aid_channel():
+    repository = FakeTransportsRepository()
+    app = transports_app(repository)
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/damaged-home-reports",
+        headers={**AUTH_HEADERS, "Idempotency-Key": "clave-casita-0182"},
         json={
-            "description": "La casa perdió el techo y un muro lateral.",
-            "department": "Santander",
-            "municipality": "Bucaramanga",
-            "address": "Calle 10 # 4-20, barrio La Feria",
-            "latitude": 7.11935,
-            "longitude": -73.12274,
+            **DAMAGED_HOME_PAYLOAD,
+            "householdSize": 5,
+            "donationChannel": "Nequi",
+            "donationReference": "3001234567",
         },
     )
 
     assert response.status_code == 201
-    assert "id" in response.json()
     call = repository.calls[0]
-    assert call["account_id"] is None
-    assert call["latitude"] == 7.11935
+    assert call["account_id"] == ACCOUNT_ID
+    assert call["household_size"] == 5
+    assert call["donation_channel"] == "Nequi"
+    assert call["donation_reference"] == "3001234567"
+    # El código público se genera en servidor, nunca lo manda el cliente.
+    assert call["public_code"].startswith("CASA-")
+
+
+@pytest.mark.anyio
+async def test_damaged_home_rejects_a_lonely_donation_channel():
+    """Canal sin referencia (o al revés) no sirve para transferir."""
+    app = transports_app()
+
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/damaged-home-reports",
+        headers=AUTH_HEADERS,
+        json={**DAMAGED_HOME_PAYLOAD, "donationChannel": "Nequi"},
+    )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.anyio
@@ -301,24 +341,26 @@ async def test_damaged_home_rejects_short_description_and_odd_coords():
         app,
         "POST",
         "/internal/v1/damaged-home-reports",
-        headers=ANON_HEADERS,
+        headers=AUTH_HEADERS,
         json={
             "description": "corta",
             "department": "Santander",
             "municipality": "Bucaramanga",
             "address": "Calle 10 # 4-20",
+            "householdSize": 3,
         },
     )
     unpaired = await request_app(
         app,
         "POST",
         "/internal/v1/damaged-home-reports",
-        headers=ANON_HEADERS,
+        headers=AUTH_HEADERS,
         json={
             "description": "La casa perdió el techo y un muro.",
             "department": "Santander",
             "municipality": "Bucaramanga",
             "address": "Calle 10 # 4-20",
+            "householdSize": 3,
             "latitude": 7.1,
         },
     )
@@ -645,6 +687,8 @@ DAMAGED_HOME_PAYLOAD = {
     "address": "Calle 10 # 4-20, barrio La Feria",
     "latitude": 7.11935,
     "longitude": -73.12274,
+    # CHG-182: cuántas personas viven en la casa.
+    "householdSize": 4,
 }
 
 
@@ -666,7 +710,7 @@ async def test_damaged_home_stores_photos_with_opaque_keys():
         app,
         "POST",
         "/internal/v1/damaged-home-reports",
-        headers=ANON_HEADERS,
+        headers=AUTH_HEADERS,
         data=form["data"],
         files=form["files"],
     )
@@ -700,14 +744,14 @@ async def test_damaged_home_without_photos_still_publishes():
         app,
         "POST",
         "/internal/v1/damaged-home-reports",
-        headers=ANON_HEADERS,
+        headers=AUTH_HEADERS,
         files={"payload": (None, json.dumps(DAMAGED_HOME_PAYLOAD))},
     )
     legacy_json = await request_app(
         app,
         "POST",
         "/internal/v1/damaged-home-reports",
-        headers={**ANON_HEADERS, "Idempotency-Key": "clave-idempotente-json-0162"},
+        headers={**AUTH_HEADERS, "Idempotency-Key": "clave-idempotente-json-0162"},
         json=DAMAGED_HOME_PAYLOAD,
     )
 
@@ -728,7 +772,7 @@ async def test_damaged_home_rejects_more_photos_than_allowed():
         app,
         "POST",
         "/internal/v1/damaged-home-reports",
-        headers=ANON_HEADERS,
+        headers=AUTH_HEADERS,
         data=form["data"],
         files=form["files"],
     )
@@ -750,7 +794,7 @@ async def test_damaged_home_idempotent_retry_drops_new_binaries():
             app,
             "POST",
             "/internal/v1/damaged-home-reports",
-            headers=ANON_HEADERS,
+            headers=AUTH_HEADERS,
             data=form["data"],
             files=form["files"],
         )

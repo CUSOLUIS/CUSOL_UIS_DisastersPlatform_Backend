@@ -2446,6 +2446,14 @@ class RouteAcceptanceReceipt(ApiModel):
 
 
 # CHG-162 — «Mi casita partida»: informe de hogar en malas condiciones.
+# CHG-182 — Medios para recibir ayuda directa. Catálogo cerrado: la
+# plataforma no verifica el dato ni intermedia la transferencia, así que
+# al menos acota qué se puede escribir.
+DamagedHomeDonationChannel = Literal[
+    "Nequi", "Daviplata", "Bancolombia", "Movii", "Otro"
+]
+
+
 class DamagedHomeReportInput(ApiModel):
     model_config = ConfigDict(
         alias_generator=to_camel,
@@ -2460,6 +2468,15 @@ class DamagedHomeReportInput(ApiModel):
     address: str = Field(min_length=3, max_length=300)
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
+    # CHG-182: cuántas personas viven en la casa. Obligatorio en las
+    # publicaciones nuevas: es lo que dimensiona la ayuda.
+    household_size: int = Field(ge=1, le=60)
+    # CHG-182: medio para recibir ayuda directa. Opcional, pero si se
+    # declara el canal hay que decir a dónde se transfiere (y al revés).
+    donation_channel: DamagedHomeDonationChannel | None = None
+    donation_reference: str | None = Field(
+        default=None, min_length=4, max_length=60
+    )
 
     @model_validator(mode="after")
     def _coordinates_pair(self):
@@ -2470,7 +2487,76 @@ class DamagedHomeReportInput(ApiModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _donation_pair(self):
+        canal = self.donation_channel
+        referencia = (
+            self.donation_reference.strip()
+            if self.donation_reference
+            else None
+        )
+        if (canal is None) != (referencia is None):
+            raise ValueError(
+                "donationChannel y donationReference deben enviarse "
+                "juntos o ambos ausentes"
+            )
+        return self
+
 
 class DamagedHomeReportReceipt(ApiModel):
     id: UUID
+    # CHG-182: código público para citar la casita en avisos y correos.
+    public_code: str | None = Field(default=None, max_length=40)
     created_at: datetime
+
+
+# CHG-182 — Casita publicada, tal como la ve el mapa y su ficha.
+class ActiveDamagedHome(ApiModel):
+    id: UUID
+    public_code: str | None = None
+    description: str
+    department: str
+    municipality: str
+    address: str
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    household_size: int | None = Field(default=None, ge=1, le=60)
+    donation_channel: DamagedHomeDonationChannel | None = None
+    donation_reference: str | None = Field(default=None, max_length=60)
+    created_at: datetime
+    updated_at: datetime
+    # Rutas relativas de las fotografías públicas (derivadas, sin EXIF).
+    photo_urls: list[str] = Field(default_factory=list, max_length=5)
+    comment_rating_average: float | None = Field(default=None, ge=1, le=5)
+    comment_rating_count: int = Field(default=0, ge=0)
+
+
+class DamagedHomePage(ApiModel):
+    items: list[ActiveDamagedHome] = Field(max_length=50)
+    total: int = Field(ge=0)
+    generated_at: datetime
+
+
+# CHG-182 — Casita propia en «Mi espacio», con los comentarios que su
+# dueña todavía no ha leído.
+class MyDamagedHome(ActiveDamagedHome):
+    published: bool
+    unread_comments: int = Field(default=0, ge=0)
+    comments_count: int = Field(default=0, ge=0)
+
+
+class MyDamagedHomesResponse(ApiModel):
+    items: list[MyDamagedHome] = Field(max_length=100)
+    total: int = Field(ge=0)
+    unread_total: int = Field(default=0, ge=0)
+
+
+class DamagedHomeComplaintReceipt(ApiModel):
+    damaged_home_id: UUID
+    reports_count: int = Field(ge=1)
+    under_observation: bool
+    disabled: bool = False
+
+
+class DamagedHomeDeleteReceipt(ApiModel):
+    deleted: int = Field(ge=0)

@@ -49,6 +49,12 @@ from .models import (
     AidLocationInput,
     AID_LOCATION_KINDS_REQUIRING_ACCOUNT,
     DamagedHomeReportInput,
+    ActiveDamagedHome,
+    DamagedHomePage,
+    DamagedHomeComplaintReceipt,
+    DamagedHomeDeleteReceipt,
+    MyDamagedHome,
+    MyDamagedHomesResponse,
     HelpRequestReportReceipt,
     DamagedHomeReportReceipt,
     ActiveTransport,
@@ -256,6 +262,11 @@ def generate_help_request_code(now: datetime) -> str:
 def generate_food_offer_code(now: datetime) -> str:
     """Código público de oferta de comida (CHG-163)."""
     return f"FO-{now.year}-{secrets.token_hex(4).upper()}"
+
+
+def generate_damaged_home_code(now: datetime) -> str:
+    """Código público de «Mi casita destruida» (CHG-182)."""
+    return f"CASA-{now.year}-{secrets.token_hex(4).upper()}"
 
 
 def generate_reception_route_code(now: datetime) -> str:
@@ -2818,7 +2829,16 @@ def create_app(
         actor = resolve_actor(request)
         if isinstance(actor, JSONResponse):
             return actor
-        _actor_kind, account_id = actor
+        actor_kind, account_id = actor
+        # CHG-182 — «Mi casita destruida» solo la publica quien tiene
+        # cuenta: aquí se declara un medio para recibir dinero y hay que
+        # poder responder por él y avisarle de los comentarios.
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401,
+                "Sesión requerida",
+                "Publicar tu casita exige una cuenta.",
+            )
         oversize = check_declared_length(request)
         if oversize is not None:
             return oversize
@@ -2901,6 +2921,15 @@ def create_app(
                 longitude=payload.longitude,
                 account_id=account_id,
                 photos=stored_photos,
+                # CHG-182
+                public_code=generate_damaged_home_code(datetime.now(UTC)),
+                household_size=payload.household_size,
+                donation_channel=payload.donation_channel,
+                donation_reference=(
+                    payload.donation_reference.strip()
+                    if payload.donation_reference
+                    else None
+                ),
             )
         except asyncpg.PostgresError:
             cleanup()
@@ -3307,6 +3336,405 @@ def create_app(
                 404, "Oferta no encontrada", "La oferta no existe."
             )
         return FoodOfferDeleteReceipt(deleted=deleted)
+
+    # CHG-182 — «Mi casita destruida»: feed público, fotos públicas,
+    # comunidad completa, bandeja de «Mi espacio» y borrado admin.
+
+    def active_damaged_home_model(row: dict) -> ActiveDamagedHome:
+        return ActiveDamagedHome(
+            id=row["id"],
+            public_code=row.get("public_code"),
+            description=row["description"],
+            department=row["department"],
+            municipality=row["municipality"],
+            address=row["address"],
+            latitude=row["latitude"],
+            longitude=row["longitude"],
+            household_size=row.get("household_size"),
+            donation_channel=row.get("donation_channel"),
+            donation_reference=row.get("donation_reference"),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            photo_urls=[
+                f"/api/v1/public/damaged-homes/{row['id']}/photos/{photo_id}"
+                for photo_id in (row.get("photo_ids") or [])
+            ],
+            comment_rating_average=row.get("comment_rating_average"),
+            comment_rating_count=row.get("comment_rating_count") or 0,
+        )
+
+    @application.get(
+        "/internal/v1/damaged-homes",
+        response_model=DamagedHomePage,
+        response_model_by_alias=True,
+        tags=["BuildingReports"],
+    )
+    async def list_active_damaged_homes(
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        if limit not in (10, 25, 50):
+            return problem(
+                422,
+                "Tamaño de página inválido",
+                "El tamaño de página debe ser 10, 25 o 50.",
+            )
+        rows, total = await data.list_active_damaged_homes(limit, offset)
+        return DamagedHomePage(
+            items=[active_damaged_home_model(row) for row in rows],
+            total=total,
+            generated_at=datetime.now(UTC),
+        )
+
+    @application.get(
+        "/internal/v1/public/damaged-homes/{damaged_home_id}"
+        "/photos/{photo_id}",
+        tags=["BuildingReports"],
+    )
+    async def serve_damaged_home_photo(
+        damaged_home_id: UUID,
+        photo_id: UUID,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        photo = await data.get_damaged_home_photo(
+            damaged_home_id=damaged_home_id, photo_id=photo_id
+        )
+        if photo is None:
+            return problem(
+                404,
+                "Fotografía no disponible",
+                "La casita no tiene esa fotografía o ya no se publica.",
+            )
+        try:
+            content = object_storage.load(photo["object_key"])
+        except StorageUnavailableError:
+            content = None
+        if content is None:
+            return problem(
+                503,
+                "Fotografía no disponible",
+                "No fue posible leer la fotografía en este momento.",
+            )
+        from fastapi.responses import Response as RawResponse
+
+        return RawResponse(
+            content=content,
+            media_type=photo["content_type"],
+            headers={"Cache-Control": "private, max-age=300"},
+        )
+
+    @application.get(
+        "/internal/v1/damaged-homes/{damaged_home_id}/comments",
+        response_model=AidLocationCommentsResponse,
+        response_model_by_alias=True,
+        tags=["BuildingReports"],
+    )
+    async def list_damaged_home_comments(
+        damaged_home_id: UUID,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        limit: int = 50,
+    ):
+        page = await data.list_damaged_home_comments(
+            damaged_home_id=damaged_home_id, limit=max(1, min(limit, 100))
+        )
+        if page is None:
+            return problem(
+                404, "Casita no disponible", "La publicación no existe."
+            )
+        return AidLocationCommentsResponse(
+            items=[
+                AidLocationComment(
+                    id=row["id"],
+                    author_display_name=row["author_display_name"],
+                    actor_kind=row["actor_kind"],
+                    content=row["content"],
+                    rating=row.get("rating"),
+                    created_at=row["created_at"],
+                )
+                for row in page["items"]
+            ],
+            total=page["total"],
+            rating_average=page["rating_average"],
+            rating_count=page["rating_count"],
+        )
+
+    @application.post(
+        "/internal/v1/damaged-homes/{damaged_home_id}/comments",
+        status_code=201,
+        response_model=AidLocationComment,
+        response_model_by_alias=True,
+        tags=["BuildingReports"],
+    )
+    async def create_damaged_home_comment(
+        damaged_home_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        author_display_name: str | None = None
+        if actor_kind == "authenticated":
+            display_raw = request.headers.get("x-actor-display", "").strip()
+            if display_raw:
+                try:
+                    author_display_name = (
+                        base64.b64decode(display_raw.encode()).decode()[:161]
+                        or None
+                    )
+                except Exception:
+                    author_display_name = None
+        try:
+            payload = AidLocationCommentInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        try:
+            row = await data.create_damaged_home_comment(
+                idempotency_key=idempotency_key,
+                damaged_home_id=damaged_home_id,
+                actor_kind=actor_kind,
+                account_id=account_id,
+                author_display_name=author_display_name,
+                content=payload.content.strip(),
+                rating=payload.rating,
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible publicar el comentario.",
+            )
+        if row is None:
+            return problem(
+                404, "Casita no disponible", "La publicación no existe."
+            )
+
+        # CHG-182 — Aviso a la dueña por el camino de CHG-054. Mejor
+        # esfuerzo y fuera de la transacción: si el correo falla, el
+        # comentario sigue publicado. Nunca se avisa de los comentarios
+        # que ella misma escribe.
+        owner_account_id = row.get("owner_account_id")
+        if (
+            row.get("created")
+            and owner_account_id is not None
+            and owner_account_id != account_id
+        ):
+            try:
+                await report_notifier.notify_report_status(
+                    owner_account_id,
+                    "publicación de Mi casita destruida",
+                    row.get("public_code") or "sin código",
+                    "Alguien comentó tu publicación. Entra a «Mi "
+                    "espacio» para leerlo.",
+                )
+            except Exception:
+                pass
+
+        return AidLocationComment(
+            id=row["id"],
+            author_display_name=row["author_display_name"],
+            actor_kind=row["actor_kind"],
+            content=row["content"],
+            rating=row.get("rating"),
+            created_at=row["created_at"],
+        )
+
+    @application.post(
+        "/internal/v1/damaged-homes/{damaged_home_id}/reports",
+        status_code=202,
+        response_model=DamagedHomeComplaintReceipt,
+        response_model_by_alias=True,
+        tags=["BuildingReports"],
+    )
+    async def create_damaged_home_complaint(
+        damaged_home_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        denouncer_key = request.headers.get("x-denouncer-key", "").strip()
+        if not denouncer_key:
+            return problem(
+                422,
+                "Denunciante no resuelto",
+                "Falta la clave de denunciante resuelta por el gateway.",
+            )
+        try:
+            payload = AidLocationReportInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        try:
+            result = await data.create_damaged_home_complaint(
+                idempotency_key=idempotency_key,
+                damaged_home_id=damaged_home_id,
+                actor_kind=actor_kind,
+                account_id=account_id,
+                denouncer_key=denouncer_key,
+                reason_category=payload.category,
+                reason_encrypted=encrypt(payload.reason.strip()),
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible registrar la denuncia.",
+            )
+        if result is None:
+            return problem(
+                404, "Casita no disponible", "La publicación no existe."
+            )
+        return DamagedHomeComplaintReceipt(
+            damaged_home_id=damaged_home_id,
+            reports_count=result["reports_count"],
+            under_observation=result["under_observation"],
+            disabled=result["disabled"],
+        )
+
+    @application.get(
+        "/internal/v1/me/damaged-homes",
+        response_model=MyDamagedHomesResponse,
+        response_model_by_alias=True,
+        tags=["BuildingReports"],
+    )
+    async def list_my_damaged_homes(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401,
+                "Sesión requerida",
+                "Esta bandeja exige una cuenta.",
+            )
+        rows = await data.list_my_damaged_homes(account_id)
+        items = [
+            MyDamagedHome(
+                **active_damaged_home_model(row).model_dump(by_alias=False),
+                published=bool(row["visible"]) and row["disabled_at"] is None,
+                unread_comments=int(row.get("unread_comments") or 0),
+                comments_count=int(row.get("comments_count") or 0),
+            )
+            for row in rows
+        ]
+        return MyDamagedHomesResponse(
+            items=items,
+            total=len(items),
+            unread_total=sum(item.unread_comments for item in items),
+        )
+
+    @application.post(
+        "/internal/v1/me/damaged-homes/{damaged_home_id}/comments-seen",
+        status_code=204,
+        tags=["BuildingReports"],
+    )
+    async def mark_damaged_home_comments_seen(
+        damaged_home_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401, "Sesión requerida", "Esta acción exige una cuenta."
+            )
+        marked = await data.mark_damaged_home_comments_seen(
+            damaged_home_id=damaged_home_id, account_id=account_id
+        )
+        if not marked:
+            return problem(
+                404,
+                "Casita no disponible",
+                "La publicación no existe o no es tuya.",
+            )
+        from fastapi.responses import Response as RawResponse
+
+        return RawResponse(status_code=204)
+
+    @application.delete(
+        "/internal/v1/admin/damaged-homes/{damaged_home_id}/comments"
+        "/{comment_id}",
+        response_model=AidLocationCommentDeleteReceipt,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_delete_damaged_home_comment(
+        damaged_home_id: UUID,
+        comment_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display_name = actor
+        deleted = await data.admin_delete_damaged_home_comment(
+            damaged_home_id=damaged_home_id,
+            comment_id=comment_id,
+            actor_account_id=actor_account_id,
+            actor_display_name=actor_display_name,
+        )
+        if deleted == 0:
+            return problem(
+                404,
+                "Comentario no encontrado",
+                "El comentario no existe en esa publicación.",
+            )
+        return AidLocationCommentDeleteReceipt(deleted=deleted)
+
+    @application.delete(
+        "/internal/v1/admin/damaged-homes/{damaged_home_id}",
+        response_model=DamagedHomeDeleteReceipt,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_delete_damaged_home(
+        damaged_home_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display_name = actor
+        deleted, storage_keys = await data.admin_delete_damaged_home(
+            damaged_home_id=damaged_home_id,
+            actor_account_id=actor_account_id,
+            actor_display_name=actor_display_name,
+        )
+        if deleted == 0:
+            return problem(
+                404, "Casita no encontrada", "La publicación no existe."
+            )
+        # Los binarios se limpian fuera de la transacción: si el
+        # almacenamiento falla, la fila ya no existe igual.
+        for key in storage_keys:
+            try:
+                object_storage.delete(key)
+            except Exception:
+                pass
+        return DamagedHomeDeleteReceipt(deleted=deleted)
 
     # CHG-180 — Comunidad de «Necesitamos ayuda»: comentarios con
     # estrellas, denuncia y borrado administrativo, con las mismas

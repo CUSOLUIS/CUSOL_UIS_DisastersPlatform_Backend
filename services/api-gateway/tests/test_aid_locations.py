@@ -769,7 +769,33 @@ async def test_transport_forwards_authenticated_account():
 
 
 @pytest.mark.anyio
-async def test_damaged_home_allows_anonymous_and_forwards():
+async def test_damaged_home_requires_an_account():
+    """CHG-182: publicar la casita exige cuenta; sin ella, 401."""
+    calls = []
+
+    def disaster_handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(201, json={})
+
+    upstream, identity = make_clients(disaster_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/damaged-homes",
+        headers=IDEMPOTENCY,
+        json={"description": "La casa perdió el techo."},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 401
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_damaged_home_publishes_with_a_session():
     seen = {}
 
     def disaster_handler(request: httpx.Request):
@@ -791,11 +817,13 @@ async def test_damaged_home_allows_anonymous_and_forwards():
         "POST",
         "/api/v1/damaged-homes",
         headers=IDEMPOTENCY,
+        cookies={"cusol_session": "token-user"},
         json={
             "description": "La casa perdió el techo y un muro.",
             "department": "Santander",
             "municipality": "Bucaramanga",
             "address": "Calle 10 # 4-20",
+            "householdSize": 4,
         },
     )
     await upstream.aclose()
@@ -803,7 +831,8 @@ async def test_damaged_home_allows_anonymous_and_forwards():
 
     assert response.status_code == 201
     assert seen["path"] == "/internal/v1/damaged-home-reports"
-    assert seen["actor"] == "anonymous"
+    # CHG-182: el actor viaja siempre autenticado y con su cuenta.
+    assert seen["actor"] == "authenticated"
 
 
 # CHG-162 (F2) — El informe admite fotos del daño: multipart en
@@ -834,7 +863,8 @@ async def test_damaged_home_forwards_multipart_photos_untouched():
         app,
         "POST",
         "/api/v1/damaged-homes",
-        headers={**IDEMPOTENCY, "Cookie": "otra_cookie=privada"},
+        headers=IDEMPOTENCY,
+        cookies={"cusol_session": "token-user"},
         data={"payload": '{"description":"La casa perdió el techo."}'},
         files=[("photos", ("daño.jpg", b"binario-de-foto", "image/jpeg"))],
     )
@@ -844,7 +874,8 @@ async def test_damaged_home_forwards_multipart_photos_untouched():
     assert response.status_code == 201
     assert seen["content_type"].startswith("multipart/form-data")
     assert b"binario-de-foto" in seen["body"]
-    # Las cookies del visitante nunca viajan al servicio.
+    # La cookie de sesión se queda en el gateway: al servicio solo van
+    # los encabezados de actor.
     assert seen["cookie"] is None
 
 
@@ -1014,3 +1045,221 @@ async def test_journey_conflict_passes_through():
 
     assert response.status_code == 409
     assert response.json()["title"] == "Estado del viaje no compatible"
+
+
+# CHG-182 — «Mi casita destruida» en la puerta pública: feed del mapa,
+# fotos públicas, comunidad y bandeja propia. Publicar exige cuenta;
+# mirar, comentar y denunciar no.
+
+HOME_ID = "cccccccc-cccc-4ccc-8ccc-ccccccccc182"
+HOME_COMMENT_ID = "cccccccc-cccc-4ccc-8ccc-ccccccccc183"
+
+HOME_PAGE = {
+    "items": [
+        {
+            "id": HOME_ID,
+            "publicCode": "CASA-2026-ABCD1234",
+            "description": "El río se llevó la mitad de la casa.",
+            "department": "Chocó",
+            "municipality": "Quibdó",
+            "address": "Barrio Niño Jesús, calle 3",
+            "latitude": 5.69,
+            "longitude": -76.66,
+            "householdSize": 5,
+            "donationChannel": "Nequi",
+            "donationReference": "3001234567",
+            "createdAt": "2026-08-20T10:00:00Z",
+            "updatedAt": "2026-08-20T10:00:00Z",
+            "photoUrls": [f"/api/v1/public/damaged-homes/{HOME_ID}/photos/1"],
+            "commentRatingAverage": 4.5,
+            "commentRatingCount": 2,
+        }
+    ],
+    "total": 1,
+    "generatedAt": "2026-08-20T10:05:00Z",
+}
+
+
+@pytest.mark.anyio
+async def test_damaged_homes_feed_is_public():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["cookie"] = request.headers.get("cookie")
+        return httpx.Response(200, json=HOME_PAGE)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "GET",
+        "/api/v1/damaged-homes?limit=25&offset=0",
+        headers={"Cookie": "otra=privada"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["householdSize"] == 5
+    assert item["donationChannel"] == "Nequi"
+    assert seen["path"] == "/internal/v1/damaged-homes"
+    assert seen["cookie"] is None
+
+
+@pytest.mark.anyio
+async def test_damaged_home_photo_is_streamed_with_its_media_type():
+    def handler(request: httpx.Request):
+        return httpx.Response(
+            200,
+            content=b"imagen",
+            headers={"content-type": "image/jpeg"},
+        )
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app, "GET", f"/api/v1/public/damaged-homes/{HOME_ID}/photos/1"
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/jpeg")
+    assert response.content == b"imagen"
+
+
+@pytest.mark.anyio
+async def test_damaged_home_comment_forwards_the_actor():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["actor"] = request.headers.get("x-actor-kind")
+        await request.aread()
+        return httpx.Response(
+            201,
+            json={
+                "id": HOME_COMMENT_ID,
+                "authorDisplayName": None,
+                "actorKind": "anonymous",
+                "content": "Vamos mañana con colchones.",
+                "rating": 5,
+                "createdAt": "2026-08-20T11:00:00Z",
+            },
+        )
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        f"/api/v1/damaged-homes/{HOME_ID}/comments",
+        headers={"Idempotency-Key": "clave-comentario-casita-0182"},
+        json={"content": "Vamos mañana con colchones.", "rating": 5},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 201
+    assert seen["actor"] == "anonymous"
+    assert seen["path"] == f"/internal/v1/damaged-homes/{HOME_ID}/comments"
+
+
+@pytest.mark.anyio
+async def test_damaged_home_anonymous_complaint_hashes_the_fingerprint():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["denouncer"] = request.headers.get("x-denouncer-key")
+        await request.aread()
+        return httpx.Response(
+            202,
+            json={
+                "damagedHomeId": HOME_ID,
+                "reportsCount": 1,
+                "underObservation": False,
+                "disabled": False,
+            },
+        )
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        f"/api/v1/public/damaged-homes/{HOME_ID}/reports",
+        headers={
+            "Idempotency-Key": "clave-denuncia-casita-0182",
+            "X-Visitor-Fingerprint": "huella-del-visitante",
+        },
+        json={"category": "informacion_falsa", "reason": "No es esa casa."},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 202
+    assert seen["denouncer"].startswith("fp:")
+    assert "huella-del-visitante" not in seen["denouncer"]
+
+
+@pytest.mark.anyio
+async def test_my_damaged_homes_requires_a_session():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(
+            200, json={"items": [], "total": 0, "unreadTotal": 0}
+        )
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    sin_sesion = await request_gateway(app, "GET", "/api/v1/me/damaged-homes")
+    con_sesion = await request_gateway(
+        app,
+        "GET",
+        "/api/v1/me/damaged-homes",
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert sin_sesion.status_code == 401
+    assert con_sesion.status_code == 200
+    assert calls == ["/internal/v1/me/damaged-homes"]
+
+
+@pytest.mark.anyio
+async def test_marking_comments_seen_travels_with_the_account():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["account"] = request.headers.get("x-account-id")
+        return httpx.Response(204)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        f"/api/v1/me/damaged-homes/{HOME_ID}/comments-seen",
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 204
+    assert seen["account"] == USER_ACCOUNT["id"]
+    assert seen["path"] == (
+        f"/internal/v1/me/damaged-homes/{HOME_ID}/comments-seen"
+    )
+

@@ -1383,6 +1383,65 @@ class RouteAcceptanceReceipt(ApiModel):
 
 
 # CHG-162 — «Mi casita partida».
+# CHG-182 — Medios para recibir ayuda directa. Catálogo cerrado: la
+# plataforma no verifica el dato ni intermedia la transferencia, así que
+# al menos acota qué se puede escribir.
+DamagedHomeDonationChannel = Literal[
+    "Nequi", "Daviplata", "Bancolombia", "Movii", "Otro"
+]
+
+
+# CHG-182 — Casita publicada, tal como la ve el mapa y su ficha.
+class ActiveDamagedHome(ApiModel):
+    id: UUID
+    public_code: str | None = None
+    description: str
+    department: str
+    municipality: str
+    address: str
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    household_size: int | None = Field(default=None, ge=1, le=60)
+    donation_channel: DamagedHomeDonationChannel | None = None
+    donation_reference: str | None = Field(default=None, max_length=60)
+    created_at: datetime
+    updated_at: datetime
+    photo_urls: list[str] = Field(default_factory=list, max_length=5)
+    comment_rating_average: float | None = Field(default=None, ge=1, le=5)
+    comment_rating_count: int = Field(default=0, ge=0)
+
+
+class DamagedHomePage(ApiModel):
+    items: list[ActiveDamagedHome] = Field(max_length=50)
+    total: int = Field(ge=0)
+    generated_at: datetime
+
+
+class MyDamagedHome(ActiveDamagedHome):
+    published: bool
+    unread_comments: int = Field(default=0, ge=0)
+    comments_count: int = Field(default=0, ge=0)
+
+
+class MyDamagedHomesResponse(ApiModel):
+    items: list[MyDamagedHome] = Field(max_length=100)
+    total: int = Field(ge=0)
+    unread_total: int = Field(default=0, ge=0)
+
+
+class DamagedHomeComplaintReceipt(ApiModel):
+    damaged_home_id: UUID
+    reports_count: int = Field(ge=1)
+    under_observation: bool
+    disabled: bool = False
+
+
+class DamagedHomeDeleteReceipt(ApiModel):
+    deleted: int = Field(ge=0)
+
+
 class DamagedHomeReportReceipt(ApiModel):
     id: UUID
+    # CHG-182: código público para citar la casita en avisos y correos.
+    public_code: str | None = Field(default=None, max_length=40)
     created_at: datetime

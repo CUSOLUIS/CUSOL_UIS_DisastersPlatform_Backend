@@ -104,32 +104,9 @@ _LOGISTICS_MAP_PROJECTION_SQL = """
     LIMIT $1
 """
 
-# CHG-162 — «Mi casita partida»: hogares en malas condiciones visibles
-# y con coordenadas, proyectados al mapa con categoría propia. La
-# fuente es sintética (reporte ciudadano) porque la tabla no guarda
-# fuente institucional.
-_DAMAGED_HOMES_MAP_SQL = """
-    SELECT
-        r.id,
-        'damaged_home' AS category,
-        'Hogar en malas condiciones' AS title,
-        r.municipality || ', ' || r.department AS location_label,
-        r.latitude,
-        r.longitude,
-        'unverified' AS verification_status,
-        NULL::uuid AS related_disaster_id,
-        r.description,
-        'operational' AS data_classification,
-        r.updated_at,
-        'Reporte ciudadano' AS source_name,
-        'citizen' AS source_type,
-        NULL::text AS source_url
-    FROM disaster_service.damaged_home_reports r
-    WHERE r.visible
-      AND r.latitude IS NOT NULL
-    ORDER BY r.updated_at DESC
-    LIMIT $1
-"""
+# CHG-182: la proyección de «Mi casita destruida» al mapa compartido
+# se retiró junto con su SQL: la casita viaja por su propio feed
+# público, que lleva fotos, personas, medio de ayuda y puntuación.
 
 # CHG-153 — Denunciantes DISTINTOS de un lugar (antiabuso del umbral):
 # denuncias vivas (no rechazadas ni archivadas), cada denunciante una
@@ -2396,6 +2373,13 @@ class PostgresDisasterRepository:
         longitude: float | None,
         account_id: UUID | None,
         photos: list[StoredPhoto] | None = None,
+        # CHG-182: código público para citarla en avisos y correos,
+        # cuántas personas viven en la casa y el medio para recibir
+        # ayuda directa (canal de catálogo + referencia corta).
+        public_code: str | None = None,
+        household_size: int | None = None,
+        donation_channel: str | None = None,
+        donation_reference: str | None = None,
     ) -> tuple[dict, bool]:
         async with self._pool.acquire() as connection:
             async with connection.transaction():
@@ -2404,10 +2388,14 @@ class PostgresDisasterRepository:
                     INSERT INTO disaster_service.damaged_home_reports (
                         id, idempotency_key, account_id, description,
                         department, municipality, address, latitude,
-                        longitude
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        longitude, public_code, household_size,
+                        donation_channel, donation_reference
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                        $12, $13
+                    )
                     ON CONFLICT (idempotency_key) DO NOTHING
-                    RETURNING id, created_at
+                    RETURNING id, public_code, created_at
                     """,
                     report_id,
                     idempotency_key,
@@ -2418,11 +2406,15 @@ class PostgresDisasterRepository:
                     address,
                     latitude,
                     longitude,
+                    public_code,
+                    household_size,
+                    donation_channel,
+                    donation_reference,
                 )
                 if row is None:
                     existing = await connection.fetchrow(
                         """
-                        SELECT id, created_at
+                        SELECT id, public_code, created_at
                         FROM disaster_service.damaged_home_reports
                         WHERE idempotency_key = $1
                         """,
@@ -2501,11 +2493,13 @@ class PostgresDisasterRepository:
             _LOGISTICS_MAP_PROJECTION_SQL,
             limit,
         )
-        # CHG-162: hogares en malas condiciones visibles y ubicables.
-        damaged_homes = await self._pool.fetch(
-            _DAMAGED_HOMES_MAP_SQL,
-            limit,
-        )
+        # CHG-182: la casita dejó de proyectarse aquí. Ahora tiene su
+        # propio feed público (`/damaged-homes`), como las solicitudes
+        # de ayuda y las ofertas de comida, porque necesita llevar
+        # fotos, personas, medio de ayuda y puntuación —datos que no
+        # caben en un punto operativo común— y el mapa la fusiona en
+        # cliente. Proyectarla dos veces la duplicaría en el mapa.
+        damaged_homes: list = []
 
         def _row_point(row: dict, precision: str) -> OperationalMapPoint:
             return OperationalMapPoint(
@@ -4364,6 +4358,439 @@ class PostgresDisasterRepository:
     # el acopio local (CHG-165/166/167) y que la oferta de comida
     # (CHG-176), con la solicitud como tercer objetivo de las mismas
     # tablas.
+
+    # CHG-182 — «Mi casita destruida»: feed público, comunidad, avisos
+    # al dueño y borrado administrativo. La casita es el CUARTO
+    # objetivo de las tablas comunitarias; aquí «denuncia» se llama
+    # complaint porque «report» ya nombra al informe mismo.
+
+    _DAMAGED_HOME_PUBLIC_COLUMNS = """
+        h.id, h.public_code, h.description, h.department,
+        h.municipality, h.address, h.latitude, h.longitude,
+        h.household_size, h.donation_channel, h.donation_reference,
+        h.created_at, h.updated_at,
+        ( SELECT ROUND(AVG(c.rating)::numeric, 1)::float8
+          FROM disaster_service.aid_location_comments c
+          WHERE c.damaged_home_id = h.id AND c.rating IS NOT NULL
+        ) AS comment_rating_average,
+        ( SELECT COUNT(*)
+          FROM disaster_service.aid_location_comments c
+          WHERE c.damaged_home_id = h.id AND c.rating IS NOT NULL
+        ) AS comment_rating_count,
+        ( SELECT COALESCE(
+              array_agg(p.id ORDER BY p.position), ARRAY[]::uuid[]
+          )
+          FROM disaster_service.damaged_home_report_photos p
+          WHERE p.report_id = h.id
+        ) AS photo_ids
+    """
+
+    async def list_active_damaged_homes(
+        self, limit: int, offset: int
+    ) -> tuple[list[dict], int]:
+        """Casitas publicadas, las más recientes primero.
+
+        Se excluyen las retiradas por moderación (`visible`) y las
+        deshabilitadas por denuncias; nada se borra al filtrarlas.
+        """
+        rows = await self._pool.fetch(
+            f"""
+            SELECT {self._DAMAGED_HOME_PUBLIC_COLUMNS}
+            FROM disaster_service.damaged_home_reports h
+            WHERE h.visible AND h.disabled_at IS NULL
+            ORDER BY h.created_at DESC, h.id DESC
+            LIMIT $1 OFFSET $2
+            """,
+            limit,
+            offset,
+        )
+        total = await self._pool.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM disaster_service.damaged_home_reports
+            WHERE visible AND disabled_at IS NULL
+            """
+        )
+        return [dict(row) for row in rows], int(total)
+
+    async def get_damaged_home_photo(
+        self, *, damaged_home_id: UUID, photo_id: UUID
+    ) -> dict | None:
+        """Foto pública de una casita publicada (derivada, sin EXIF)."""
+        row = await self._pool.fetchrow(
+            """
+            SELECT p.derived_object_key AS object_key,
+                   p.content_type
+            FROM disaster_service.damaged_home_report_photos p
+            INNER JOIN disaster_service.damaged_home_reports h
+                ON h.id = p.report_id
+            WHERE p.id = $2 AND p.report_id = $1
+              AND h.visible AND h.disabled_at IS NULL
+            """,
+            damaged_home_id,
+            photo_id,
+        )
+        return None if row is None else dict(row)
+
+    async def list_damaged_home_comments(
+        self, *, damaged_home_id: UUID, limit: int
+    ) -> dict | None:
+        async with self._pool.acquire() as connection:
+            exists = await connection.fetchval(
+                "SELECT 1 FROM disaster_service.damaged_home_reports "
+                "WHERE id = $1",
+                damaged_home_id,
+            )
+            if exists is None:
+                return None
+            rows = await connection.fetch(
+                """
+                SELECT id, account_id, author_display_name,
+                       actor_kind::text AS actor_kind, content, rating,
+                       created_at
+                FROM disaster_service.aid_location_comments
+                WHERE damaged_home_id = $1
+                ORDER BY created_at DESC, id DESC
+                LIMIT $2
+                """,
+                damaged_home_id,
+                limit,
+            )
+            total = int(
+                await connection.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM disaster_service.aid_location_comments
+                    WHERE damaged_home_id = $1
+                    """,
+                    damaged_home_id,
+                )
+            )
+            aggregate = await connection.fetchrow(
+                """
+                SELECT ROUND(AVG(rating)::numeric, 1)::float8 AS average,
+                       COUNT(rating) AS count
+                FROM disaster_service.aid_location_comments
+                WHERE damaged_home_id = $1 AND rating IS NOT NULL
+                """,
+                damaged_home_id,
+            )
+        return {
+            "items": [dict(row) for row in rows],
+            "total": total,
+            "rating_average": aggregate["average"],
+            "rating_count": int(aggregate["count"]),
+        }
+
+    async def create_damaged_home_comment(
+        self,
+        *,
+        idempotency_key: str,
+        damaged_home_id: UUID,
+        actor_kind: str,
+        account_id: UUID | None,
+        author_display_name: str | None,
+        content: str,
+        rating: int,
+    ) -> dict | None:
+        """Publica el comentario y devuelve a quién hay que avisarle.
+
+        La fila incluye `owner_account_id` y `public_code` de la casita
+        para que la capa HTTP mande el aviso por correo (CHG-054) sin
+        volver a consultar. El aviso nunca forma parte de esta
+        transacción: si el correo falla, el comentario sigue publicado.
+        """
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                target = await connection.fetchrow(
+                    """
+                    SELECT account_id, public_code
+                    FROM disaster_service.damaged_home_reports
+                    WHERE id = $1
+                    """,
+                    damaged_home_id,
+                )
+                if target is None:
+                    return None
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO disaster_service.aid_location_comments (
+                        idempotency_key, damaged_home_id, account_id,
+                        author_display_name, actor_kind, content, rating
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                    RETURNING id, account_id, author_display_name,
+                              actor_kind::text AS actor_kind, content,
+                              rating, created_at
+                    """,
+                    idempotency_key,
+                    damaged_home_id,
+                    account_id,
+                    author_display_name,
+                    actor_kind,
+                    content,
+                    rating,
+                )
+                created = row is not None
+                if row is None:
+                    row = await connection.fetchrow(
+                        """
+                        SELECT id, account_id, author_display_name,
+                               actor_kind::text AS actor_kind, content,
+                               rating, created_at
+                        FROM disaster_service.aid_location_comments
+                        WHERE idempotency_key = $1
+                        """,
+                        idempotency_key,
+                    )
+        if row is None:
+            return None
+        return {
+            **dict(row),
+            "created": created,
+            "owner_account_id": target["account_id"],
+            "public_code": target["public_code"],
+        }
+
+    async def create_damaged_home_complaint(
+        self,
+        *,
+        idempotency_key: str,
+        damaged_home_id: UUID,
+        actor_kind: str,
+        account_id: UUID | None,
+        denouncer_key: str,
+        reason_encrypted: bytes | None,
+        reason_category: str,
+    ) -> dict | None:
+        """Denuncia una casita, con los umbrales de siempre."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                target = await connection.fetchrow(
+                    """
+                    SELECT id, disabled_at
+                    FROM disaster_service.damaged_home_reports
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    damaged_home_id,
+                )
+                if target is None:
+                    return None
+                await connection.execute(
+                    """
+                    INSERT INTO disaster_service.aid_location_reports (
+                        idempotency_key, damaged_home_id, actor_kind,
+                        account_id, denouncer_key, reason_encrypted,
+                        reason_category
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    -- El predicado debe coincidir EXACTAMENTE con el
+                    -- del índice parcial, o Postgres no lo infiere.
+                    ON CONFLICT (damaged_home_id, denouncer_key)
+                        WHERE archived_at IS NULL
+                          AND damaged_home_id IS NOT NULL
+                        DO NOTHING
+                    """,
+                    idempotency_key,
+                    damaged_home_id,
+                    actor_kind,
+                    account_id,
+                    denouncer_key,
+                    reason_encrypted,
+                    reason_category,
+                )
+                reporters = int(
+                    await connection.fetchval(
+                        """
+                        SELECT COUNT(*)
+                        FROM disaster_service.aid_location_reports
+                        WHERE damaged_home_id = $1
+                          AND archived_at IS NULL
+                          AND moderation_status <> 'rejected'
+                        """,
+                        damaged_home_id,
+                    )
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.community_contribution_audit (
+                        event_type, contribution_kind, contribution_id,
+                        detail
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    "damaged_home_reported",
+                    "damaged_home",
+                    damaged_home_id,
+                    f"denuncias_vivas={reporters} categoria={reason_category}",
+                )
+                disabled = target["disabled_at"] is not None
+                if (
+                    reporters >= AID_LOCATION_DISABLE_THRESHOLD
+                    and target["disabled_at"] is None
+                ):
+                    await connection.execute(
+                        """
+                        UPDATE disaster_service.damaged_home_reports
+                        SET disabled_at = NOW()
+                        WHERE id = $1
+                        """,
+                        damaged_home_id,
+                    )
+                    disabled = True
+                    await connection.execute(
+                        """
+                        INSERT INTO
+                            disaster_service.community_contribution_audit (
+                            event_type, contribution_kind,
+                            contribution_id, detail
+                        ) VALUES ($1, $2, $3, $4)
+                        """,
+                        "damaged_home_disabled_by_reports",
+                        "damaged_home",
+                        damaged_home_id,
+                        f"denuncias_vivas={reporters}",
+                    )
+        return {
+            "reports_count": reporters,
+            "under_observation": (
+                reporters >= AID_LOCATION_REPORT_THRESHOLD and not disabled
+            ),
+            "disabled": disabled,
+        }
+
+    async def admin_delete_damaged_home_comment(
+        self,
+        *,
+        damaged_home_id: UUID,
+        comment_id: UUID,
+        actor_account_id: UUID,
+        actor_display_name: str,
+    ) -> int:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                deleted = await connection.fetchval(
+                    """
+                    DELETE FROM disaster_service.aid_location_comments
+                    WHERE id = $1 AND damaged_home_id = $2
+                    RETURNING id
+                    """,
+                    comment_id,
+                    damaged_home_id,
+                )
+                if deleted is None:
+                    return 0
+                await self._admin_audit(
+                    connection,
+                    actor_account_id,
+                    actor_display_name,
+                    "damaged_home_comment_deleted",
+                    "damaged_home_comment",
+                    comment_id,
+                    "success",
+                    None,
+                    ["deleted"],
+                    None,
+                )
+        return 1
+
+    async def admin_delete_damaged_home(
+        self,
+        *,
+        damaged_home_id: UUID,
+        actor_account_id: UUID,
+        actor_display_name: str,
+    ) -> tuple[int, list[str]]:
+        """Borra la casita entera y devuelve las claves de sus fotos.
+
+        Comentarios, denuncias y filas de fotos caen por CASCADE; los
+        binarios los limpia la capa HTTP con las claves devueltas.
+        """
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                keys = await connection.fetch(
+                    """
+                    SELECT object_key, derived_object_key
+                    FROM disaster_service.damaged_home_report_photos
+                    WHERE report_id = $1
+                    """,
+                    damaged_home_id,
+                )
+                deleted = await connection.fetchval(
+                    """
+                    DELETE FROM disaster_service.damaged_home_reports
+                    WHERE id = $1
+                    RETURNING id
+                    """,
+                    damaged_home_id,
+                )
+                if deleted is None:
+                    return 0, []
+                await self._admin_audit(
+                    connection,
+                    actor_account_id,
+                    actor_display_name,
+                    "damaged_home_deleted",
+                    "damaged_home",
+                    damaged_home_id,
+                    "success",
+                    None,
+                    ["deleted"],
+                    None,
+                )
+        storage_keys: list[str] = []
+        for row in keys:
+            storage_keys.append(row["object_key"])
+            storage_keys.append(row["derived_object_key"])
+        return 1, storage_keys
+
+    async def list_my_damaged_homes(self, account_id: UUID) -> list[dict]:
+        """Casitas de la cuenta, con los comentarios sin leer.
+
+        «Sin leer» = publicados después del sello `comments_seen_at`,
+        y sin contar los que escribió la propia dueña.
+        """
+        rows = await self._pool.fetch(
+            f"""
+            SELECT {self._DAMAGED_HOME_PUBLIC_COLUMNS},
+                   h.visible,
+                   h.disabled_at,
+                   ( SELECT COUNT(*)
+                     FROM disaster_service.aid_location_comments c
+                     WHERE c.damaged_home_id = h.id
+                       AND (c.account_id IS NULL
+                            OR c.account_id <> h.account_id)
+                       AND (h.comments_seen_at IS NULL
+                            OR c.created_at > h.comments_seen_at)
+                   ) AS unread_comments,
+                   ( SELECT COUNT(*)
+                     FROM disaster_service.aid_location_comments c
+                     WHERE c.damaged_home_id = h.id
+                   ) AS comments_count
+            FROM disaster_service.damaged_home_reports h
+            WHERE h.account_id = $1
+            ORDER BY h.created_at DESC, h.id DESC
+            LIMIT 100
+            """,
+            account_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def mark_damaged_home_comments_seen(
+        self, *, damaged_home_id: UUID, account_id: UUID
+    ) -> bool:
+        """Sella la lectura; solo la dueña puede hacerlo."""
+        updated = await self._pool.fetchval(
+            """
+            UPDATE disaster_service.damaged_home_reports
+            SET comments_seen_at = NOW()
+            WHERE id = $1 AND account_id = $2
+            RETURNING id
+            """,
+            damaged_home_id,
+            account_id,
+        )
+        return updated is not None
 
     async def list_help_request_comments(
         self, *, help_request_id: UUID, limit: int

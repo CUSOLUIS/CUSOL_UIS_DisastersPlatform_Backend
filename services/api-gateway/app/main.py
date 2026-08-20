@@ -36,6 +36,10 @@ from .models import (
     AdminMutationReceipt,
     AdminSubmissionDeleteReceipt,
     DamagedHomeReportReceipt,
+    DamagedHomePage,
+    DamagedHomeComplaintReceipt,
+    DamagedHomeDeleteReceipt,
+    MyDamagedHomesResponse,
     HumanitarianTransportReceipt,
     ActiveTransportsResponse,
     # CHG-174: aceptación de ruta Centro Local ↔ Mulera.
@@ -4511,15 +4515,19 @@ def create_app(
             mutation=True,
         )
 
-    # CHG-162 — Alta de «Mi casita partida» (anónimo permitido, como
-    # los demás reportes ciudadanos).
+    # CHG-182 — Alta de «Mi casita destruida»: SOLO con cuenta. Aquí se
+    # declara un medio para recibir dinero y hay a quién avisarle de los
+    # comentarios; sin cuenta no hay responsable ni destinatario.
     @application.post(
         "/api/v1/damaged-homes",
         status_code=201,
         response_model=DamagedHomeReportReceipt,
         response_model_by_alias=True,
         responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Origen no permitido"},
             413: {"description": "Carga demasiado grande"},
+            415: {"description": "Fotografía no procesable"},
             422: {"description": "Informe inválido"},
             429: {"description": "Límite excedido"},
             503: {"description": "Servicio no disponible"},
@@ -4558,15 +4566,12 @@ def create_app(
                     status_code=413,
                     problem_type="payload-too-large",
                 )
-        account = await resolve_optional_account(request, identity)
-        if account is not None:
-            if not account_contribution_limiter.allow(
-                f"account:{account.id}"
-            ):
-                return rate_limited_response(
-                    "Se superó el límite de registros por minuto."
-                )
-        elif not anonymous_contribution_limiter.allow(client_key(request)):
+        # CHG-182: la cuenta es obligatoria; el 401 sale de aquí sin
+        # molestar al servicio.
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not account_contribution_limiter.allow(f"account:{account.id}"):
             return rate_limited_response(
                 "Se superó el límite de registros por minuto."
             )
@@ -4575,12 +4580,9 @@ def create_app(
                 "content-type", "application/json"
             ),
             "idempotency-key": idempotency_key,
-            "x-actor-kind": (
-                "authenticated" if account is not None else "anonymous"
-            ),
+            "x-actor-kind": "authenticated",
+            "x-account-id": str(account.id),
         }
-        if account is not None:
-            headers["x-account-id"] = str(account.id)
         body = await request.body()
         try:
             response = await upstream.post(
@@ -5344,6 +5346,479 @@ def create_app(
             "DELETE",
             f"/internal/v1/admin/food-offers/{food_offer_id}",
             FoodOfferDeleteReceipt,
+        )
+
+    # ------------------------------------------------------------------
+    # CHG-182 — «Mi casita destruida»: feed público del mapa, fotos
+    # públicas, comunidad completa, bandeja de «Mi espacio» y borrado
+    # administrativo. Misma autorización que el resto: leer es público,
+    # comentar exige Origin e Idempotency-Key (anónimo permitido),
+    # denunciar tiene su variante anónima y con cuenta, y borrar exige
+    # super_admin. Lo único distinto es publicar: eso sí exige cuenta.
+    # ------------------------------------------------------------------
+
+    @application.get(
+        "/api/v1/damaged-homes",
+        response_model=DamagedHomePage,
+        response_model_by_alias=True,
+        responses={
+            422: {"description": "Tamaño de página inválido"},
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["BuildingReports"],
+    )
+    async def list_active_damaged_homes(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        if not directory_search_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        try:
+            response = await upstream.get(
+                "/internal/v1/damaged-homes",
+                params={"limit": limit, "offset": offset},
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return DamagedHomePage.model_validate(response.json())
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar las casitas en este momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.get(
+        "/api/v1/public/damaged-homes/{damaged_home_id}/photos/{photo_id}",
+        responses={
+            404: {"description": "Fotografía inexistente"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["BuildingReports"],
+    )
+    async def serve_damaged_home_photo(
+        damaged_home_id: str,
+        photo_id: str,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        try:
+            response = await upstream.get(
+                f"/internal/v1/public/damaged-homes/{damaged_home_id}"
+                f"/photos/{photo_id}"
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return Response(
+                content=response.content,
+                media_type=response.headers.get(
+                    "content-type", "application/octet-stream"
+                ),
+                headers={
+                    "Cache-Control": response.headers.get(
+                        "cache-control", "public, max-age=300"
+                    )
+                },
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible obtener la fotografía en este momento.",
+                title="Servicio no disponible",
+            )
+
+    async def _forward_damaged_home_complaint(
+        damaged_home_id: UUID,
+        request: Request,
+        upstream: httpx.AsyncClient,
+        actor_kind: str,
+        denouncer_key: str,
+        account_id: UUID | None,
+    ) -> JSONResponse:
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        headers = {
+            "content-type": request.headers.get(
+                "content-type", "application/json"
+            ),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": actor_kind,
+            "x-denouncer-key": denouncer_key,
+        }
+        if account_id is not None:
+            headers["x-account-id"] = str(account_id)
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                f"/internal/v1/damaged-homes/{damaged_home_id}/reports",
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=202,
+                content=DamagedHomeComplaintReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible registrar la denuncia en este momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.post(
+        "/api/v1/public/damaged-homes/{damaged_home_id}/reports",
+        status_code=202,
+        response_model=DamagedHomeComplaintReceipt,
+        response_model_by_alias=True,
+        responses={
+            404: {"description": "Casita inexistente"},
+            422: {"description": "Datos inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["BuildingReports"],
+    )
+    async def create_anonymous_damaged_home_complaint(
+        damaged_home_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        if not anonymous_contribution_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de denuncias por minuto."
+            )
+        return await _forward_damaged_home_complaint(
+            damaged_home_id,
+            request,
+            upstream,
+            "anonymous",
+            _denouncer_key_anonymous(request),
+            None,
+        )
+
+    @application.post(
+        "/api/v1/me/damaged-homes/{damaged_home_id}/reports",
+        status_code=202,
+        response_model=DamagedHomeComplaintReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Origen no permitido"},
+            404: {"description": "Casita inexistente"},
+            422: {"description": "Datos inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["BuildingReports"],
+    )
+    async def create_account_damaged_home_complaint(
+        damaged_home_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not account_contribution_limiter.allow(f"account:{account.id}"):
+            return rate_limited_response(
+                "Se superó el límite de denuncias por minuto."
+            )
+        return await _forward_damaged_home_complaint(
+            damaged_home_id,
+            request,
+            upstream,
+            "authenticated",
+            f"account:{account.id}",
+            account.id,
+        )
+
+    @application.get(
+        "/api/v1/damaged-homes/{damaged_home_id}/comments",
+        response_model=AidLocationCommentsResponse,
+        response_model_by_alias=True,
+        responses={
+            404: {"description": "Casita inexistente"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["BuildingReports"],
+    )
+    async def list_damaged_home_comments(
+        damaged_home_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    ):
+        if not directory_search_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        try:
+            response = await upstream.get(
+                f"/internal/v1/damaged-homes/{damaged_home_id}/comments",
+                params={"limit": limit},
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return AidLocationCommentsResponse.model_validate(
+                response.json()
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar los comentarios en este "
+                "momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.post(
+        "/api/v1/damaged-homes/{damaged_home_id}/comments",
+        status_code=201,
+        response_model=AidLocationComment,
+        response_model_by_alias=True,
+        responses={
+            403: {"description": "Origen no permitido"},
+            404: {"description": "Casita inexistente"},
+            422: {"description": "Datos inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["BuildingReports"],
+    )
+    async def create_damaged_home_comment(
+        damaged_home_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        account = await resolve_optional_account(request, identity)
+        if account is not None:
+            if not account_contribution_limiter.allow(
+                f"account:{account.id}"
+            ):
+                return rate_limited_response(
+                    "Se superó el límite de comentarios por minuto."
+                )
+        elif not anonymous_contribution_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de comentarios por minuto."
+            )
+        headers = {
+            "content-type": request.headers.get(
+                "content-type", "application/json"
+            ),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": (
+                "authenticated" if account is not None else "anonymous"
+            ),
+        }
+        if account is not None:
+            headers["x-account-id"] = str(account.id)
+            headers["x-actor-display"] = base64.b64encode(
+                account.display_name.encode()
+            ).decode()
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                f"/internal/v1/damaged-homes/{damaged_home_id}/comments",
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=201,
+                content=AidLocationComment.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible publicar el comentario en este momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.get(
+        "/api/v1/me/damaged-homes",
+        response_model=MyDamagedHomesResponse,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["BuildingReports"],
+    )
+    async def list_my_damaged_homes(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        try:
+            response = await upstream.get(
+                "/internal/v1/me/damaged-homes",
+                headers={
+                    "x-actor-kind": "authenticated",
+                    "x-account-id": str(account.id),
+                },
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return MyDamagedHomesResponse.model_validate(response.json())
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar tus casitas en este momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.post(
+        "/api/v1/me/damaged-homes/{damaged_home_id}/comments-seen",
+        status_code=204,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Origen no permitido"},
+            404: {"description": "Casita inexistente o ajena"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["BuildingReports"],
+    )
+    async def mark_damaged_home_comments_seen(
+        damaged_home_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        try:
+            response = await upstream.post(
+                f"/internal/v1/me/damaged-homes/{damaged_home_id}"
+                "/comments-seen",
+                headers={
+                    "x-actor-kind": "authenticated",
+                    "x-account-id": str(account.id),
+                },
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return Response(status_code=204)
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible marcar los comentarios como leídos.",
+                title="Servicio no disponible",
+            )
+
+    @application.delete(
+        "/api/v1/admin/damaged-homes/{damaged_home_id}/comments"
+        "/{comment_id}",
+        response_model=AidLocationCommentDeleteReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Rol insuficiente u origen no permitido"},
+            404: {"description": "Comentario inexistente"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_delete_damaged_home_comment(
+        damaged_home_id: UUID,
+        comment_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "DELETE",
+            f"/internal/v1/admin/damaged-homes/{damaged_home_id}"
+            f"/comments/{comment_id}",
+            AidLocationCommentDeleteReceipt,
+        )
+
+    @application.delete(
+        "/api/v1/admin/damaged-homes/{damaged_home_id}",
+        response_model=DamagedHomeDeleteReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Rol insuficiente u origen no permitido"},
+            404: {"description": "Casita inexistente"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_delete_damaged_home(
+        damaged_home_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "DELETE",
+            f"/internal/v1/admin/damaged-homes/{damaged_home_id}",
+            DamagedHomeDeleteReceipt,
         )
 
     # ------------------------------------------------------------------
