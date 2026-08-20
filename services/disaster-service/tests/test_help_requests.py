@@ -1042,3 +1042,235 @@ async def test_admin_volunteers_requires_super_admin():
         headers={**ADMIN_HEADERS, "X-Actor-Role": "moderator"},
     )
     assert response.status_code == 403
+
+
+# CHG-180 — «Necesitamos ayuda» gana lo mismo que un Centro de Acopio
+# Local: comentarios con estrellas, denuncias con sus umbrales y borrado
+# administrativo de comentarios. Mismo contrato que CHG-176 dio a las
+# ofertas de comida; solo cambia el objetivo.
+
+COMMUNITY_REQUEST_ID = UUID("cccccccc-cccc-4ccc-8ccc-ccccccccc180")
+COMMUNITY_COMMENT_ID = UUID("cccccccc-cccc-4ccc-8ccc-ccccccccc181")
+COMMUNITY_ACTOR_ID = UUID(ACCOUNT_ID)
+COMMUNITY_CREATED_AT = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+COMMUNITY_ADMIN_HEADERS = {
+    "X-Actor-Role": "super_admin",
+    "X-Actor-Account-Id": str(COMMUNITY_ACTOR_ID),
+    "X-Actor-Display": "YWRtaW4=",
+}
+COMMUNITY_COMMENT_HEADERS = {
+    "Idempotency-Key": "clave-comentario-ayuda-0180",
+    "X-Actor-Kind": "anonymous",
+}
+COMMUNITY_REPORT_HEADERS = {
+    "Idempotency-Key": "clave-denuncia-ayuda-0180",
+    "X-Actor-Kind": "anonymous",
+    "X-Denouncer-Key": "fp:abcdef0123456789",
+}
+
+
+class FakeHelpRequestCommunityRepository(FakeHelpRequestRepository):
+    def __init__(self, *, missing=False, reporters=1, disabled=False):
+        super().__init__()
+        self.missing = missing
+        self.reporters = reporters
+        self.disabled = disabled
+        self.community_calls: list[tuple[str, dict]] = []
+
+    async def list_help_request_comments(self, **kwargs):
+        self.community_calls.append(("list", kwargs))
+        if self.missing:
+            return None
+        return {
+            "items": [
+                {
+                    "id": COMMUNITY_COMMENT_ID,
+                    "account_id": None,
+                    "author_display_name": None,
+                    "actor_kind": "anonymous",
+                    "content": "Llegó ayuda al lugar, todo cierto.",
+                    "rating": 5,
+                    "created_at": COMMUNITY_CREATED_AT,
+                }
+            ],
+            "total": 1,
+            "rating_average": 4.5,
+            "rating_count": 2,
+        }
+
+    async def create_help_request_comment(self, **kwargs):
+        self.community_calls.append(("comment", kwargs))
+        if self.missing:
+            return None
+        return {
+            "id": COMMUNITY_COMMENT_ID,
+            "account_id": None,
+            "author_display_name": None,
+            "actor_kind": "anonymous",
+            "content": kwargs["content"],
+            "rating": kwargs["rating"],
+            "created_at": COMMUNITY_CREATED_AT,
+        }
+
+    async def create_help_request_report(self, **kwargs):
+        self.community_calls.append(("report", kwargs))
+        if self.missing:
+            return None
+        return {
+            "reports_count": self.reporters,
+            "under_observation": self.reporters >= 10 and not self.disabled,
+            "disabled": self.disabled,
+        }
+
+    async def admin_delete_help_request_comment(self, **kwargs):
+        self.community_calls.append(("delete_comment", kwargs))
+        return 0 if self.missing else 1
+
+
+def community_app(repository=None):
+    return create_app(
+        repository=repository or FakeHelpRequestCommunityRepository(),
+        storage=FakeStorage(),
+    )
+
+
+@pytest.mark.anyio
+async def test_help_request_comments_publish_the_average():
+    response = await request_app(
+        community_app(),
+        "GET",
+        f"/internal/v1/help-requests/{COMMUNITY_REQUEST_ID}/comments",
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    # El promedio lo calcula el servidor, igual que en los acopios.
+    assert body["ratingAverage"] == 4.5
+    assert body["ratingCount"] == 2
+    assert body["items"][0]["rating"] == 5
+
+
+@pytest.mark.anyio
+async def test_help_request_comment_requires_a_star_rating():
+    response = await request_app(
+        community_app(),
+        "POST",
+        f"/internal/v1/help-requests/{COMMUNITY_REQUEST_ID}/comments",
+        headers=COMMUNITY_COMMENT_HEADERS,
+        json={"content": "Confirmo que la solicitud es real."},
+    )
+    # CHG-166 rige igual aquí: sin estrellas no hay comentario.
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_help_request_comment_is_published_anonymously():
+    repository = FakeHelpRequestCommunityRepository()
+    response = await request_app(
+        community_app(repository),
+        "POST",
+        f"/internal/v1/help-requests/{COMMUNITY_REQUEST_ID}/comments",
+        headers=COMMUNITY_COMMENT_HEADERS,
+        json={
+            "content": "Estuve allí y la ayuda hacía falta.",
+            "rating": 4,
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["rating"] == 4
+    call = dict(repository.community_calls[0][1])
+    assert call["help_request_id"] == COMMUNITY_REQUEST_ID
+    assert call["actor_kind"] == "anonymous"
+
+
+@pytest.mark.anyio
+async def test_help_request_report_needs_the_denouncer_key():
+    response = await request_app(
+        community_app(),
+        "POST",
+        f"/internal/v1/help-requests/{COMMUNITY_REQUEST_ID}/reports",
+        headers={
+            key: value
+            for key, value in COMMUNITY_REPORT_HEADERS.items()
+            if key != "X-Denouncer-Key"
+        },
+        json={"category": "informacion_falsa", "reason": "No existe."},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_help_request_report_reports_the_threshold_state():
+    repository = FakeHelpRequestCommunityRepository(
+        reporters=20, disabled=True
+    )
+    response = await request_app(
+        community_app(repository),
+        "POST",
+        f"/internal/v1/help-requests/{COMMUNITY_REQUEST_ID}/reports",
+        headers=COMMUNITY_REPORT_HEADERS,
+        json={
+            "category": "informacion_falsa",
+            "reason": "La dirección no corresponde con la realidad.",
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    # Al alcanzar el umbral la solicitud deja de publicarse.
+    assert body["disabled"] is True
+    assert body["reportsCount"] == 20
+    assert body["helpRequestId"] == str(COMMUNITY_REQUEST_ID)
+
+
+@pytest.mark.anyio
+async def test_admin_deletes_a_help_request_comment():
+    repository = FakeHelpRequestCommunityRepository()
+    response = await request_app(
+        community_app(repository),
+        "DELETE",
+        f"/internal/v1/admin/help-requests/{COMMUNITY_REQUEST_ID}"
+        f"/comments/{COMMUNITY_COMMENT_ID}",
+        headers=COMMUNITY_ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["deleted"] == 1
+
+
+@pytest.mark.anyio
+async def test_help_request_comment_deletion_refuses_a_plain_account():
+    response = await request_app(
+        community_app(),
+        "DELETE",
+        f"/internal/v1/admin/help-requests/{COMMUNITY_REQUEST_ID}"
+        f"/comments/{COMMUNITY_COMMENT_ID}",
+        headers={
+            "X-Actor-Role": "user",
+            "X-Actor-Account-Id": str(COMMUNITY_ACTOR_ID),
+        },
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_community_endpoints_404_on_a_missing_request():
+    app = community_app(FakeHelpRequestCommunityRepository(missing=True))
+
+    listing = await request_app(
+        app,
+        "GET",
+        f"/internal/v1/help-requests/{COMMUNITY_REQUEST_ID}/comments",
+    )
+    assert listing.status_code == 404
+
+    report = await request_app(
+        app,
+        "POST",
+        f"/internal/v1/help-requests/{COMMUNITY_REQUEST_ID}/reports",
+        headers=COMMUNITY_REPORT_HEADERS,
+        json={"category": "informacion_falsa", "reason": "No existe."},
+    )
+    assert report.status_code == 404
+

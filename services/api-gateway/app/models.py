@@ -475,6 +475,17 @@ class FoodOfferDeleteReceipt(ApiModel):
     deleted: int = Field(ge=0)
 
 
+# CHG-180 — Constancia de la denuncia a una solicitud de ayuda. Misma
+# forma que la del acopio y la de la oferta, con su propio
+# identificador: la solicitud es efímera, así que «deshabilitada»
+# significa que deja de publicarse, no que se pueda reactivar.
+class HelpRequestReportReceipt(ApiModel):
+    help_request_id: UUID
+    reports_count: int = Field(ge=1)
+    under_observation: bool
+    disabled: bool = False
+
+
 class AidLocationCommentDeleteReceipt(ApiModel):
     deleted: int = Field(ge=0)
 
@@ -982,6 +993,10 @@ class ActiveHelpRequest(ApiModel):
     attenders_count: int = Field(ge=0)
     attended_by_me: bool
     photo_url: str | None = None
+    # CHG-180: la puntuación viaja con la solicitud (el mapa la fusiona
+    # en cliente), igual que en las ofertas de comida.
+    comment_rating_average: float | None = Field(default=None, ge=1, le=5)
+    comment_rating_count: int = Field(default=0, ge=0)
 
 
 class HelpRequestPage(ApiModel):

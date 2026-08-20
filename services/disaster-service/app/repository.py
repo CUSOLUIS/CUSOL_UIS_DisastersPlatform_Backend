@@ -4360,6 +4360,263 @@ class PostgresDisasterRepository:
             "disabled": disabled,
         }
 
+    # CHG-180 — La comunidad de «Necesitamos ayuda»: mismas reglas que
+    # el acopio local (CHG-165/166/167) y que la oferta de comida
+    # (CHG-176), con la solicitud como tercer objetivo de las mismas
+    # tablas.
+
+    async def list_help_request_comments(
+        self, *, help_request_id: UUID, limit: int
+    ) -> dict | None:
+        """Comentarios públicos de la solicitud, recientes primero."""
+        async with self._pool.acquire() as connection:
+            exists = await connection.fetchval(
+                "SELECT 1 FROM disaster_service.help_requests WHERE id = $1",
+                help_request_id,
+            )
+            if exists is None:
+                return None
+            rows = await connection.fetch(
+                """
+                SELECT id, account_id, author_display_name,
+                       actor_kind::text AS actor_kind, content, rating,
+                       created_at
+                FROM disaster_service.aid_location_comments
+                WHERE help_request_id = $1
+                ORDER BY created_at DESC, id DESC
+                LIMIT $2
+                """,
+                help_request_id,
+                limit,
+            )
+            total = int(
+                await connection.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM disaster_service.aid_location_comments
+                    WHERE help_request_id = $1
+                    """,
+                    help_request_id,
+                )
+            )
+            aggregate = await connection.fetchrow(
+                """
+                SELECT ROUND(AVG(rating)::numeric, 1)::float8 AS average,
+                       COUNT(rating) AS count
+                FROM disaster_service.aid_location_comments
+                WHERE help_request_id = $1 AND rating IS NOT NULL
+                """,
+                help_request_id,
+            )
+        return {
+            "items": [dict(row) for row in rows],
+            "total": total,
+            "rating_average": aggregate["average"],
+            "rating_count": int(aggregate["count"]),
+        }
+
+    async def create_help_request_comment(
+        self,
+        *,
+        idempotency_key: str,
+        help_request_id: UUID,
+        actor_kind: str,
+        account_id: UUID | None,
+        author_display_name: str | None,
+        content: str,
+        rating: int,
+    ) -> dict | None:
+        """Publica un comentario con estrellas, anónimo o con cuenta."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                exists = await connection.fetchval(
+                    "SELECT 1 FROM disaster_service.help_requests "
+                    "WHERE id = $1",
+                    help_request_id,
+                )
+                if exists is None:
+                    return None
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO disaster_service.aid_location_comments (
+                        idempotency_key, help_request_id, account_id,
+                        author_display_name, actor_kind, content, rating
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                    RETURNING id, account_id, author_display_name,
+                              actor_kind::text AS actor_kind, content,
+                              rating, created_at
+                    """,
+                    idempotency_key,
+                    help_request_id,
+                    account_id,
+                    author_display_name,
+                    actor_kind,
+                    content,
+                    rating,
+                )
+                if row is None:
+                    row = await connection.fetchrow(
+                        """
+                        SELECT id, account_id, author_display_name,
+                               actor_kind::text AS actor_kind, content,
+                               rating, created_at
+                        FROM disaster_service.aid_location_comments
+                        WHERE idempotency_key = $1
+                        """,
+                        idempotency_key,
+                    )
+        return dict(row) if row is not None else None
+
+    async def create_help_request_report(
+        self,
+        *,
+        idempotency_key: str,
+        help_request_id: UUID,
+        actor_kind: str,
+        account_id: UUID | None,
+        denouncer_key: str,
+        reason_encrypted: bytes | None,
+        reason_category: str,
+    ) -> dict | None:
+        """Denuncia una solicitud con los umbrales de siempre.
+
+        Un mismo denunciante no cuenta dos veces en el ciclo vivo. Al
+        llegar al umbral de deshabilitación la solicitud deja de
+        publicarse y sale del mapa; como es efímera, no hay estado que
+        reactivar y nada se borra.
+        """
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                target = await connection.fetchrow(
+                    """
+                    SELECT id, disabled_at
+                    FROM disaster_service.help_requests
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    help_request_id,
+                )
+                if target is None:
+                    return None
+                await connection.execute(
+                    """
+                    INSERT INTO disaster_service.aid_location_reports (
+                        idempotency_key, help_request_id, actor_kind,
+                        account_id, denouncer_key, reason_encrypted,
+                        reason_category
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    -- El predicado debe coincidir EXACTAMENTE con el
+                    -- del índice parcial, o Postgres no lo infiere.
+                    ON CONFLICT (help_request_id, denouncer_key)
+                        WHERE archived_at IS NULL
+                          AND help_request_id IS NOT NULL
+                        DO NOTHING
+                    """,
+                    idempotency_key,
+                    help_request_id,
+                    actor_kind,
+                    account_id,
+                    denouncer_key,
+                    reason_encrypted,
+                    reason_category,
+                )
+                reporters = int(
+                    await connection.fetchval(
+                        """
+                        SELECT COUNT(*)
+                        FROM disaster_service.aid_location_reports
+                        WHERE help_request_id = $1
+                          AND archived_at IS NULL
+                          AND moderation_status <> 'rejected'
+                        """,
+                        help_request_id,
+                    )
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.community_contribution_audit (
+                        event_type, contribution_kind, contribution_id,
+                        detail
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    "help_request_reported",
+                    "help_request",
+                    help_request_id,
+                    f"denuncias_vivas={reporters} categoria={reason_category}",
+                )
+                disabled = target["disabled_at"] is not None
+                if (
+                    reporters >= AID_LOCATION_DISABLE_THRESHOLD
+                    and target["disabled_at"] is None
+                ):
+                    await connection.execute(
+                        """
+                        UPDATE disaster_service.help_requests
+                        SET disabled_at = NOW()
+                        WHERE id = $1
+                        """,
+                        help_request_id,
+                    )
+                    disabled = True
+                    await connection.execute(
+                        """
+                        INSERT INTO
+                            disaster_service.community_contribution_audit (
+                            event_type, contribution_kind,
+                            contribution_id, detail
+                        ) VALUES ($1, $2, $3, $4)
+                        """,
+                        "help_request_disabled_by_reports",
+                        "help_request",
+                        help_request_id,
+                        f"denuncias_vivas={reporters}",
+                    )
+        return {
+            "reports_count": reporters,
+            "under_observation": (
+                reporters >= AID_LOCATION_REPORT_THRESHOLD and not disabled
+            ),
+            "disabled": disabled,
+        }
+
+    async def admin_delete_help_request_comment(
+        self,
+        *,
+        help_request_id: UUID,
+        comment_id: UUID,
+        actor_account_id: UUID,
+        actor_display_name: str,
+    ) -> int:
+        """Borra un comentario suelto de la solicitud y lo audita."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                deleted = await connection.fetchval(
+                    """
+                    DELETE FROM disaster_service.aid_location_comments
+                    WHERE id = $1 AND help_request_id = $2
+                    RETURNING id
+                    """,
+                    comment_id,
+                    help_request_id,
+                )
+                if deleted is None:
+                    return 0
+                await self._admin_audit(
+                    connection,
+                    actor_account_id,
+                    actor_display_name,
+                    "help_request_comment_deleted",
+                    "help_request_comment",
+                    comment_id,
+                    "success",
+                    None,
+                    ["deleted"],
+                    None,
+                )
+        return 1
+
     async def admin_delete_food_offer_comment(
         self,
         *,
@@ -6283,9 +6540,22 @@ class PostgresDisasterRepository:
                     WHERE a.help_request_id = hr.id
                       AND a.account_id = $3
                 )) AS attended_by_me,
-                hr.photo_derived_storage_key IS NOT NULL AS has_photo
+                hr.photo_derived_storage_key IS NOT NULL AS has_photo,
+                -- CHG-180: la puntuación viaja con la solicitud, igual
+                -- que en las ofertas de comida; mismo cálculo que los
+                -- acopios.
+                ( SELECT ROUND(AVG(c.rating)::numeric, 1)::float8
+                  FROM disaster_service.aid_location_comments c
+                  WHERE c.help_request_id = hr.id AND c.rating IS NOT NULL
+                ) AS comment_rating_average,
+                ( SELECT COUNT(*)
+                  FROM disaster_service.aid_location_comments c
+                  WHERE c.help_request_id = hr.id AND c.rating IS NOT NULL
+                ) AS comment_rating_count
             FROM disaster_service.help_requests hr
-            WHERE hr.expires_at > NOW()
+            -- CHG-180: una solicitud deshabilitada por denuncias deja
+            -- de publicarse, igual que un acopio sale del mapa.
+            WHERE hr.expires_at > NOW() AND hr.disabled_at IS NULL
             ORDER BY hr.created_at DESC, hr.id DESC
             LIMIT $1 OFFSET $2
             """,
@@ -6297,7 +6567,7 @@ class PostgresDisasterRepository:
             """
             SELECT COUNT(*)
             FROM disaster_service.help_requests
-            WHERE expires_at > NOW()
+            WHERE expires_at > NOW() AND disabled_at IS NULL
             """
         )
         return [dict(row) for row in rows], int(total)

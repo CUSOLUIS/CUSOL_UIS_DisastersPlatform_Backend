@@ -752,3 +752,221 @@ async def test_admin_volunteers_forwards_and_returns_pii():
         f"/internal/v1/admin/help-requests/{REQUEST_ID}/volunteers"
     )
     assert seen["role"] == "super_admin"
+
+
+# CHG-180 — La comunidad de «Necesitamos ayuda» en la puerta pública:
+# leer comentarios es abierto, comentar exige Origin e Idempotency-Key
+# (anónimo permitido), denunciar tiene su variante anónima —con la
+# huella hasheada por el gateway— y con cuenta, y borrar un comentario
+# exige super_admin. Espejo de lo que CHG-165/176 dieron a acopios y
+# ofertas.
+
+COMMENTS_PATH = f"/api/v1/help-requests/{REQUEST_ID}/comments"
+PUBLIC_REPORT_PATH = f"/api/v1/public/help-requests/{REQUEST_ID}/reports"
+ME_REPORT_PATH = f"/api/v1/me/help-requests/{REQUEST_ID}/reports"
+COMMENT_ID = "77777777-7777-4777-8777-777777777702"
+
+COMMENTS_PAGE = {
+    "items": [
+        {
+            "id": COMMENT_ID,
+            "authorDisplayName": None,
+            "actorKind": "anonymous",
+            "content": "Llegó ayuda al lugar, todo cierto.",
+            "rating": 5,
+            "createdAt": "2026-08-19T12:00:00Z",
+        }
+    ],
+    "total": 1,
+    "ratingAverage": 4.5,
+    "ratingCount": 2,
+}
+
+REPORT_RECEIPT = {
+    "helpRequestId": REQUEST_ID,
+    "reportsCount": 1,
+    "underObservation": False,
+    "disabled": False,
+}
+
+
+@pytest.mark.anyio
+async def test_comments_are_public_and_carry_the_average():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["cookie"] = request.headers.get("cookie")
+        return httpx.Response(200, json=COMMENTS_PAGE)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app, "GET", COMMENTS_PATH, headers={"Cookie": "otra=privada"}
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert response.json()["ratingAverage"] == 4.5
+    assert seen["path"] == f"/internal/v1/help-requests/{REQUEST_ID}/comments"
+    assert seen["cookie"] is None
+
+
+@pytest.mark.anyio
+async def test_anonymous_comment_is_forwarded_with_its_actor():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["actor"] = request.headers.get("x-actor-kind")
+        seen["account"] = request.headers.get("x-account-id")
+        seen["idempotency"] = request.headers.get("idempotency-key")
+        seen["body"] = await request.aread()
+        return httpx.Response(201, json=COMMENTS_PAGE["items"][0])
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        COMMENTS_PATH,
+        headers={"Idempotency-Key": "clave-comentario-ayuda-0180"},
+        json={"content": "Estuve allí y hacía falta.", "rating": 4},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 201
+    assert seen["actor"] == "anonymous"
+    assert seen["account"] is None
+    assert b"rating" in seen["body"]
+
+
+@pytest.mark.anyio
+async def test_comment_rejects_a_foreign_origin():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(201, json=COMMENTS_PAGE["items"][0])
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        COMMENTS_PATH,
+        headers={
+            "Idempotency-Key": "clave-comentario-ayuda-0180",
+            "Origin": "https://malicioso.example",
+        },
+        json={"content": "Comentario intruso.", "rating": 1},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 403
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_anonymous_report_travels_with_a_hashed_fingerprint():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["denouncer"] = request.headers.get("x-denouncer-key")
+        seen["actor"] = request.headers.get("x-actor-kind")
+        await request.aread()
+        return httpx.Response(202, json=REPORT_RECEIPT)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        PUBLIC_REPORT_PATH,
+        headers={
+            "Idempotency-Key": "clave-denuncia-ayuda-0180",
+            "X-Visitor-Fingerprint": "huella-del-visitante",
+        },
+        json={"category": "informacion_falsa", "reason": "No existe."},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 202
+    assert response.json()["helpRequestId"] == REQUEST_ID
+    assert seen["actor"] == "anonymous"
+    # La huella nunca viaja en claro: se hashea en el gateway.
+    assert seen["denouncer"].startswith("fp:")
+    assert "huella-del-visitante" not in seen["denouncer"]
+
+
+@pytest.mark.anyio
+async def test_account_report_requires_a_session():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(202, json=REPORT_RECEIPT)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    sin_sesion = await request_gateway(
+        app,
+        "POST",
+        ME_REPORT_PATH,
+        headers={"Idempotency-Key": "clave-denuncia-ayuda-0180"},
+        json={"category": "seguridad", "reason": "Motivo suficiente."},
+    )
+    con_sesion = await request_gateway(
+        app,
+        "POST",
+        ME_REPORT_PATH,
+        headers={"Idempotency-Key": "clave-denuncia-ayuda-0180"},
+        cookies={"cusol_session": "token-user"},
+        json={"category": "seguridad", "reason": "Motivo suficiente."},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert sin_sesion.status_code == 401
+    assert con_sesion.status_code == 202
+    assert calls == [f"/internal/v1/help-requests/{REQUEST_ID}/reports"]
+
+
+@pytest.mark.anyio
+async def test_comment_deletion_is_only_for_super_admin():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["role"] = request.headers.get("x-actor-role")
+        return httpx.Response(200, json={"deleted": 1})
+
+    upstream, identity = make_clients(handler, identity=admin_identity_handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    path = f"/api/v1/admin/help-requests/{REQUEST_ID}/comments/{COMMENT_ID}"
+    como_usuario = await request_gateway(
+        app, "DELETE", path, cookies={"cusol_session": "token-user"}
+    )
+    como_admin = await request_gateway(
+        app, "DELETE", path, cookies={"cusol_session": "token-admin"}
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert como_usuario.status_code == 403
+    assert como_admin.status_code == 200
+    assert seen["role"] == "super_admin"
+    assert seen["path"] == (
+        f"/internal/v1/admin/help-requests/{REQUEST_ID}/comments/{COMMENT_ID}"
+    )
+
