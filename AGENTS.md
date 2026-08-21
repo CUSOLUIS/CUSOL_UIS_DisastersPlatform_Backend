@@ -11,6 +11,34 @@ Antes de modificar comportamiento, leer:
 
 El backend implementa el contrato; no cambia silenciosamente tipos, estados, errores ni reglas consumidas por frontend.
 
+## Grafo del repositorio (CHG-183, 2026-08-20)
+
+`graphify-out/` contiene el grafo de conocimiento de este repositorio:
+`graph.json` (datos), `GRAPH_REPORT.md` (informe), `graph.html` (mapa visual) y
+`wiki/` (un artículo por comunidad).
+
+- **Para localizar dónde vive algo, consultarlo ANTES de barrer el árbol con
+  `grep` o lectura exploratoria**, desde la raíz del repositorio:
+  `graphify query "<pregunta>"`, `graphify explain "<símbolo>"`,
+  `graphify path "<A>" "<B>"`, `graphify affected "<archivo>"`.
+  `graphify-out/wiki/index.md` es la entrada para un agente que no ejecuta nada.
+- **Tras cada cambio de código**, al cerrar el expediente: `graphify update .`
+  (determinista, sin LLM ni coste). Anotar el resultado en la bitácora del
+  `CHG-NNN`.
+- **Aviso (verificado el 2026-08-20, CHG-185):** el comando solo deja los
+  archivos intactos si la topología **no** cambió. En cuanto el cambio añade
+  archivos, la detección de comunidades se re-agrupa y `update` **renombra
+  todas las etiquetas curadas por su nodo central** —el mismo daño que en
+  Specs—. La salida anterior queda respaldada en `graphify-out/<fecha>/`. La
+  reparación es determinista y está descrita en la bitácora de CHG-185:
+  reasignar cada comunidad nueva a la vieja con la que más nodos comparte y
+  devolverle su etiqueta en `.graphify_labels.json`, `graph.json`, `graph.html`
+  y los encabezados de `GRAPH_REPORT.md`; las comunidades que el cambio
+  reformó se nombran a mano. Sin esa reparación, el grafo pierde el índice en
+  castellano y queda con nombres de archivo.
+- El grafo es un índice, no una fuente de verdad: señala archivo y línea; lo que
+  manda sigue siendo el código y el contrato.
+
 ## Responsabilidades
 
 - Validar entradas, autenticación y autorización en fronteras del sistema.
