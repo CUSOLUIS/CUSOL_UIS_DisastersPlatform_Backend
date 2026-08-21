@@ -142,6 +142,9 @@ from .models import (
     AdminHelpRequestPage,
     AdminHelpRequestVolunteer,
     AdminHelpRequestVolunteerPage,
+    HelpRequestAttendInput,
+    HelpRequestAttender,
+    HelpRequestAttendersPage,
     HelpRequestAttendReceipt,
     HelpRequestInput,
     HelpRequestVolunteerInput,
@@ -5142,7 +5145,35 @@ def create_app(
                 "Atender una solicitud exige una cuenta autenticada "
                 "resuelta por el gateway.",
             )
-        row = await data.attend_help_request(request_id, account_id)
+        # CHG-193: el cuerpo es opcional — un cliente anterior no lo
+        # manda y entonces no se comparte nada. La instantánea (nombre y
+        # teléfono) la rellena el gateway desde la sesión; el navegador
+        # no elige con qué nombre figura nadie.
+        raw_body = await request.body()
+        try:
+            attend_input = (
+                HelpRequestAttendInput.model_validate_json(raw_body)
+                if raw_body
+                else HelpRequestAttendInput()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+
+        row = await data.attend_help_request(
+            request_id,
+            account_id,
+            shares_identity=attend_input.shares_identity,
+            name_encrypted=(
+                encrypt(attend_input.name)
+                if attend_input.shares_identity
+                else None
+            ),
+            phone_encrypted=(
+                encrypt(attend_input.phone)
+                if attend_input.shares_identity
+                else None
+            ),
+        )
         if row is None:
             return problem(
                 404,
@@ -5250,6 +5281,7 @@ def create_app(
                 photo_content_type=(
                     photo.content_type if photo else None
                 ),
+                shares_contact=payload.shares_contact,
             )
         except asyncpg.PostgresError:
             cleanup()
@@ -5275,6 +5307,120 @@ def create_app(
             id=row["id"],
             attenders_count=row["attenders_count"],
             attending=True,
+        )
+
+    # CHG-193 — Quién atiende MI solicitud. Solo para su dueña: la
+    # consulta de una solicitud ajena y la de una inexistente responden
+    # lo mismo, para no delatar cuáles existen.
+    @application.get(
+        "/internal/v1/help-requests/{request_id}/attenders",
+        response_model=HelpRequestAttendersPage,
+        response_model_by_alias=True,
+        tags=["HelpRequests"],
+    )
+    async def list_help_request_attenders(
+        request_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401,
+                "Sesión requerida",
+                "Ver quién atiende una solicitud exige la cuenta que la "
+                "creó.",
+            )
+        rows = await data.list_help_request_attenders(
+            request_id, account_id
+        )
+        if rows is None:
+            return problem(
+                404,
+                "Solicitud no disponible",
+                "La solicitud no existe o no es tuya.",
+            )
+        items = []
+        for row in rows:
+            shared = bool(row["shares_contact"])
+            items.append(
+                HelpRequestAttender(
+                    id=row["id"],
+                    kind=row["kind"],
+                    joined_at=row["created_at"],
+                    shares_contact=shared,
+                    name=decrypt_text(row["name_encrypted"])
+                    if shared
+                    else None,
+                    phone=decrypt_text(row["phone_encrypted"])
+                    if shared
+                    else None,
+                    photo_url=(
+                        "/api/v1/help-requests/"
+                        f"{request_id}/attenders/{row['id']}/photo"
+                        if shared and row["has_photo"]
+                        else None
+                    ),
+                )
+            )
+        return HelpRequestAttendersPage(
+            items=items,
+            total=len(items),
+            generated_at=datetime.now(UTC),
+        )
+
+    @application.get(
+        "/internal/v1/help-requests/{request_id}/attenders/"
+        "{volunteer_id}/photo",
+        tags=["HelpRequests"],
+    )
+    async def serve_help_request_attender_photo(
+        request_id: UUID,
+        volunteer_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401,
+                "Sesión requerida",
+                "La fotografía de quien atiende es de su solicitud.",
+            )
+        photo = await data.get_help_request_volunteer_photo(
+            request_id, volunteer_id, account_id
+        )
+        if photo is None:
+            return problem(
+                404,
+                "Fotografía no disponible",
+                "No hay fotografía compartida para esa persona.",
+            )
+        try:
+            content = object_storage.load(photo["object_key"])
+        except StorageUnavailableError:
+            content = None
+        if content is None:
+            return problem(
+                503,
+                "Fotografía no disponible",
+                "No fue posible leer la fotografía en este momento.",
+            )
+
+        from fastapi.responses import Response as RawResponse
+
+        return RawResponse(
+            content=content,
+            media_type=photo["content_type"],
+            # Privada: es de una persona concreta y solo la ve la dueña
+            # de la solicitud, así que no se cachea en ningún sitio.
+            headers={"Cache-Control": "no-store"},
         )
 
     @application.get(

@@ -1009,3 +1009,120 @@ async def test_comment_deletion_is_only_for_super_admin():
         f"/internal/v1/admin/help-requests/{REQUEST_ID}/comments/{COMMENT_ID}"
     )
 
+
+# --- CHG-193: quién atiende MI solicitud ---
+
+ATTENDERS_PAGE = {
+    "items": [
+        {
+            "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+            "kind": "account",
+            "joinedAt": "2026-08-21T12:00:00Z",
+            "sharesContact": True,
+            "name": "Usuaria Normal",
+            "phone": "3001234567",
+            "photoUrl": None,
+        }
+    ],
+    "total": 1,
+    "generatedAt": "2026-08-21T12:05:00Z",
+}
+
+
+@pytest.mark.anyio
+async def test_attend_sends_session_identity_only_when_accepted():
+    bodies = []
+
+    def handler(request: httpx.Request):
+        bodies.append(json.loads(request.content.decode()))
+        return httpx.Response(200, json=ATTEND_RECEIPT)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    aceptando = await request_gateway(
+        app,
+        "POST",
+        f"{PATH}/{REQUEST_ID}/attend",
+        json={"sharesIdentity": True},
+        cookies={"cusol_session": "token-user"},
+    )
+    sin_aceptar = await request_gateway(
+        app,
+        "POST",
+        f"{PATH}/{REQUEST_ID}/attend",
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert aceptando.status_code == 200
+    assert sin_aceptar.status_code == 200
+    # El nombre sale de la sesión, no del navegador.
+    assert bodies[0] == {
+        "sharesIdentity": True,
+        "name": USER_ACCOUNT["displayName"],
+        "phone": USER_ACCOUNT.get("phone"),
+    }
+    # Sin aceptar el aviso no viaja ningún dato personal.
+    assert bodies[1] == {"sharesIdentity": False}
+
+
+@pytest.mark.anyio
+async def test_attend_ignores_identity_sent_by_the_client():
+    bodies = []
+
+    def handler(request: httpx.Request):
+        bodies.append(json.loads(request.content.decode()))
+        return httpx.Response(200, json=ATTEND_RECEIPT)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "POST",
+        f"{PATH}/{REQUEST_ID}/attend",
+        json={"sharesIdentity": True, "name": "Nombre Inventado"},
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    # `name` no es un campo que el cliente pueda mandar.
+    assert response.status_code == 422
+    assert bodies == []
+
+
+@pytest.mark.anyio
+async def test_attenders_require_session_and_carry_the_account():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["account"] = request.headers.get("x-account-id")
+        return httpx.Response(200, json=ATTENDERS_PAGE)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    sin_sesion = await request_gateway(
+        app, "GET", f"{PATH}/{REQUEST_ID}/attenders"
+    )
+    con_sesion = await request_gateway(
+        app,
+        "GET",
+        f"{PATH}/{REQUEST_ID}/attenders",
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert sin_sesion.status_code == 401
+    assert con_sesion.status_code == 200
+    assert con_sesion.json()["items"][0]["name"] == "Usuaria Normal"
+    assert seen["path"] == (
+        f"/internal/v1/help-requests/{REQUEST_ID}/attenders"
+    )
+    assert seen["account"] == USER_ACCOUNT["id"]
+

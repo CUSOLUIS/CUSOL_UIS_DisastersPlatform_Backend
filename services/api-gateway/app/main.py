@@ -109,6 +109,8 @@ from .models import (
     SessionEnvelope,
     UnverifiedBuildingReportReceipt,
     VerificationStatus,
+    HelpRequestAttendInput,
+    HelpRequestAttendersPage,
     HelpRequestAttendReceipt,
     FoodOfferPage,
     FoodOfferReceipt,
@@ -2908,9 +2910,35 @@ def create_app(
             return rate_limited_response(
                 "Se superó el límite de acciones por minuto."
             )
+        # CHG-193: el navegador solo dice si aceptó el aviso; el nombre
+        # y el teléfono los pone el gateway desde la sesión, para que
+        # nadie pueda figurar con datos que no son suyos. El cuerpo es
+        # opcional: un cliente anterior no lo manda y no comparte nada.
+        raw_body = await request.body()
+        try:
+            attend_input = (
+                HelpRequestAttendInput.model_validate_json(raw_body)
+                if raw_body
+                else HelpRequestAttendInput()
+            )
+        except ValueError:
+            return problem_response(
+                "El cuerpo de la petición no es válido.",
+                title="Datos inválidos",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        upstream_payload: dict = {
+            "sharesIdentity": attend_input.shares_identity
+        }
+        if attend_input.shares_identity:
+            upstream_payload["name"] = account.display_name
+            upstream_payload["phone"] = account.phone
+
         try:
             response = await upstream.post(
                 f"/internal/v1/help-requests/{request_id}/attend",
+                json=upstream_payload,
                 headers={
                     "x-actor-kind": "authenticated",
                     "x-account-id": str(account.id),
@@ -2925,6 +2953,103 @@ def create_app(
         except (httpx.HTTPError, httpx.TimeoutException, ValueError):
             return problem_response(
                 "No fue posible registrar la atención en este momento.",
+                title="Servicio de solicitudes no disponible",
+            )
+
+    # CHG-193 — Quién atiende MI solicitud. Exige sesión y el servicio
+    # interno comprueba además que la solicitud sea de esa cuenta: una
+    # solicitud ajena responde lo mismo que una inexistente.
+    @application.get(
+        "/api/v1/help-requests/{request_id}/attenders",
+        response_model=HelpRequestAttendersPage,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            404: {"description": "Solicitud inexistente o de otra cuenta"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HelpRequests"],
+    )
+    async def list_help_request_attenders(
+        request_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not help_request_read_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        try:
+            response = await upstream.get(
+                f"/internal/v1/help-requests/{request_id}/attenders",
+                headers={
+                    "x-actor-kind": "authenticated",
+                    "x-account-id": str(account.id),
+                },
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return HelpRequestAttendersPage.model_validate(response.json())
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar quién atiende la solicitud en "
+                "este momento.",
+                title="Servicio de solicitudes no disponible",
+            )
+
+    @application.get(
+        "/api/v1/help-requests/{request_id}/attenders/{attender_id}/photo",
+        responses={
+            401: {"description": "Sesión requerida"},
+            404: {"description": "Sin fotografía compartida"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HelpRequests"],
+    )
+    async def serve_help_request_attender_photo(
+        request_id: UUID,
+        attender_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        try:
+            response = await upstream.get(
+                f"/internal/v1/help-requests/{request_id}/attenders/"
+                f"{attender_id}/photo",
+                headers={
+                    "x-actor-kind": "authenticated",
+                    "x-account-id": str(account.id),
+                },
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return Response(
+                content=response.content,
+                media_type=response.headers.get(
+                    "content-type", "image/jpeg"
+                ),
+                # Es la cara de una persona concreta, visible solo para
+                # la dueña de la solicitud: no se cachea en ningún sitio.
+                headers={"Cache-Control": "no-store"},
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible entregar la fotografía en este momento.",
                 title="Servicio de solicitudes no disponible",
             )
 

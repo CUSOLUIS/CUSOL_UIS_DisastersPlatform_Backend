@@ -1786,6 +1786,10 @@ class HelpRequestVolunteerInput(ApiModel):
         default=None, max_length=PHONE_MAX_LENGTH, pattern=PHONE_PATTERN
     )
     email: str | None = Field(default=None, max_length=254)
+    # CHG-193: el formulario nuevo advierte que nombre, teléfono y foto
+    # se comparten con quien pidió la ayuda. Falso por defecto para que
+    # un cliente viejo —o un envío sin la advertencia— no comparta nada.
+    shares_contact: bool = False
 
     @model_validator(mode="after")
     def _name_is_readable(self):
@@ -1833,6 +1837,39 @@ class HelpRequestPage(ApiModel):
     items: list[ActiveHelpRequest] = Field(max_length=50)
     total: int = Field(ge=0)
     generated_at: datetime
+
+
+# CHG-193 — Quien pidió ayuda ve quién la atiende. Cada fila dice si esa
+# persona consintió compartir sus datos: sin consentimiento viaja el
+# hecho de que atiende y nada más (las anteriores a CHG-193 se
+# registraron bajo otra promesa y nunca se identifican). El correo sigue
+# siendo privado del super_admin en todos los casos.
+class HelpRequestAttender(ApiModel):
+    id: UUID
+    kind: Literal["account", "volunteer"]
+    joined_at: datetime
+    shares_contact: bool
+    name: str | None = None
+    phone: str | None = None
+    photo_url: str | None = None
+
+
+class HelpRequestAttendersPage(ApiModel):
+    items: list[HelpRequestAttender]
+    total: int = Field(ge=0)
+    generated_at: datetime
+
+
+class HelpRequestAttendInput(ApiModel):
+    """Lo que el navegador manda al atender. `sharesIdentity` es el
+    aviso aceptado: al atender, tu nombre y tu teléfono se comparten con
+    quien pidió la ayuda."""
+
+    shares_identity: bool = False
+    # Solo el gateway los rellena, desde la sesión: el navegador no
+    # decide con qué nombre figura nadie.
+    name: str | None = Field(default=None, max_length=161)
+    phone: str | None = Field(default=None, max_length=30)
 
 
 class HelpRequestAttendReceipt(ApiModel):

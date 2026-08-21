@@ -1008,6 +1008,46 @@ class HelpRequestPage(ApiModel):
     generated_at: datetime
 
 
+# CHG-193 — Quien pidió ayuda ve quién la atiende. Cada fila dice si esa
+# persona consintió compartir sus datos: sin consentimiento viaja el
+# hecho de que atiende y nada más (las anteriores a CHG-193 se
+# registraron bajo otra promesa y nunca se identifican). El correo sigue
+# siendo privado del super_admin en todos los casos.
+class HelpRequestAttender(ApiModel):
+    id: UUID
+    kind: Literal["account", "volunteer"]
+    joined_at: datetime
+    shares_contact: bool
+    name: str | None = None
+    phone: str | None = None
+    photo_url: str | None = None
+
+
+class HelpRequestAttendersPage(ApiModel):
+    items: list[HelpRequestAttender]
+    total: int = Field(ge=0)
+    generated_at: datetime
+
+
+class HelpRequestAttendInput(ApiModel):
+    """Lo que el navegador manda al atender. `sharesIdentity` es el
+    aviso aceptado: al atender, tu nombre y tu teléfono se comparten con
+    quien pidió la ayuda.
+
+    Prohíbe campos desconocidos a propósito: el nombre y el teléfono los
+    pone el gateway desde la sesión, así que un cliente que intente
+    mandarlos recibe un 422 en vez de que se ignoren en silencio."""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    shares_identity: bool = False
+
+
 class HelpRequestAttendReceipt(ApiModel):
     id: UUID
     attenders_count: int = Field(ge=1)

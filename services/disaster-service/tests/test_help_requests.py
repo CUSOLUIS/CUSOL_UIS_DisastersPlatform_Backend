@@ -34,6 +34,8 @@ class FakeHelpRequestRepository:
     def __init__(self):
         self.rows: dict[UUID, dict] = {}
         self.attenders: set[tuple[UUID, UUID]] = set()
+        # CHG-193: lo que cada quien consintió compartir al atender.
+        self.attender_consent: dict[tuple[UUID, UUID], dict] = {}
         # CHG-148: voluntarios anónimos (una fila por envío).
         self.volunteers: list[dict] = []
         self.by_key: dict[str, UUID] = {}
@@ -238,15 +240,97 @@ class FakeHelpRequestRepository:
         )
         return authenticated + anonymous
 
-    async def attend_help_request(self, request_id, account_id):
+    async def attend_help_request(
+        self,
+        request_id,
+        account_id,
+        *,
+        shares_identity=False,
+        name_encrypted=None,
+        phone_encrypted=None,
+    ):
         row = self.rows.get(request_id)
         if row is None or not self._active(row):
             return None
         self.attenders.add((request_id, account_id))
+        key = (request_id, account_id)
+        # Espejo del repositorio real: el consentimiento solo se añade,
+        # repetir la atención nunca lo retira.
+        if shares_identity or key not in self.attender_consent:
+            self.attender_consent[key] = {
+                "shares_identity": shares_identity
+                or self.attender_consent.get(key, {}).get(
+                    "shares_identity", False
+                ),
+                "name_encrypted": name_encrypted,
+                "phone_encrypted": phone_encrypted,
+                "created_at": datetime.now(UTC),
+            }
         return {
             "id": request_id,
             "attenders_count": self._attenders_count(request_id),
         }
+
+    async def list_help_request_attenders(self, request_id, account_id):
+        row = self.rows.get(request_id)
+        if row is None or row.get("reporter_account_id") != account_id:
+            return None
+        items = []
+        for entry in self.attenders:
+            if entry[0] != request_id:
+                continue
+            detail = self.attender_consent.get(entry, {})
+            items.append(
+                {
+                    "kind": "account",
+                    "id": entry[1],
+                    "created_at": detail.get(
+                        "created_at", datetime.now(UTC)
+                    ),
+                    "shares_contact": detail.get("shares_identity", False),
+                    "name_encrypted": detail.get("name_encrypted"),
+                    "phone_encrypted": detail.get("phone_encrypted"),
+                    "has_photo": False,
+                }
+            )
+        for volunteer in self.volunteers:
+            if volunteer["help_request_id"] != request_id:
+                continue
+            items.append(
+                {
+                    "kind": "volunteer",
+                    "id": volunteer["id"],
+                    "created_at": volunteer["created_at"],
+                    "shares_contact": volunteer.get("shares_contact", False),
+                    "name_encrypted": volunteer.get("name_encrypted"),
+                    "phone_encrypted": volunteer.get("phone_encrypted"),
+                    "has_photo": volunteer.get("photo_derived_storage_key")
+                    is not None,
+                }
+            )
+        items.sort(key=lambda item: item["created_at"], reverse=True)
+        return items
+
+    async def get_help_request_volunteer_photo(
+        self, request_id, volunteer_id, account_id
+    ):
+        row = self.rows.get(request_id)
+        if row is None or row.get("reporter_account_id") != account_id:
+            return None
+        for volunteer in self.volunteers:
+            if (
+                volunteer["id"] == volunteer_id
+                and volunteer["help_request_id"] == request_id
+                and volunteer.get("shares_contact")
+                and volunteer.get("photo_derived_storage_key")
+            ):
+                return {
+                    "object_key": volunteer["photo_derived_storage_key"],
+                    "content_type": volunteer.get(
+                        "photo_content_type", "image/jpeg"
+                    ),
+                }
+        return None
 
     async def create_help_request_volunteer(
         self, *, idempotency_key, request_id, **kwargs
@@ -260,6 +344,8 @@ class FakeHelpRequestRepository:
         if not already:
             self.volunteers.append(
                 {
+                    "id": uuid4(),
+                    "created_at": datetime.now(UTC),
                     "idempotency_key": idempotency_key,
                     "help_request_id": request_id,
                     **kwargs,
@@ -1319,4 +1405,135 @@ async def test_community_endpoints_404_on_a_missing_request():
         json={"category": "informacion_falsa", "reason": "No existe."},
     )
     assert report.status_code == 404
+
+
+# --- CHG-193: quién atiende MI solicitud ---
+
+
+@pytest.mark.anyio
+async def test_owner_sees_who_attends_with_and_without_consent():
+    repository = FakeHelpRequestRepository()
+    request_id = repository.seed(reporter_account_id=UUID(ACCOUNT_ID))
+    app = help_app(repository=repository)
+
+    # Voluntaria que aceptó el aviso del formulario nuevo.
+    await post_volunteer(
+        app,
+        request_id,
+        payload={
+            "name": "Ana Voluntaria",
+            "phone": "3001234567",
+            "email": "ana@example.com",
+            "sharesContact": True,
+        },
+        key="voluntaria-que-consiente-01",
+    )
+    # Voluntario registrado bajo la promesa vieja: no comparte nada.
+    await post_volunteer(
+        app,
+        request_id,
+        payload={"name": "Bruno Antiguo", "phone": "3007654321"},
+        key="voluntario-sin-consentimiento-1",
+    )
+    # Persona con cuenta que aceptó el aviso al atender.
+    await request_app(
+        app,
+        "POST",
+        f"/internal/v1/help-requests/{request_id}/attend",
+        json={
+            "sharesIdentity": True,
+            "name": "Carla Con Cuenta",
+            "phone": "3009998877",
+        },
+        headers={
+            "X-Actor-Kind": "authenticated",
+            "X-Account-Id": OTHER_ACCOUNT_ID,
+        },
+    )
+
+    response = await request_app(
+        app,
+        "GET",
+        f"/internal/v1/help-requests/{request_id}/attenders",
+        headers=AUTH_HEADERS,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 3
+    by_name = {item["name"]: item for item in body["items"]}
+    assert by_name["Ana Voluntaria"]["phone"] == "3001234567"
+    assert by_name["Ana Voluntaria"]["kind"] == "volunteer"
+    assert by_name["Carla Con Cuenta"]["phone"] == "3009998877"
+    assert by_name["Carla Con Cuenta"]["kind"] == "account"
+    # El de la promesa vieja figura, pero sin un solo dato personal.
+    sin_datos = [item for item in body["items"] if item["name"] is None]
+    assert len(sin_datos) == 1
+    assert sin_datos[0]["sharesContact"] is False
+    assert sin_datos[0]["phone"] is None
+    # El correo NUNCA sale por aquí, ni siquiera con consentimiento.
+    assert all("email" not in item for item in body["items"])
+
+
+@pytest.mark.anyio
+async def test_attending_without_accepting_shares_nothing():
+    repository = FakeHelpRequestRepository()
+    request_id = repository.seed(reporter_account_id=UUID(ACCOUNT_ID))
+    app = help_app(repository=repository)
+
+    await request_app(
+        app,
+        "POST",
+        f"/internal/v1/help-requests/{request_id}/attend",
+        headers={
+            "X-Actor-Kind": "authenticated",
+            "X-Account-Id": OTHER_ACCOUNT_ID,
+        },
+    )
+
+    body = (
+        await request_app(
+            app,
+            "GET",
+            f"/internal/v1/help-requests/{request_id}/attenders",
+            headers=AUTH_HEADERS,
+        )
+    ).json()
+    assert body["total"] == 1
+    assert body["items"][0]["sharesContact"] is False
+    assert body["items"][0]["name"] is None
+
+
+@pytest.mark.anyio
+async def test_attenders_are_only_for_the_owner():
+    repository = FakeHelpRequestRepository()
+    request_id = repository.seed(reporter_account_id=UUID(ACCOUNT_ID))
+    app = help_app(repository=repository)
+
+    ajena = await request_app(
+        app,
+        "GET",
+        f"/internal/v1/help-requests/{request_id}/attenders",
+        headers={
+            "X-Actor-Kind": "authenticated",
+            "X-Account-Id": OTHER_ACCOUNT_ID,
+        },
+    )
+    inexistente = await request_app(
+        app,
+        "GET",
+        f"/internal/v1/help-requests/{uuid4()}/attenders",
+        headers=AUTH_HEADERS,
+    )
+    sin_sesion = await request_app(
+        app,
+        "GET",
+        f"/internal/v1/help-requests/{request_id}/attenders",
+    )
+
+    # Ajena e inexistente responden IGUAL: no se delata cuál existe.
+    assert ajena.status_code == 404
+    assert inexistente.status_code == 404
+    assert ajena.json()["detail"] == inexistente.json()["detail"]
+    assert sin_sesion.status_code == 401
 

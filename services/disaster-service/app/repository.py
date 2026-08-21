@@ -7108,9 +7108,21 @@ class PostgresDisasterRepository:
         return [dict(row) for row in rows], int(total)
 
     async def attend_help_request(
-        self, request_id: UUID, account_id: UUID
+        self,
+        request_id: UUID,
+        account_id: UUID,
+        *,
+        shares_identity: bool = False,
+        name_encrypted: bytes | None = None,
+        phone_encrypted: bytes | None = None,
     ) -> dict | None:
-        """Registra la atención de forma idempotente (DEC-125-03)."""
+        """Registra la atención de forma idempotente (DEC-125-03).
+
+        CHG-193: quien acepta el aviso deja además su nombre y teléfono
+        cifrados, la instantánea de lo que consintió en ese momento. Sin
+        consentimiento no se guarda nada de eso, y repetir la atención
+        nunca lo retira: solo puede añadirlo.
+        """
         async with self._pool.acquire() as connection:
             async with connection.transaction():
                 active = await connection.fetchval(
@@ -7127,14 +7139,22 @@ class PostgresDisasterRepository:
                     """
                     INSERT INTO
                         disaster_service.help_request_attenders (
-                            help_request_id, account_id
+                            help_request_id, account_id, shares_identity,
+                            name_encrypted, phone_encrypted
                         )
-                    VALUES ($1, $2)
+                    VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (help_request_id, account_id)
-                    DO NOTHING
+                    DO UPDATE SET
+                        shares_identity = TRUE,
+                        name_encrypted = EXCLUDED.name_encrypted,
+                        phone_encrypted = EXCLUDED.phone_encrypted
+                    WHERE EXCLUDED.shares_identity
                     """,
                     request_id,
                     account_id,
+                    shares_identity,
+                    name_encrypted,
+                    phone_encrypted,
                 )
                 count = await connection.fetchval(
                     _COMBINED_ATTENDERS_COUNT_SQL,
@@ -7153,6 +7173,7 @@ class PostgresDisasterRepository:
         photo_storage_key: str | None,
         photo_derived_storage_key: str | None,
         photo_content_type: str | None,
+        shares_contact: bool = False,
     ) -> tuple[dict, bool] | None:
         """CHG-148: registra un voluntario anónimo (PII ya cifrada).
 
@@ -7179,9 +7200,10 @@ class PostgresDisasterRepository:
                             idempotency_key, help_request_id,
                             name_encrypted, phone_encrypted,
                             email_encrypted, photo_storage_key,
-                            photo_derived_storage_key, photo_content_type
+                            photo_derived_storage_key, photo_content_type,
+                            shares_contact
                         )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     ON CONFLICT (idempotency_key) DO NOTHING
                     RETURNING id
                     """,
@@ -7193,6 +7215,7 @@ class PostgresDisasterRepository:
                     photo_storage_key,
                     photo_derived_storage_key,
                     photo_content_type,
+                    shares_contact,
                 )
                 count = await connection.fetchval(
                     _COMBINED_ATTENDERS_COUNT_SQL,
@@ -7202,6 +7225,81 @@ class PostgresDisasterRepository:
             "id": request_id,
             "attenders_count": int(count),
         }, inserted is not None
+
+    async def list_help_request_attenders(
+        self, request_id: UUID, account_id: UUID
+    ) -> list[dict] | None:
+        """CHG-193: quiénes atienden una solicitud, SOLO para su dueña.
+
+        Devuelve None si la solicitud no existe o no es de esa cuenta —
+        el que pregunta por una ajena no distingue un caso del otro—.
+        Cada fila dice si la persona consintió compartir sus datos; sin
+        consentimiento viaja el hecho de que atiende y nada más.
+        """
+        async with self._pool.acquire() as connection:
+            owned = await connection.fetchval(
+                """
+                SELECT 1
+                FROM disaster_service.help_requests
+                WHERE id = $1 AND reporter_account_id = $2
+                """,
+                request_id,
+                account_id,
+            )
+            if owned is None:
+                return None
+            rows = await connection.fetch(
+                """
+                SELECT
+                    'account' AS kind,
+                    a.account_id AS id,
+                    a.created_at,
+                    a.shares_identity AS shares_contact,
+                    a.name_encrypted,
+                    a.phone_encrypted,
+                    FALSE AS has_photo
+                FROM disaster_service.help_request_attenders a
+                WHERE a.help_request_id = $1
+                UNION ALL
+                SELECT
+                    'volunteer' AS kind,
+                    v.id,
+                    v.created_at,
+                    v.shares_contact,
+                    v.name_encrypted,
+                    v.phone_encrypted,
+                    v.photo_derived_storage_key IS NOT NULL AS has_photo
+                FROM disaster_service.help_request_volunteers v
+                WHERE v.help_request_id = $1
+                ORDER BY created_at DESC
+                """,
+                request_id,
+            )
+            return [dict(row) for row in rows]
+
+    async def get_help_request_volunteer_photo(
+        self, request_id: UUID, volunteer_id: UUID, account_id: UUID
+    ) -> dict | None:
+        """CHG-193: la foto de un voluntario, solo para la dueña de la
+        solicitud y solo si esa persona consintió compartirla."""
+        row = await self._pool.fetchrow(
+            """
+            SELECT v.photo_derived_storage_key AS object_key,
+                   v.photo_content_type AS content_type
+            FROM disaster_service.help_request_volunteers v
+            JOIN disaster_service.help_requests r
+              ON r.id = v.help_request_id
+            WHERE v.id = $1
+              AND v.help_request_id = $2
+              AND r.reporter_account_id = $3
+              AND v.shares_contact
+              AND v.photo_derived_storage_key IS NOT NULL
+            """,
+            volunteer_id,
+            request_id,
+            account_id,
+        )
+        return dict(row) if row else None
 
     async def get_help_request_photo(
         self, request_id: UUID
