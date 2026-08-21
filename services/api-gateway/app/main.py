@@ -2959,6 +2959,59 @@ def create_app(
     # CHG-193 — Quién atiende MI solicitud. Exige sesión y el servicio
     # interno comprueba además que la solicitud sea de esa cuenta: una
     # solicitud ajena responde lo mismo que una inexistente.
+    # CHG-196 — La dueña elimina su propia solicitud. Es una mutación
+    # con cookie de sesión: pasa por la comprobación de origen (CHG-022)
+    # y la cuenta sale de la sesión, nunca del cliente. La puerta de
+    # propiedad la guarda además el repositorio (DEC-196-01).
+    @application.delete(
+        "/api/v1/help-requests/{request_id}",
+        status_code=204,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Origen no permitido"},
+            404: {"description": "Solicitud inexistente o de otra cuenta"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HelpRequests"],
+    )
+    async def delete_own_help_request(
+        request_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not help_attend_limiter.allow(str(account.id)):
+            return rate_limited_response(
+                "Se superó el límite de acciones por minuto."
+            )
+        try:
+            response = await upstream.request(
+                "DELETE",
+                f"/internal/v1/help-requests/{request_id}",
+                headers={
+                    "x-actor-kind": "authenticated",
+                    "x-account-id": str(account.id),
+                },
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return Response(status_code=204)
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible eliminar la solicitud en este momento.",
+                title="Servicio de solicitudes no disponible",
+            )
+
     @application.get(
         "/api/v1/help-requests/{request_id}/attenders",
         response_model=HelpRequestAttendersPage,

@@ -187,6 +187,27 @@ class FakeHelpRequestRepository:
             ),
         }
 
+    # CHG-196 — mismo borrado, con la puerta de propiedad.
+    async def delete_own_help_request(self, request_id, account_id):
+        row = self.rows.get(request_id)
+        if row is None or row.get("reporter_account_id") != account_id:
+            return None
+        self.rows.pop(request_id, None)
+        self.attenders = {
+            entry for entry in self.attenders if entry[0] != request_id
+        }
+        self.volunteers = [
+            volunteer
+            for volunteer in self.volunteers
+            if volunteer["help_request_id"] != request_id
+        ]
+        return {
+            "photo_storage_key": row.get("photo_storage_key"),
+            "photo_derived_storage_key": row.get(
+                "photo_derived_storage_key"
+            ),
+        }
+
     async def admin_purge_help_requests(self):
         keys = [
             key
@@ -1537,3 +1558,65 @@ async def test_attenders_are_only_for_the_owner():
     assert ajena.json()["detail"] == inexistente.json()["detail"]
     assert sin_sesion.status_code == 401
 
+
+
+# CHG-196 — La dueña elimina su propia solicitud.
+@pytest.mark.anyio
+async def test_owner_deletes_own_help_request():
+    repository = FakeHelpRequestRepository()
+    request_id = repository.seed(reporter_account_id=UUID(ACCOUNT_ID))
+    app = help_app(repository=repository)
+
+    borrado = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/help-requests/{request_id}",
+        headers=AUTH_HEADERS,
+    )
+
+    assert borrado.status_code == 204
+    # La fila se fue de verdad: ya no se lista ni se puede volver a borrar.
+    assert request_id not in repository.rows
+    repetido = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/help-requests/{request_id}",
+        headers=AUTH_HEADERS,
+    )
+    assert repetido.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_deleting_a_help_request_is_only_for_its_owner():
+    repository = FakeHelpRequestRepository()
+    request_id = repository.seed(reporter_account_id=UUID(ACCOUNT_ID))
+    app = help_app(repository=repository)
+
+    ajena = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/help-requests/{request_id}",
+        headers={
+            "X-Actor-Kind": "authenticated",
+            "X-Account-Id": OTHER_ACCOUNT_ID,
+        },
+    )
+    inexistente = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/help-requests/{uuid4()}",
+        headers=AUTH_HEADERS,
+    )
+    sin_sesion = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/help-requests/{request_id}",
+    )
+
+    # Ajena e inexistente responden IGUAL, como en CHG-193.
+    assert ajena.status_code == 404
+    assert inexistente.status_code == 404
+    assert ajena.json()["detail"] == inexistente.json()["detail"]
+    assert sin_sesion.status_code == 401
+    # Y la solicitud sigue viva: nadie ajeno la tocó.
+    assert request_id in repository.rows

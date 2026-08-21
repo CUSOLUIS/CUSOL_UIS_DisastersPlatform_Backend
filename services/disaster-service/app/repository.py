@@ -7420,6 +7420,29 @@ class PostgresDisasterRepository:
         )
         return None if row is None else dict(row)
 
+    # CHG-196 — La dueña elimina su propia solicitud. Mismo borrado que
+    # el administrativo, con la puerta de propiedad AQUÍ y no solo en el
+    # gateway: una solicitud ajena no se distingue de una inexistente.
+    async def delete_own_help_request(
+        self, request_id: UUID, account_id: UUID
+    ) -> dict | None:
+        """Borra la solicitud solo si la creó `account_id`.
+
+        Devuelve las claves de foto de la fila borrada, o None si no
+        existía o es de otra cuenta —el llamador no puede distinguir un
+        caso del otro, y eso es deliberado—.
+        """
+        row = await self._pool.fetchrow(
+            """
+            DELETE FROM disaster_service.help_requests
+            WHERE id = $1 AND reporter_account_id = $2
+            RETURNING photo_storage_key, photo_derived_storage_key
+            """,
+            request_id,
+            account_id,
+        )
+        return None if row is None else dict(row)
+
     async def admin_purge_help_requests(self) -> tuple[int, list[str]]:
         rows = await self._pool.fetch(
             """

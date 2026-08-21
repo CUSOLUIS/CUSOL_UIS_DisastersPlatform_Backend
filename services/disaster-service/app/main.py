@@ -5312,6 +5312,47 @@ def create_app(
     # CHG-193 — Quién atiende MI solicitud. Solo para su dueña: la
     # consulta de una solicitud ajena y la de una inexistente responden
     # lo mismo, para no delatar cuáles existen.
+    # CHG-196 — La dueña elimina su propia solicitud. Reutiliza el
+    # borrado del super_admin: la fila se va, atendedores y voluntarios
+    # caen por CASCADE y las fotos salen del almacén (DEC-196-01).
+    @application.delete(
+        "/internal/v1/help-requests/{request_id}",
+        status_code=204,
+        tags=["HelpRequests"],
+    )
+    async def delete_own_help_request(
+        request_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401,
+                "Sesión requerida",
+                "Eliminar una solicitud exige la cuenta que la creó.",
+            )
+        row = await data.delete_own_help_request(request_id, account_id)
+        if row is None:
+            # Ajena o inexistente: misma respuesta a propósito.
+            return problem(
+                404,
+                "Solicitud no disponible",
+                "La solicitud no existe o no es tuya.",
+            )
+        for key in (
+            row.get("photo_storage_key"),
+            row.get("photo_derived_storage_key"),
+        ):
+            if key:
+                object_storage.delete(key)
+        from fastapi.responses import Response as RawResponse
+
+        return RawResponse(status_code=204)
+
     @application.get(
         "/internal/v1/help-requests/{request_id}/attenders",
         response_model=HelpRequestAttendersPage,

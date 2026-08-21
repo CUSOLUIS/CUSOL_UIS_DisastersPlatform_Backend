@@ -1126,3 +1126,89 @@ async def test_attenders_require_session_and_carry_the_account():
     )
     assert seen["account"] == USER_ACCOUNT["id"]
 
+
+
+# CHG-196 — Eliminar la solicitud propia: mutación con sesión, así que
+# pasa por la comprobación de origen y la cuenta sale de la cookie.
+@pytest.mark.anyio
+async def test_delete_own_request_carries_the_session_account():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["account"] = request.headers.get("x-account-id")
+        return httpx.Response(204)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    sin_sesion = await request_gateway(app, "DELETE", f"{PATH}/{REQUEST_ID}")
+    con_sesion = await request_gateway(
+        app,
+        "DELETE",
+        f"{PATH}/{REQUEST_ID}",
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert sin_sesion.status_code == 401
+    assert con_sesion.status_code == 204
+    assert seen["method"] == "DELETE"
+    assert seen["path"] == f"/internal/v1/help-requests/{REQUEST_ID}"
+    assert seen["account"] == USER_ACCOUNT["id"]
+
+
+@pytest.mark.anyio
+async def test_delete_own_request_rejects_a_foreign_origin():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(204)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "DELETE",
+        f"{PATH}/{REQUEST_ID}",
+        headers={"Origin": "https://malicioso.example"},
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 403
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_delete_of_a_foreign_request_passes_the_404_through():
+    def handler(request: httpx.Request):
+        return httpx.Response(
+            404,
+            json={
+                "type": "about:blank",
+                "title": "Solicitud no disponible",
+                "status": 404,
+                "detail": "La solicitud no existe o no es tuya.",
+            },
+        )
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "DELETE",
+        f"{PATH}/{REQUEST_ID}",
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "La solicitud no existe o no es tuya."
