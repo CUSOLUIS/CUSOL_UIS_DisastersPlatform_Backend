@@ -252,6 +252,45 @@ async def test_list_forwards_pagination_and_actor():
     assert seen["actor"] == "anonymous"
 
 
+# CHG-190 — la pertenencia la calcula el servicio interno contra la cuenta
+# de la sesión; el gateway solo tiene que dejarla pasar hasta el cliente.
+@pytest.mark.anyio
+async def test_list_passes_through_ownership_flag():
+    page = json.loads(json.dumps(PAGE))
+    page["items"][0]["createdByMe"] = True
+
+    def handler(request: httpx.Request):
+        return httpx.Response(200, json=page)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app, "GET", PATH, cookies={"cusol_session": "token-user"}
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["createdByMe"] is True
+
+
+@pytest.mark.anyio
+async def test_list_defaults_ownership_to_false_when_upstream_omits_it():
+    def handler(request: httpx.Request):
+        return httpx.Response(200, json=PAGE)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(app, "GET", PATH)
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["createdByMe"] is False
+
+
 @pytest.mark.anyio
 async def test_list_rejects_unknown_page_size():
     calls = []

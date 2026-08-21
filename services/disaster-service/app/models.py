@@ -1819,6 +1819,9 @@ class ActiveHelpRequest(ApiModel):
     expires_at: datetime
     attenders_count: int = Field(ge=0)
     attended_by_me: bool
+    # CHG-190: true solo para la cuenta que creó la solicitud; sin
+    # sesión siempre false. No expone la identidad de nadie más.
+    created_by_me: bool = False
     photo_url: str | None = None
     # CHG-180: la puntuación viaja con la solicitud (el mapa la fusiona
     # en cliente), igual que en las ofertas de comida.

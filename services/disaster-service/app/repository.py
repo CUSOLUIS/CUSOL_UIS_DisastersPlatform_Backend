@@ -6967,6 +6967,12 @@ class PostgresDisasterRepository:
                     WHERE a.help_request_id = hr.id
                       AND a.account_id = $3
                 )) AS attended_by_me,
+                -- CHG-190: la solicitud propia se marca para quien la
+                -- creó; en «Mi espacio» las solicitudes están para
+                -- atenderlas y nadie se atiende a sí mismo. Es un
+                -- booleano contra la sesión, no revela al dueño.
+                ($3::uuid IS NOT NULL
+                 AND hr.reporter_account_id = $3) AS created_by_me,
                 hr.photo_derived_storage_key IS NOT NULL AS has_photo,
                 -- CHG-180: la puntuación viaja con la solicitud, igual
                 -- que en las ofertas de comida; mismo cálculo que los

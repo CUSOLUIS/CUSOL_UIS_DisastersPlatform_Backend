@@ -46,11 +46,19 @@ class FakeHelpRequestRepository:
     def _active(self, row: dict) -> bool:
         return row["expires_at"] > datetime.now(UTC)
 
-    def seed(self, *, expired: bool = False, photo: bool = False) -> UUID:
+    def seed(
+        self,
+        *,
+        expired: bool = False,
+        photo: bool = False,
+        reporter_account_id: UUID | None = None,
+    ) -> UUID:
         request_id = uuid4()
         created = datetime.now(UTC) - timedelta(hours=2)
         self.rows[request_id] = {
             "id": request_id,
+            # CHG-190: nulo = solicitud creada sin cuenta.
+            "reporter_account_id": reporter_account_id,
             "description": "Necesitamos ayuda urgente con rescate.",
             "address": "Calle 10 #5-20, Bucaramanga",
             "latitude": 7.12,
@@ -211,6 +219,9 @@ class FakeHelpRequestRepository:
                     "attenders_count": self._attenders_count(row["id"]),
                     "attended_by_me": account_id is not None
                     and (row["id"], account_id) in self.attenders,
+                    # CHG-190: espejo de la consulta real.
+                    "created_by_me": account_id is not None
+                    and row.get("reporter_account_id") == account_id,
                     "has_photo": row["photo_derived_storage_key"]
                     is not None,
                 }
@@ -613,6 +624,41 @@ async def test_list_reports_attention_and_photo_url():
     assert item["photoUrl"] == (
         f"/api/v1/public/help-requests/{request_id}/photo"
     )
+
+
+# CHG-190 — la solicitud propia se marca para su dueño, y solo para él:
+# «Mi espacio» la esconde porque allí las solicitudes están para atenderlas.
+@pytest.mark.anyio
+async def test_list_marks_own_request_for_its_author():
+    repository = FakeHelpRequestRepository()
+    mine = repository.seed(reporter_account_id=UUID(ACCOUNT_ID))
+    others = repository.seed(reporter_account_id=UUID(OTHER_ACCOUNT_ID))
+    anonymous = repository.seed()
+    app = help_app(repository=repository)
+
+    response = await request_app(
+        app, "GET", "/internal/v1/help-requests", headers=AUTH_HEADERS
+    )
+
+    assert response.status_code == 200
+    flags = {
+        item["id"]: item["createdByMe"] for item in response.json()["items"]
+    }
+    assert flags[str(mine)] is True
+    assert flags[str(others)] is False
+    assert flags[str(anonymous)] is False
+
+
+@pytest.mark.anyio
+async def test_list_without_session_never_marks_ownership():
+    repository = FakeHelpRequestRepository()
+    repository.seed(reporter_account_id=UUID(ACCOUNT_ID))
+    app = help_app(repository=repository)
+
+    response = await request_app(app, "GET", "/internal/v1/help-requests")
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["createdByMe"] is False
 
 
 @pytest.mark.anyio

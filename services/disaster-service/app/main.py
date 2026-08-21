@@ -4856,6 +4856,7 @@ def create_app(
             expires_at=row["expires_at"],
             attenders_count=row["attenders_count"],
             attended_by_me=bool(row["attended_by_me"]),
+            created_by_me=bool(row.get("created_by_me")),
             photo_url=(
                 f"/api/v1/public/help-requests/{row['id']}/photo"
                 if row.get("has_photo")
