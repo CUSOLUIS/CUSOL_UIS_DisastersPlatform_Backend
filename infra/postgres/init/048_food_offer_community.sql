@@ -18,11 +18,22 @@ ALTER TABLE disaster_service.aid_location_comments
     ADD COLUMN IF NOT EXISTS food_offer_id UUID
         REFERENCES disaster_service.food_offers(id) ON DELETE CASCADE;
 
+-- CHG-204: además de «si no existe», hace falta «si nadie la amplió
+-- todavía». 050 y 051 rehacen esta misma restricción con tres y cuatro
+-- objetivos; si una pasada posterior la dejara caída (por datos que la
+-- versión estrecha ya no admite), esta migración volvería a intentar la
+-- de DOS y el despliegue entero moriría aquí. La presencia de
+-- `help_request_id` dice que 050 ya pasó.
 DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'aid_location_comment_single_target'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'disaster_service'
+          AND table_name = 'aid_location_comments'
+          AND column_name = 'help_request_id'
     ) THEN
         ALTER TABLE disaster_service.aid_location_comments
             ADD CONSTRAINT aid_location_comment_single_target
@@ -42,11 +53,17 @@ ALTER TABLE disaster_service.aid_location_reports
     ADD COLUMN IF NOT EXISTS food_offer_id UUID
         REFERENCES disaster_service.food_offers(id) ON DELETE CASCADE;
 
+-- CHG-204: misma cautela que arriba, para la gemela de denuncias.
 DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'aid_location_report_single_target'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'disaster_service'
+          AND table_name = 'aid_location_reports'
+          AND column_name = 'help_request_id'
     ) THEN
         ALTER TABLE disaster_service.aid_location_reports
             ADD CONSTRAINT aid_location_report_single_target

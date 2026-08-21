@@ -14,13 +14,29 @@ ALTER TABLE disaster_service.aid_location_comments
     ADD COLUMN IF NOT EXISTS help_request_id UUID
         REFERENCES disaster_service.help_requests(id) ON DELETE CASCADE;
 
-ALTER TABLE disaster_service.aid_location_comments
-    DROP CONSTRAINT IF EXISTS aid_location_comment_single_target;
-ALTER TABLE disaster_service.aid_location_comments
-    ADD CONSTRAINT aid_location_comment_single_target
-    CHECK (
-        num_nonnulls(location_id, food_offer_id, help_request_id) = 1
-    );
+-- CHG-204: solo mientras 051 no haya ampliado esto a cuatro objetivos.
+-- Sin esta guardia, en cuanto existía un comentario sobre una casita
+-- —que la versión de TRES no admite— este bloque borraba la restricción
+-- y no lograba recrearla: el despliegue moría y la tabla se quedaba sin
+-- ninguna. La presencia de `damaged_home_id` dice que 051 ya pasó.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'disaster_service'
+          AND table_name = 'aid_location_comments'
+          AND column_name = 'damaged_home_id'
+    ) THEN
+        ALTER TABLE disaster_service.aid_location_comments
+            DROP CONSTRAINT IF EXISTS aid_location_comment_single_target;
+        ALTER TABLE disaster_service.aid_location_comments
+            ADD CONSTRAINT aid_location_comment_single_target
+            CHECK (
+                num_nonnulls(location_id, food_offer_id, help_request_id) = 1
+            );
+    END IF;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS aid_location_comments_help_request_idx
     ON disaster_service.aid_location_comments
@@ -33,13 +49,26 @@ ALTER TABLE disaster_service.aid_location_reports
     ADD COLUMN IF NOT EXISTS help_request_id UUID
         REFERENCES disaster_service.help_requests(id) ON DELETE CASCADE;
 
-ALTER TABLE disaster_service.aid_location_reports
-    DROP CONSTRAINT IF EXISTS aid_location_report_single_target;
-ALTER TABLE disaster_service.aid_location_reports
-    ADD CONSTRAINT aid_location_report_single_target
-    CHECK (
-        num_nonnulls(location_id, food_offer_id, help_request_id) = 1
-    );
+-- CHG-204: misma guardia para la gemela de denuncias, que tenía el
+-- mismo defecto esperando al primer reporte sobre una casita.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'disaster_service'
+          AND table_name = 'aid_location_reports'
+          AND column_name = 'damaged_home_id'
+    ) THEN
+        ALTER TABLE disaster_service.aid_location_reports
+            DROP CONSTRAINT IF EXISTS aid_location_report_single_target;
+        ALTER TABLE disaster_service.aid_location_reports
+            ADD CONSTRAINT aid_location_report_single_target
+            CHECK (
+                num_nonnulls(location_id, food_offer_id, help_request_id) = 1
+            );
+    END IF;
+END
+$$;
 
 CREATE UNIQUE INDEX IF NOT EXISTS help_request_report_live_denouncer_idx
     ON disaster_service.aid_location_reports
