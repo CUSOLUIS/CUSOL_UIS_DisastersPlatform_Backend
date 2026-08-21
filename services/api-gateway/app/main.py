@@ -5892,6 +5892,53 @@ def create_app(
                 title="Servicio no disponible",
             )
 
+    # CHG-202 — La dueña elimina su propia casita. Mutación con cookie:
+    # pasa por la comprobación de origen (CHG-022) y la cuenta sale de
+    # la sesión. La puerta de propiedad la guarda además el repositorio.
+    @application.delete(
+        "/api/v1/me/damaged-homes/{damaged_home_id}",
+        status_code=204,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Origen no permitido"},
+            404: {"description": "Casita inexistente o de otra cuenta"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["BuildingReports"],
+    )
+    async def delete_own_damaged_home(
+        damaged_home_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        try:
+            response = await upstream.request(
+                "DELETE",
+                f"/internal/v1/me/damaged-homes/{damaged_home_id}",
+                headers={
+                    "x-actor-kind": "authenticated",
+                    "x-account-id": str(account.id),
+                },
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return Response(status_code=204)
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible eliminar la casita en este momento.",
+                title="Servicio no disponible",
+            )
+
     @application.post(
         "/api/v1/me/damaged-homes/{damaged_home_id}/comments-seen",
         status_code=204,

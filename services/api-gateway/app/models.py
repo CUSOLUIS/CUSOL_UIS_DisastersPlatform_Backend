@@ -1447,6 +1447,10 @@ class ActiveDamagedHome(ApiModel):
     household_size: int | None = Field(default=None, ge=1, le=60)
     donation_channel: DamagedHomeDonationChannel | None = None
     donation_reference: str | None = Field(default=None, max_length=60)
+    # CHG-201: vídeo de TikTok de la casita, público como las fotos. El
+    # servicio lo valida contra una lista cerrada de anfitriones antes
+    # de guardarlo (DEC-201-01); aquí solo se transporta.
+    video_url: str | None = Field(default=None, max_length=300)
     created_at: datetime
     updated_at: datetime
     photo_urls: list[str] = Field(default_factory=list, max_length=5)

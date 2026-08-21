@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from app.main import create_app
+from app.models import normalized_tiktok_url
 
 from test_admin_console import RecordingNotifier
 from test_missing_persons import FakeStorage, request_app
@@ -57,6 +58,8 @@ def home_row(**overrides) -> dict:
         "household_size": 5,
         "donation_channel": "Nequi",
         "donation_reference": "3001234567",
+        # CHG-201: vídeo de TikTok, opcional.
+        "video_url": "https://www.tiktok.com/@familia/video/7412345678901234567",
         "created_at": CREATED_AT,
         "updated_at": CREATED_AT,
         "comment_rating_average": 4.5,
@@ -168,6 +171,16 @@ class FakeDamagedHomesRepository:
             )
         ]
 
+    # CHG-202 — borrado por la dueña, con puerta de propiedad.
+    async def delete_own_damaged_home(self, damaged_home_id, account_id):
+        self.calls.append(
+            ("delete_own", {"home": damaged_home_id, "account": account_id})
+        )
+        if self.missing or damaged_home_id != HOME_ID or account_id != OWNER_ID:
+            return None
+        self.missing = True
+        return ["casitas/original.jpg", "casitas/derivada.jpg"]
+
     async def mark_damaged_home_comments_seen(self, **kwargs):
         self.seen.append(kwargs)
         return not self.missing
@@ -193,6 +206,11 @@ async def test_feed_publishes_photos_household_and_rating():
     assert item["donationChannel"] == "Nequi"
     assert item["donationReference"] == "3001234567"
     assert item["commentRatingAverage"] == 4.5
+    # CHG-201: el vídeo viaja al feed, así que la ficha puede ofrecerlo
+    # a cualquiera que la abra, con cuenta o sin ella.
+    assert item["videoUrl"] == (
+        "https://www.tiktok.com/@familia/video/7412345678901234567"
+    )
     # Las fotos viajan como rutas públicas, nunca como claves de
     # almacenamiento.
     assert item["photoUrls"] == [
@@ -414,3 +432,100 @@ async def test_community_endpoints_404_on_a_missing_home():
 
     assert listing.status_code == 404
     assert complaint.status_code == 404
+
+
+# CHG-201 — DEC-201-01: el enlace del vídeo solo puede ser de TikTok.
+# Sin esta puerta, el campo sería un canal para publicar cualquier
+# enlace junto a un medio para recibir dinero (CHG-182).
+@pytest.mark.parametrize(
+    "enlace",
+    [
+        "https://www.tiktok.com/@familia/video/7412345678901234567",
+        "https://vm.tiktok.com/ZM6abcdef/",
+        "https://vt.tiktok.com/ZS8abcdef/",
+        "https://m.tiktok.com/v/7412345678901234567.html",
+    ],
+)
+def test_tiktok_links_are_accepted(enlace):
+    assert normalized_tiktok_url(enlace) == enlace
+
+
+@pytest.mark.parametrize(
+    "enlace",
+    [
+        "http://www.tiktok.com/@familia/video/74123",  # sin https
+        "https://tiktok.com.malicioso.example/video/1",  # anfitrión ajeno
+        "https://www.youtube.com/watch?v=abc",
+        "https://malicioso.example/phishing",
+        "https://www.tiktok.com@malicioso.example/video/1",  # credenciales
+        "javascript:alert(1)",
+    ],
+)
+def test_everything_that_is_not_tiktok_is_rejected(enlace):
+    with pytest.raises(ValueError):
+        normalized_tiktok_url(enlace)
+
+
+def test_an_empty_video_link_means_no_video():
+    assert normalized_tiktok_url(None) is None
+    assert normalized_tiktok_url("") is None
+    assert normalized_tiktok_url("   ") is None
+
+
+# CHG-202 — La dueña elimina su casita; nadie más puede.
+@pytest.mark.anyio
+async def test_owner_deletes_her_damaged_home():
+    repository = FakeDamagedHomesRepository()
+    storage = FakeStorage()
+    app = homes_app(repository=repository, storage=storage)
+
+    response = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/me/damaged-homes/{HOME_ID}",
+        headers={
+            "X-Actor-Kind": "authenticated",
+            "X-Account-Id": str(OWNER_ID),
+        },
+    )
+
+    assert response.status_code == 204
+    # Los binarios de sus fotos salen del almacén con ella.
+    assert storage.deleted == [
+        "casitas/original.jpg",
+        "casitas/derivada.jpg",
+    ]
+
+
+@pytest.mark.anyio
+async def test_deleting_a_damaged_home_is_only_for_its_owner():
+    repository = FakeDamagedHomesRepository()
+    app = homes_app(repository=repository)
+
+    ajena = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/me/damaged-homes/{HOME_ID}",
+        headers={
+            "X-Actor-Kind": "authenticated",
+            "X-Account-Id": str(VISITOR_ID),
+        },
+    )
+    inexistente = await request_app(
+        app,
+        "DELETE",
+        f"/internal/v1/me/damaged-homes/{uuid4()}",
+        headers={
+            "X-Actor-Kind": "authenticated",
+            "X-Account-Id": str(OWNER_ID),
+        },
+    )
+    sin_sesion = await request_app(
+        app, "DELETE", f"/internal/v1/me/damaged-homes/{HOME_ID}"
+    )
+
+    # Ajena e inexistente responden IGUAL: no se delata cuál existe.
+    assert ajena.status_code == 404
+    assert inexistente.status_code == 404
+    assert ajena.json()["detail"] == inexistente.json()["detail"]
+    assert sin_sesion.status_code == 401

@@ -1,6 +1,7 @@
 import re
 from datetime import date, datetime
 from typing import Literal
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import (
@@ -2494,6 +2495,46 @@ DamagedHomeDonationChannel = Literal[
 ]
 
 
+# CHG-201 — DEC-201-01: el vídeo de la casita solo puede apuntar a
+# TikTok, y por https. Sin esta lista cerrada el campo sería un canal
+# para publicar cualquier enlace junto a un medio para recibir dinero
+# (CHG-182), que es la mitad que le falta a una estafa.
+DAMAGED_HOME_VIDEO_HOSTS = frozenset(
+    {
+        "tiktok.com",
+        "www.tiktok.com",
+        "m.tiktok.com",
+        "vm.tiktok.com",
+        "vt.tiktok.com",
+    }
+)
+
+
+def normalized_tiktok_url(value: str | None) -> str | None:
+    """Devuelve la URL limpia, o lanza ValueError si no es de TikTok.
+
+    Acepta None y la cadena vacía como «no hay vídeo».
+    """
+    if value is None:
+        return None
+    limpio = value.strip()
+    if not limpio:
+        return None
+    partes = urlsplit(limpio)
+    if partes.scheme != "https":
+        raise ValueError("el enlace del vídeo debe empezar por https://")
+    # `hostname` ya viene en minúsculas y sin puerto ni credenciales;
+    # comparar contra netloc dejaría pasar «tiktok.com@malicioso».
+    if partes.hostname not in DAMAGED_HOME_VIDEO_HOSTS:
+        raise ValueError(
+            "el enlace del vídeo debe ser de TikTok "
+            "(tiktok.com, vm.tiktok.com o vt.tiktok.com)"
+        )
+    if partes.username or partes.password:
+        raise ValueError("el enlace del vídeo no puede llevar credenciales")
+    return limpio
+
+
 class DamagedHomeReportInput(ApiModel):
     model_config = ConfigDict(
         alias_generator=to_camel,
@@ -2517,6 +2558,13 @@ class DamagedHomeReportInput(ApiModel):
     donation_reference: str | None = Field(
         default=None, min_length=4, max_length=60
     )
+    # CHG-201: enlace opcional a un vídeo de TikTok (DEC-201-01).
+    video_url: str | None = Field(default=None, max_length=300)
+
+    @field_validator("video_url")
+    @classmethod
+    def _video_is_tiktok(cls, value: str | None) -> str | None:
+        return normalized_tiktok_url(value)
 
     @model_validator(mode="after")
     def _coordinates_pair(self):
@@ -2563,6 +2611,9 @@ class ActiveDamagedHome(ApiModel):
     household_size: int | None = Field(default=None, ge=1, le=60)
     donation_channel: DamagedHomeDonationChannel | None = None
     donation_reference: str | None = Field(default=None, max_length=60)
+    # CHG-201: vídeo de TikTok, si la familia lo dejó. Público, como las
+    # fotos: lo ve cualquiera que abra la ficha, con cuenta o sin ella.
+    video_url: str | None = Field(default=None, max_length=300)
     created_at: datetime
     updated_at: datetime
     # Rutas relativas de las fotografías públicas (derivadas, sin EXIF).

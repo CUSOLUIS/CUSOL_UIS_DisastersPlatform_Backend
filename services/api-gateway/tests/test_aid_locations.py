@@ -1263,3 +1263,62 @@ async def test_marking_comments_seen_travels_with_the_account():
         f"/internal/v1/me/damaged-homes/{HOME_ID}/comments-seen"
     )
 
+
+
+# CHG-202 — La dueña elimina su casita: mutación con sesión, así que
+# pasa por la comprobación de origen y la cuenta sale de la cookie.
+@pytest.mark.anyio
+async def test_deleting_own_damaged_home_carries_the_session_account():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["account"] = request.headers.get("x-account-id")
+        return httpx.Response(204)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    sin_sesion = await request_gateway(
+        app, "DELETE", f"/api/v1/me/damaged-homes/{HOME_ID}"
+    )
+    con_sesion = await request_gateway(
+        app,
+        "DELETE",
+        f"/api/v1/me/damaged-homes/{HOME_ID}",
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert sin_sesion.status_code == 401
+    assert con_sesion.status_code == 204
+    assert seen["method"] == "DELETE"
+    assert seen["path"] == f"/internal/v1/me/damaged-homes/{HOME_ID}"
+    assert seen["account"] is not None
+
+
+@pytest.mark.anyio
+async def test_deleting_own_damaged_home_rejects_a_foreign_origin():
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append(request.url.path)
+        return httpx.Response(204)
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+
+    response = await request_gateway(
+        app,
+        "DELETE",
+        f"/api/v1/me/damaged-homes/{HOME_ID}",
+        headers={"Origin": "https://malicioso.example"},
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+
+    assert response.status_code == 403
+    assert calls == []

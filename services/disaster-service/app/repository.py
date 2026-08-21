@@ -2380,6 +2380,8 @@ class PostgresDisasterRepository:
         household_size: int | None = None,
         donation_channel: str | None = None,
         donation_reference: str | None = None,
+        # CHG-201: enlace al vídeo de TikTok, ya validado por el modelo.
+        video_url: str | None = None,
     ) -> tuple[dict, bool]:
         async with self._pool.acquire() as connection:
             async with connection.transaction():
@@ -2389,10 +2391,11 @@ class PostgresDisasterRepository:
                         id, idempotency_key, account_id, description,
                         department, municipality, address, latitude,
                         longitude, public_code, household_size,
-                        donation_channel, donation_reference
+                        donation_channel, donation_reference,
+                        video_url
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                        $12, $13
+                        $12, $13, $14
                     )
                     ON CONFLICT (idempotency_key) DO NOTHING
                     RETURNING id, public_code, created_at
@@ -2410,6 +2413,7 @@ class PostgresDisasterRepository:
                     household_size,
                     donation_channel,
                     donation_reference,
+                    video_url,
                 )
                 if row is None:
                     existing = await connection.fetchrow(
@@ -4368,6 +4372,7 @@ class PostgresDisasterRepository:
         h.id, h.public_code, h.description, h.department,
         h.municipality, h.address, h.latitude, h.longitude,
         h.household_size, h.donation_channel, h.donation_reference,
+        h.video_url,
         h.created_at, h.updated_at,
         ( SELECT ROUND(AVG(c.rating)::numeric, 1)::float8
           FROM disaster_service.aid_location_comments c
@@ -4693,6 +4698,46 @@ class PostgresDisasterRepository:
                     None,
                 )
         return 1
+
+    # CHG-202 — La dueña borra su propia casita. Mismo borrado que el
+    # administrativo, con la puerta de propiedad AQUÍ y no solo en el
+    # gateway: una casita ajena no se distingue de una inexistente.
+    async def delete_own_damaged_home(
+        self, damaged_home_id: UUID, account_id: UUID
+    ) -> list[str] | None:
+        """Devuelve las claves de foto a limpiar, o None si no es suya.
+
+        Comentarios, denuncias y filas de fotos caen por CASCADE, igual
+        que en el borrado administrativo; los binarios los limpia la
+        capa HTTP con las claves devueltas.
+        """
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                keys = await connection.fetch(
+                    """
+                    SELECT object_key, derived_object_key
+                    FROM disaster_service.damaged_home_report_photos
+                    WHERE report_id = $1
+                    """,
+                    damaged_home_id,
+                )
+                deleted = await connection.fetchval(
+                    """
+                    DELETE FROM disaster_service.damaged_home_reports
+                    WHERE id = $1 AND account_id = $2
+                    RETURNING id
+                    """,
+                    damaged_home_id,
+                    account_id,
+                )
+                if deleted is None:
+                    return None
+                return [
+                    key
+                    for row in keys
+                    for key in (row["object_key"], row["derived_object_key"])
+                    if key
+                ]
 
     async def admin_delete_damaged_home(
         self,

@@ -2933,6 +2933,9 @@ def create_app(
                     if payload.donation_reference
                     else None
                 ),
+                # CHG-201: el modelo ya lo validó contra la lista de
+                # anfitriones de TikTok; aquí solo se guarda.
+                video_url=payload.video_url,
             )
         except asyncpg.PostgresError:
             cleanup()
@@ -3356,6 +3359,7 @@ def create_app(
             household_size=row.get("household_size"),
             donation_channel=row.get("donation_channel"),
             donation_reference=row.get("donation_reference"),
+            video_url=row.get("video_url"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             photo_urls=[
@@ -3607,6 +3611,44 @@ def create_app(
             under_observation=result["under_observation"],
             disabled=result["disabled"],
         )
+
+    # CHG-202 — La dueña elimina su propia casita. Reutiliza el borrado
+    # del super_admin: comentarios, denuncias y fotos caen por CASCADE y
+    # los binarios salen del almacén. La casita no expira sola, así que
+    # este es su único camino de salida sin pedírselo a nadie.
+    @application.delete(
+        "/internal/v1/me/damaged-homes/{damaged_home_id}",
+        status_code=204,
+        tags=["BuildingReports"],
+    )
+    async def delete_own_damaged_home(
+        damaged_home_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401,
+                "Sesión requerida",
+                "Eliminar una casita exige la cuenta que la publicó.",
+            )
+        keys = await data.delete_own_damaged_home(damaged_home_id, account_id)
+        if keys is None:
+            # Ajena o inexistente: misma respuesta a propósito.
+            return problem(
+                404,
+                "Casita no disponible",
+                "La casita no existe o no es tuya.",
+            )
+        for key in keys:
+            object_storage.delete(key)
+        from fastapi.responses import Response as RawResponse
+
+        return RawResponse(status_code=204)
 
     @application.get(
         "/internal/v1/me/damaged-homes",
