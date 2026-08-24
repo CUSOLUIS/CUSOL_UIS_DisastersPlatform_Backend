@@ -778,6 +778,20 @@ class FoodOfferDeleteReceipt(ApiModel):
     deleted: int = Field(ge=0)
 
 
+# CHG-205 — Constancia de la denuncia a una oferta de alojamiento.
+# Gemela de la de comida: el alojamiento tampoco tiene estado operativo,
+# así que «deshabilitada» significa que deja de publicarse.
+class ShelterOfferReportReceipt(ApiModel):
+    shelter_offer_id: UUID
+    reports_count: int = Field(ge=1)
+    under_observation: bool
+    disabled: bool = False
+
+
+class ShelterOfferDeleteReceipt(ApiModel):
+    deleted: int = Field(ge=0)
+
+
 # CHG-180 — Constancia de la denuncia a una solicitud de ayuda. Misma
 # forma que la del acopio y la de la oferta, con su propio
 # identificador: la solicitud es efímera, así que «deshabilitada»
@@ -1970,6 +1984,121 @@ class ActiveFoodOffer(ApiModel):
 
 class FoodOfferPage(ApiModel):
     items: list[ActiveFoodOffer] = Field(max_length=50)
+    total: int = Field(ge=0)
+    generated_at: datetime
+
+
+# CHG-205 — «Ofrecer alojamiento temporal»: gemela de la oferta de
+# comida. Mismos límites de texto y vigencia; se le suman los datos que
+# solo tienen sentido en una casa que se abre.
+SHELTER_OFFER_MIN_HOURS = FOOD_OFFER_MIN_HOURS
+SHELTER_OFFER_MAX_HOURS = FOOD_OFFER_MAX_HOURS
+SHELTER_OFFER_MIN_DISTINCT_WORDS = FOOD_OFFER_MIN_DISTINCT_WORDS
+SHELTER_OFFER_MIN_SPACES = 1
+SHELTER_OFFER_MAX_SPACES = 1000
+SHELTER_OFFER_MAX_ACCESSIBILITY_NOTES = 500
+
+
+class ShelterOfferInput(ApiModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        serialize_by_alias=True,
+        extra="forbid",
+    )
+
+    description: str = Field(min_length=10, max_length=1000)
+    address: str = Field(min_length=5, max_length=300)
+    # Igual que en la oferta de comida: la dirección escrita basta y las
+    # coordenadas viajan juntas o no viajan.
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    duration_hours: int = Field(
+        ge=SHELTER_OFFER_MIN_HOURS, le=SHELTER_OFFER_MAX_HOURS
+    )
+    notification_radius_km: int | None = Field(default=None, ge=1, le=100)
+    # Cuántas personas pueden dormir.
+    spaces_available: int = Field(
+        ge=SHELTER_OFFER_MIN_SPACES, le=SHELTER_OFFER_MAX_SPACES
+    )
+    # Si el espacio se comparte. Obligatorio a propósito: no tener
+    # respuesta es peor que cualquiera de las dos.
+    shared_space: bool
+    accepts_pets: bool = False
+    accessibility_notes: str | None = Field(
+        default=None, max_length=SHELTER_OFFER_MAX_ACCESSIBILITY_NOTES
+    )
+
+    @model_validator(mode="after")
+    def _coordinates_pair(self):
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError(
+                "latitude y longitude deben enviarse juntas o ambas "
+                "ausentes"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _radius_needs_coordinates(self):
+        if self.notification_radius_km is not None and self.latitude is None:
+            raise ValueError(
+                "notificationRadiusKm exige latitude y longitude: sin "
+                "punto no hay distancias que medir"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _description_is_readable(self):
+        try:
+            validate_community_text(
+                self.description,
+                "description",
+                min_distinct_words=SHELTER_OFFER_MIN_DISTINCT_WORDS,
+            )
+        except TextQualityError as error:
+            raise ValueError(str(error)) from error
+        return self
+
+    @model_validator(mode="after")
+    def _accessibility_notes_not_blank(self):
+        # Una nota en blanco es ruido: se trata como ausencia.
+        if self.accessibility_notes is not None:
+            cleaned = self.accessibility_notes.strip()
+            self.accessibility_notes = cleaned or None
+        return self
+
+
+class ShelterOfferReceipt(ApiModel):
+    id: UUID
+    public_code: str
+    status: Literal["active"]
+    received_at: datetime
+    expires_at: datetime
+
+
+class ActiveShelterOffer(ApiModel):
+    id: UUID
+    description: str
+    address: str
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    notification_radius_km: int | None = Field(default=None, ge=1, le=100)
+    spaces_available: int = Field(
+        ge=SHELTER_OFFER_MIN_SPACES, le=SHELTER_OFFER_MAX_SPACES
+    )
+    shared_space: bool
+    accepts_pets: bool = False
+    accessibility_notes: str | None = None
+    created_at: datetime
+    expires_at: datetime
+    # Como en la oferta de comida (CHG-176): el mapa fusiona en cliente,
+    # así que la puntuación viaja con la oferta.
+    comment_rating_average: float | None = Field(default=None, ge=1, le=5)
+    comment_rating_count: int = Field(default=0, ge=0)
+
+
+class ShelterOfferPage(ApiModel):
+    items: list[ActiveShelterOffer] = Field(max_length=50)
     total: int = Field(ge=0)
     generated_at: datetime
 

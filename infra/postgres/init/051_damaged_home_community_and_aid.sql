@@ -50,15 +50,33 @@ ALTER TABLE disaster_service.aid_location_comments
         REFERENCES disaster_service.damaged_home_reports(id)
         ON DELETE CASCADE;
 
-ALTER TABLE disaster_service.aid_location_comments
-    DROP CONSTRAINT IF EXISTS aid_location_comment_single_target;
-ALTER TABLE disaster_service.aid_location_comments
-    ADD CONSTRAINT aid_location_comment_single_target
-    CHECK (
-        num_nonnulls(
-            location_id, food_offer_id, help_request_id, damaged_home_id
-        ) = 1
-    );
+-- CHG-205: misma cautela que CHG-204 impuso a 048 y 050, ahora aplicada
+-- a esta. 054 amplía la restricción a CINCO objetivos (añade el
+-- alojamiento temporal); si esta migración volviera a imponer la de
+-- CUATRO cuando ya existe un comentario o una denuncia sobre un
+-- alojamiento, la dejaría caída y el despliegue moriría aquí. La
+-- presencia de `shelter_offer_id` dice que 054 ya pasó.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'disaster_service'
+          AND table_name = 'aid_location_comments'
+          AND column_name = 'shelter_offer_id'
+    ) THEN
+        ALTER TABLE disaster_service.aid_location_comments
+            DROP CONSTRAINT IF EXISTS aid_location_comment_single_target;
+        ALTER TABLE disaster_service.aid_location_comments
+            ADD CONSTRAINT aid_location_comment_single_target
+            CHECK (
+                num_nonnulls(
+                    location_id, food_offer_id, help_request_id,
+                    damaged_home_id
+                ) = 1
+            );
+    END IF;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS aid_location_comments_damaged_home_idx
     ON disaster_service.aid_location_comments
@@ -70,15 +88,33 @@ ALTER TABLE disaster_service.aid_location_reports
         REFERENCES disaster_service.damaged_home_reports(id)
         ON DELETE CASCADE;
 
-ALTER TABLE disaster_service.aid_location_reports
-    DROP CONSTRAINT IF EXISTS aid_location_report_single_target;
-ALTER TABLE disaster_service.aid_location_reports
-    ADD CONSTRAINT aid_location_report_single_target
-    CHECK (
-        num_nonnulls(
-            location_id, food_offer_id, help_request_id, damaged_home_id
-        ) = 1
-    );
+-- CHG-205: misma cautela que CHG-204 impuso a 048 y 050, ahora aplicada
+-- a esta. 054 amplía la restricción a CINCO objetivos (añade el
+-- alojamiento temporal); si esta migración volviera a imponer la de
+-- CUATRO cuando ya existe un comentario o una denuncia sobre un
+-- alojamiento, la dejaría caída y el despliegue moriría aquí. La
+-- presencia de `shelter_offer_id` dice que 054 ya pasó.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'disaster_service'
+          AND table_name = 'aid_location_reports'
+          AND column_name = 'shelter_offer_id'
+    ) THEN
+        ALTER TABLE disaster_service.aid_location_reports
+            DROP CONSTRAINT IF EXISTS aid_location_report_single_target;
+        ALTER TABLE disaster_service.aid_location_reports
+            ADD CONSTRAINT aid_location_report_single_target
+            CHECK (
+                num_nonnulls(
+                    location_id, food_offer_id, help_request_id,
+                    damaged_home_id
+                ) = 1
+            );
+    END IF;
+END
+$$;
 
 CREATE UNIQUE INDEX IF NOT EXISTS damaged_home_report_live_denouncer_idx
     ON disaster_service.aid_location_reports

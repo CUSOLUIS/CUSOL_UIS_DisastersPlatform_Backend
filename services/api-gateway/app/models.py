@@ -471,6 +471,17 @@ class FoodOfferReportReceipt(ApiModel):
     disabled: bool = False
 
 
+class ShelterOfferReportReceipt(ApiModel):
+    shelter_offer_id: UUID
+    reports_count: int = Field(ge=1)
+    under_observation: bool
+    disabled: bool = False
+
+
+class ShelterOfferDeleteReceipt(ApiModel):
+    deleted: int = Field(ge=0)
+
+
 class FoodOfferDeleteReceipt(ApiModel):
     deleted: int = Field(ge=0)
 
@@ -1081,6 +1092,40 @@ class ActiveFoodOffer(ApiModel):
 
 class FoodOfferPage(ApiModel):
     items: list[ActiveFoodOffer] = Field(max_length=50)
+    total: int = Field(ge=0)
+    generated_at: datetime
+
+
+# CHG-205 — «Ofrecer alojamiento temporal»: espejo de la oferta de
+# comida con los campos propios de una casa que se abre.
+class ShelterOfferReceipt(ApiModel):
+    id: UUID
+    public_code: str
+    status: Literal["active"]
+    received_at: datetime
+    expires_at: datetime
+
+
+class ActiveShelterOffer(ApiModel):
+    id: UUID
+    description: str
+    address: str
+    # Null cuando la oferta llegó solo con dirección escrita.
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    notification_radius_km: int | None = Field(default=None, ge=1, le=100)
+    spaces_available: int = Field(ge=1, le=1000)
+    shared_space: bool
+    accepts_pets: bool = False
+    accessibility_notes: str | None = None
+    created_at: datetime
+    expires_at: datetime
+    comment_rating_average: float | None = Field(default=None, ge=1, le=5)
+    comment_rating_count: int = Field(default=0, ge=0)
+
+
+class ShelterOfferPage(ApiModel):
+    items: list[ActiveShelterOffer] = Field(max_length=50)
     total: int = Field(ge=0)
     generated_at: datetime
 

@@ -7152,6 +7152,419 @@ class PostgresDisasterRepository:
         )
         return [dict(row) for row in rows], int(total)
 
+    # ------------------------------------------------------------------
+    # CHG-205 — «Ofrecer alojamiento temporal»: gemela de la oferta de
+    # comida (CHG-163/176). Mismo camino de código —creación idempotente,
+    # listado por vigencia, comentarios con estrellas, denuncias con sus
+    # umbrales y borrado administrativo— sobre la tabla propia
+    # `shelter_offers` y el QUINTO objetivo de las tablas comunitarias.
+    # ------------------------------------------------------------------
+
+    async def list_shelter_offer_comments(
+        self, *, shelter_offer_id: UUID, limit: int
+    ) -> dict | None:
+        """Comentarios públicos de la oferta, los más recientes primero.
+
+        None si la oferta no existe.
+        """
+        async with self._pool.acquire() as connection:
+            exists = await connection.fetchval(
+                "SELECT 1 FROM disaster_service.shelter_offers WHERE id = $1",
+                shelter_offer_id,
+            )
+            if exists is None:
+                return None
+            rows = await connection.fetch(
+                """
+                SELECT id, account_id, author_display_name,
+                       actor_kind::text AS actor_kind, content, rating,
+                       created_at
+                FROM disaster_service.aid_location_comments
+                WHERE shelter_offer_id = $1
+                ORDER BY created_at DESC, id DESC
+                LIMIT $2
+                """,
+                shelter_offer_id,
+                limit,
+            )
+            total = int(
+                await connection.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM disaster_service.aid_location_comments
+                    WHERE shelter_offer_id = $1
+                    """,
+                    shelter_offer_id,
+                )
+            )
+            aggregate = await connection.fetchrow(
+                """
+                SELECT ROUND(AVG(rating)::numeric, 1)::float8 AS average,
+                       COUNT(rating) AS count
+                FROM disaster_service.aid_location_comments
+                WHERE shelter_offer_id = $1 AND rating IS NOT NULL
+                """,
+                shelter_offer_id,
+            )
+        return {
+            "items": [dict(row) for row in rows],
+            "total": total,
+            "rating_average": aggregate["average"],
+            "rating_count": int(aggregate["count"]),
+        }
+
+    async def create_shelter_offer_comment(
+        self,
+        *,
+        idempotency_key: str,
+        shelter_offer_id: UUID,
+        actor_kind: str,
+        account_id: UUID | None,
+        author_display_name: str | None,
+        content: str,
+        rating: int,
+    ) -> dict | None:
+        """Publica un comentario con estrellas, anónimo o con cuenta."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                exists = await connection.fetchval(
+                    "SELECT 1 FROM disaster_service.shelter_offers "
+                    "WHERE id = $1",
+                    shelter_offer_id,
+                )
+                if exists is None:
+                    return None
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO disaster_service.aid_location_comments (
+                        idempotency_key, shelter_offer_id, account_id,
+                        author_display_name, actor_kind, content, rating
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                    RETURNING id, account_id, author_display_name,
+                              actor_kind::text AS actor_kind, content,
+                              rating, created_at
+                    """,
+                    idempotency_key,
+                    shelter_offer_id,
+                    account_id,
+                    author_display_name,
+                    actor_kind,
+                    content,
+                    rating,
+                )
+                if row is None:
+                    row = await connection.fetchrow(
+                        """
+                        SELECT id, account_id, author_display_name,
+                               actor_kind::text AS actor_kind, content,
+                               rating, created_at
+                        FROM disaster_service.aid_location_comments
+                        WHERE idempotency_key = $1
+                        """,
+                        idempotency_key,
+                    )
+        return dict(row) if row is not None else None
+
+    async def create_shelter_offer_report(
+        self,
+        *,
+        idempotency_key: str,
+        shelter_offer_id: UUID,
+        actor_kind: str,
+        account_id: UUID | None,
+        denouncer_key: str,
+        reason_encrypted: bytes | None,
+        reason_category: str,
+    ) -> dict | None:
+        """Denuncia una oferta, con los mismos umbrales que un acopio.
+
+        Un mismo denunciante no cuenta dos veces dentro del ciclo vivo.
+        Al llegar al umbral de deshabilitación la oferta deja de
+        publicarse: en algo efímero no hay estado que reactivar, así que
+        «en observación» se informa pero no persiste columna.
+        """
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                # Se bloquea la oferta para serializar el conteo.
+                target = await connection.fetchrow(
+                    """
+                    SELECT id, disabled_at
+                    FROM disaster_service.shelter_offers
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    shelter_offer_id,
+                )
+                if target is None:
+                    return None
+                await connection.execute(
+                    """
+                    INSERT INTO disaster_service.aid_location_reports (
+                        idempotency_key, shelter_offer_id, actor_kind,
+                        account_id, denouncer_key, reason_encrypted,
+                        reason_category
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    -- El predicado debe coincidir EXACTAMENTE con el
+                    -- del índice parcial, o Postgres no lo infiere.
+                    ON CONFLICT (shelter_offer_id, denouncer_key)
+                        WHERE archived_at IS NULL
+                          AND shelter_offer_id IS NOT NULL
+                        DO NOTHING
+                    """,
+                    idempotency_key,
+                    shelter_offer_id,
+                    actor_kind,
+                    account_id,
+                    denouncer_key,
+                    reason_encrypted,
+                    reason_category,
+                )
+                reporters = int(
+                    await connection.fetchval(
+                        """
+                        SELECT COUNT(*)
+                        FROM disaster_service.aid_location_reports
+                        WHERE shelter_offer_id = $1
+                          AND archived_at IS NULL
+                          AND moderation_status <> 'rejected'
+                        """,
+                        shelter_offer_id,
+                    )
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.community_contribution_audit (
+                        event_type, contribution_kind, contribution_id,
+                        detail
+                    ) VALUES ($1, $2, $3, $4)
+                    """,
+                    "shelter_offer_reported",
+                    "shelter_offer",
+                    shelter_offer_id,
+                    f"denuncias_vivas={reporters} categoria={reason_category}",
+                )
+                disabled = target["disabled_at"] is not None
+                if (
+                    reporters >= AID_LOCATION_DISABLE_THRESHOLD
+                    and target["disabled_at"] is None
+                ):
+                    await connection.execute(
+                        """
+                        UPDATE disaster_service.shelter_offers
+                        SET disabled_at = NOW()
+                        WHERE id = $1
+                        """,
+                        shelter_offer_id,
+                    )
+                    disabled = True
+                    await connection.execute(
+                        """
+                        INSERT INTO
+                            disaster_service.community_contribution_audit (
+                            event_type, contribution_kind,
+                            contribution_id, detail
+                        ) VALUES ($1, $2, $3, $4)
+                        """,
+                        "shelter_offer_disabled_by_reports",
+                        "shelter_offer",
+                        shelter_offer_id,
+                        f"denuncias_vivas={reporters}",
+                    )
+        return {
+            "reports_count": reporters,
+            "under_observation": (
+                reporters >= AID_LOCATION_REPORT_THRESHOLD and not disabled
+            ),
+            "disabled": disabled,
+        }
+
+    async def admin_delete_shelter_offer_comment(
+        self,
+        *,
+        shelter_offer_id: UUID,
+        comment_id: UUID,
+        actor_account_id: UUID,
+        actor_display_name: str,
+    ) -> int:
+        """Borra un comentario suelto de la oferta y lo audita."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                deleted = await connection.fetchval(
+                    """
+                    DELETE FROM disaster_service.aid_location_comments
+                    WHERE id = $1 AND shelter_offer_id = $2
+                    RETURNING id
+                    """,
+                    comment_id,
+                    shelter_offer_id,
+                )
+                if deleted is None:
+                    return 0
+                await self._admin_audit(
+                    connection,
+                    actor_account_id,
+                    actor_display_name,
+                    "shelter_offer_comment_deleted",
+                    "shelter_offer_comment",
+                    comment_id,
+                    "success",
+                    None,
+                    ["deleted"],
+                    None,
+                )
+        return 1
+
+    async def admin_delete_shelter_offer(
+        self,
+        *,
+        shelter_offer_id: UUID,
+        actor_account_id: UUID,
+        actor_display_name: str,
+    ) -> int:
+        """Borra la oferta entera; comentarios y denuncias caen por
+        CASCADE, igual que al borrar un acopio."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                deleted = await connection.fetchval(
+                    """
+                    DELETE FROM disaster_service.shelter_offers
+                    WHERE id = $1
+                    RETURNING id
+                    """,
+                    shelter_offer_id,
+                )
+                if deleted is None:
+                    return 0
+                await self._admin_audit(
+                    connection,
+                    actor_account_id,
+                    actor_display_name,
+                    "shelter_offer_deleted",
+                    "shelter_offer",
+                    shelter_offer_id,
+                    "success",
+                    None,
+                    ["deleted"],
+                    None,
+                )
+        return 1
+
+    async def create_shelter_offer(
+        self,
+        *,
+        idempotency_key: str,
+        public_code: str,
+        reporter_account_id: UUID | None,
+        description: str,
+        address: str,
+        latitude: float | None,
+        longitude: float | None,
+        notification_radius_km: int | None,
+        duration_hours: int,
+        spaces_available: int,
+        shared_space: bool,
+        accepts_pets: bool,
+        accessibility_notes: str | None,
+    ) -> tuple[dict, bool]:
+        """Inserta la oferta calculando expires_at en servidor.
+
+        El reintento con la misma Idempotency-Key devuelve la fila
+        original con created=False (mismo pacto que los reportes).
+        """
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO disaster_service.shelter_offers (
+                idempotency_key, public_code, reporter_account_id,
+                description, address, latitude, longitude,
+                notification_radius_km, duration_hours,
+                spaces_available, shared_space, accepts_pets,
+                accessibility_notes, expires_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                $10, $11, $12, $13,
+                NOW() + make_interval(hours => $9)
+            )
+            ON CONFLICT (idempotency_key) DO NOTHING
+            RETURNING id, public_code, created_at, expires_at
+            """,
+            idempotency_key,
+            public_code,
+            reporter_account_id,
+            description,
+            address,
+            latitude,
+            longitude,
+            notification_radius_km,
+            duration_hours,
+            spaces_available,
+            shared_space,
+            accepts_pets,
+            accessibility_notes,
+        )
+        if row is not None:
+            return dict(row), True
+        existing = await self._pool.fetchrow(
+            """
+            SELECT id, public_code, created_at, expires_at
+            FROM disaster_service.shelter_offers
+            WHERE idempotency_key = $1
+            """,
+            idempotency_key,
+        )
+        return dict(existing), False
+
+    async def list_active_shelter_offers(
+        self,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict], int]:
+        rows = await self._pool.fetch(
+            """
+            SELECT
+                so.id,
+                so.description,
+                so.address,
+                so.latitude,
+                so.longitude,
+                so.notification_radius_km,
+                so.spaces_available,
+                so.shared_space,
+                so.accepts_pets,
+                so.accessibility_notes,
+                so.created_at,
+                so.expires_at,
+                -- CHG-176: la puntuación viaja con la oferta porque el
+                -- mapa las fusiona en cliente; el mismo cálculo que
+                -- usan los acopios.
+                ( SELECT ROUND(AVG(c.rating)::numeric, 1)::float8
+                  FROM disaster_service.aid_location_comments c
+                  WHERE c.shelter_offer_id = so.id AND c.rating IS NOT NULL
+                ) AS comment_rating_average,
+                ( SELECT COUNT(*)
+                  FROM disaster_service.aid_location_comments c
+                  WHERE c.shelter_offer_id = so.id AND c.rating IS NOT NULL
+                ) AS comment_rating_count
+            FROM disaster_service.shelter_offers so
+            -- CHG-176: una oferta deshabilitada por denuncias deja de
+            -- publicarse, igual que un acopio sale del mapa.
+            WHERE so.expires_at > NOW() AND so.disabled_at IS NULL
+            ORDER BY so.created_at DESC, so.id DESC
+            LIMIT $1 OFFSET $2
+            """,
+            limit,
+            offset,
+        )
+        total = await self._pool.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM disaster_service.shelter_offers
+            WHERE expires_at > NOW() AND disabled_at IS NULL
+            """
+        )
+        return [dict(row) for row in rows], int(total)
+
     async def attend_help_request(
         self,
         request_id: UUID,

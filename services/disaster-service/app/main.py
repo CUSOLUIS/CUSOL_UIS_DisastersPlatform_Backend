@@ -84,6 +84,8 @@ from .models import (
     AidLocationCommentDeleteReceipt,
     FoodOfferDeleteReceipt,
     FoodOfferReportReceipt,
+    ShelterOfferReportReceipt,
+    ShelterOfferDeleteReceipt,
     AdminAidLocationActionReceipt,
     AdminAidLocationDeleteReceipt,
     AdminAidLocationSummary,
@@ -153,6 +155,10 @@ from .models import (
     ActiveFoodOffer,
     FoodOfferInput,
     FoodOfferPage,
+    ShelterOfferInput,
+    ShelterOfferReceipt,
+    ActiveShelterOffer,
+    ShelterOfferPage,
     FoodOfferReceipt,
 )
 from .photos import (
@@ -265,6 +271,11 @@ def generate_help_request_code(now: datetime) -> str:
 def generate_food_offer_code(now: datetime) -> str:
     """Código público de oferta de comida (CHG-163)."""
     return f"FO-{now.year}-{secrets.token_hex(4).upper()}"
+
+
+def generate_shelter_offer_code(now: datetime) -> str:
+    """Código público de oferta de alojamiento temporal (CHG-205)."""
+    return f"AL-{now.year}-{secrets.token_hex(4).upper()}"
 
 
 def generate_damaged_home_code(now: datetime) -> str:
@@ -5152,6 +5163,333 @@ def create_app(
                     created_at=row["created_at"],
                     expires_at=row["expires_at"],
                     # CHG-176: sin esto la puntuación se quedaba en la
+                    # consulta y nunca llegaba al mapa.
+                    comment_rating_average=row.get(
+                        "comment_rating_average"
+                    ),
+                    comment_rating_count=row.get("comment_rating_count")
+                    or 0,
+                )
+                for row in rows
+            ],
+            total=total,
+            generated_at=datetime.now(UTC),
+        )
+
+    # ------------------------------------------------------------------
+    # CHG-205 — «Ofrecer alojamiento temporal»: las mismas rutas que la
+    # oferta de comida, sobre su propia tabla. Anónimo permitido,
+    # vigencia en servidor y comunidad completa.
+    # ------------------------------------------------------------------
+
+    @application.get(
+        "/internal/v1/shelter-offers/{shelter_offer_id}/comments",
+        response_model=AidLocationCommentsResponse,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_shelter_offer_comments(
+        shelter_offer_id: UUID,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        limit: int = 50,
+    ):
+        page = await data.list_shelter_offer_comments(
+            shelter_offer_id=shelter_offer_id, limit=max(1, min(limit, 100))
+        )
+        if page is None:
+            return problem(
+                404, "Oferta no disponible", "La oferta no existe."
+            )
+        return AidLocationCommentsResponse(
+            items=[
+                AidLocationComment(
+                    id=row["id"],
+                    author_display_name=row["author_display_name"],
+                    actor_kind=row["actor_kind"],
+                    content=row["content"],
+                    rating=row.get("rating"),
+                    created_at=row["created_at"],
+                )
+                for row in page["items"]
+            ],
+            total=page["total"],
+            rating_average=page["rating_average"],
+            rating_count=page["rating_count"],
+        )
+
+    @application.post(
+        "/internal/v1/shelter-offers/{shelter_offer_id}/comments",
+        status_code=201,
+        response_model=AidLocationComment,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_shelter_offer_comment(
+        shelter_offer_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        author_display_name: str | None = None
+        if actor_kind == "authenticated":
+            display_raw = request.headers.get("x-actor-display", "").strip()
+            if display_raw:
+                try:
+                    author_display_name = (
+                        base64.b64decode(display_raw.encode()).decode()[:161]
+                        or None
+                    )
+                except Exception:
+                    author_display_name = None
+        try:
+            payload = AidLocationCommentInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        try:
+            row = await data.create_shelter_offer_comment(
+                idempotency_key=idempotency_key,
+                shelter_offer_id=shelter_offer_id,
+                actor_kind=actor_kind,
+                account_id=account_id,
+                author_display_name=author_display_name,
+                content=payload.content.strip(),
+                rating=payload.rating,
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible publicar el comentario.",
+            )
+        if row is None:
+            return problem(
+                404, "Oferta no disponible", "La oferta no existe."
+            )
+        return AidLocationComment(
+            id=row["id"],
+            author_display_name=row["author_display_name"],
+            actor_kind=row["actor_kind"],
+            content=row["content"],
+            rating=row.get("rating"),
+            created_at=row["created_at"],
+        )
+
+    @application.post(
+        "/internal/v1/shelter-offers/{shelter_offer_id}/reports",
+        status_code=202,
+        response_model=ShelterOfferReportReceipt,
+        response_model_by_alias=True,
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_shelter_offer_report(
+        shelter_offer_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        denouncer_key = request.headers.get("x-denouncer-key", "").strip()
+        if not denouncer_key:
+            return problem(
+                422,
+                "Denunciante no resuelto",
+                "Falta la clave de denunciante resuelta por el gateway.",
+            )
+        try:
+            payload = AidLocationReportInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        try:
+            result = await data.create_shelter_offer_report(
+                idempotency_key=idempotency_key,
+                shelter_offer_id=shelter_offer_id,
+                actor_kind=actor_kind,
+                account_id=account_id,
+                denouncer_key=denouncer_key,
+                reason_category=payload.category,
+                reason_encrypted=encrypt(payload.reason.strip()),
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible registrar la denuncia.",
+            )
+        if result is None:
+            return problem(
+                404, "Oferta no disponible", "La oferta no existe."
+            )
+        return ShelterOfferReportReceipt(
+            shelter_offer_id=shelter_offer_id,
+            reports_count=result["reports_count"],
+            under_observation=result["under_observation"],
+            disabled=result["disabled"],
+        )
+
+    @application.delete(
+        "/internal/v1/admin/shelter-offers/{shelter_offer_id}/comments"
+        "/{comment_id}",
+        response_model=AidLocationCommentDeleteReceipt,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_delete_shelter_offer_comment(
+        shelter_offer_id: UUID,
+        comment_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display_name = actor
+        deleted = await data.admin_delete_shelter_offer_comment(
+            shelter_offer_id=shelter_offer_id,
+            comment_id=comment_id,
+            actor_account_id=actor_account_id,
+            actor_display_name=actor_display_name,
+        )
+        if deleted == 0:
+            return problem(
+                404,
+                "Comentario no encontrado",
+                "El comentario no existe en esa oferta.",
+            )
+        return AidLocationCommentDeleteReceipt(deleted=deleted)
+
+    @application.delete(
+        "/internal/v1/admin/shelter-offers/{shelter_offer_id}",
+        response_model=ShelterOfferDeleteReceipt,
+        response_model_by_alias=True,
+        tags=["Administration"],
+    )
+    async def admin_delete_shelter_offer(
+        shelter_offer_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        actor = admin_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_account_id, actor_display_name = actor
+        deleted = await data.admin_delete_shelter_offer(
+            shelter_offer_id=shelter_offer_id,
+            actor_account_id=actor_account_id,
+            actor_display_name=actor_display_name,
+        )
+        if deleted == 0:
+            return problem(
+                404, "Oferta no encontrada", "La oferta no existe."
+            )
+        return ShelterOfferDeleteReceipt(deleted=deleted)
+
+    @application.post(
+        "/internal/v1/shelter-offers",
+        status_code=201,
+        response_model=ShelterOfferReceipt,
+        response_model_by_alias=True,
+        tags=["ShelterOffers"],
+    )
+    async def create_shelter_offer(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        idempotency_key = validate_idempotency_key(request)
+        if isinstance(idempotency_key, JSONResponse):
+            return idempotency_key
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        _actor_kind, reporter_account_id = actor
+        try:
+            payload = ShelterOfferInput.model_validate_json(
+                await request.body()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        received_at = datetime.now(UTC)
+        try:
+            row, _created = await data.create_shelter_offer(
+                idempotency_key=idempotency_key,
+                public_code=generate_shelter_offer_code(received_at),
+                reporter_account_id=reporter_account_id,
+                description=payload.description.strip(),
+                address=payload.address.strip(),
+                latitude=payload.latitude,
+                longitude=payload.longitude,
+                notification_radius_km=payload.notification_radius_km,
+                duration_hours=payload.duration_hours,
+                spaces_available=payload.spaces_available,
+                shared_space=payload.shared_space,
+                accepts_pets=payload.accepts_pets,
+                accessibility_notes=payload.accessibility_notes,
+            )
+        except asyncpg.PostgresError:
+            return problem(
+                503,
+                "Registro no disponible",
+                "No fue posible registrar la oferta; ningún dato "
+                "quedó publicado.",
+            )
+        return ShelterOfferReceipt(
+            id=row["id"],
+            public_code=row["public_code"],
+            status="active",
+            received_at=row["created_at"],
+            expires_at=row["expires_at"],
+        )
+
+    @application.get(
+        "/internal/v1/shelter-offers",
+        response_model=ShelterOfferPage,
+        response_model_by_alias=True,
+        tags=["ShelterOffers"],
+    )
+    async def list_active_shelter_offers(
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        if limit not in (10, 25, 50):
+            return problem(
+                422,
+                "Tamaño de página inválido",
+                "El tamaño de página debe ser 10, 25 o 50.",
+            )
+        rows, total = await data.list_active_shelter_offers(limit, offset)
+        return ShelterOfferPage(
+            items=[
+                ActiveShelterOffer(
+                    id=row["id"],
+                    description=row["description"],
+                    address=row["address"],
+                    latitude=row["latitude"],
+                    longitude=row["longitude"],
+                    notification_radius_km=row.get(
+                        "notification_radius_km"
+                    ),
+                    spaces_available=row["spaces_available"],
+                    shared_space=row["shared_space"],
+                    accepts_pets=row["accepts_pets"],
+                    accessibility_notes=row.get("accessibility_notes"),
+                    created_at=row["created_at"],
+                    expires_at=row["expires_at"],
+                    # CHG-205 (heredado de CHG-176): sin esto la puntuación se quedaba en la
                     # consulta y nunca llegaba al mapa.
                     comment_rating_average=row.get(
                         "comment_rating_average"

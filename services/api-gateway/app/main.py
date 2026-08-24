@@ -74,6 +74,8 @@ from .models import (
     AidLocationCommentDeleteReceipt,
     FoodOfferDeleteReceipt,
     FoodOfferReportReceipt,
+    ShelterOfferReportReceipt,
+    ShelterOfferDeleteReceipt,
     HelpRequestReportReceipt,
     AidLocationCommentsResponse,
     AidLocationParentCandidatesResponse,
@@ -113,7 +115,9 @@ from .models import (
     HelpRequestAttendersPage,
     HelpRequestAttendReceipt,
     FoodOfferPage,
+    ShelterOfferPage,
     FoodOfferReceipt,
+    ShelterOfferReceipt,
     HelpRequestPage,
     HelpRequestReceipt,
 )
@@ -308,6 +312,10 @@ def create_app(
     # CHG-163: lectura de ofertas «Ofrecer comida».
     food_offer_read_limiter = SlidingWindowRateLimiter(
         resolved_settings.food_offer_read_rate_limit_per_minute
+    )
+    # CHG-205: lectura de ofertas «Ofrecer alojamiento temporal».
+    shelter_offer_read_limiter = SlidingWindowRateLimiter(
+        resolved_settings.shelter_offer_read_rate_limit_per_minute
     )
     # CHG-171: lecturas de La Mulera y posiciones del conductor.
     transport_read_limiter = SlidingWindowRateLimiter(
@@ -4132,6 +4140,438 @@ def create_app(
             return problem_response(
                 "No fue posible consultar las ciudades en este momento.",
                 title="Servicio no disponible",
+            )
+
+    # ------------------------------------------------------------------
+    # CHG-205 — «Ofrecer alojamiento temporal»: las mismas rutas
+    # públicas que la oferta de comida, con su propio cupo de lectura.
+    # ------------------------------------------------------------------
+
+    async def _forward_shelter_offer_report(
+        shelter_offer_id: UUID,
+        request: Request,
+        upstream: httpx.AsyncClient,
+        actor_kind: str,
+        denouncer_key: str,
+        account_id: UUID | None,
+    ) -> JSONResponse:
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        headers = {
+            "content-type": request.headers.get(
+                "content-type", "application/json"
+            ),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": actor_kind,
+            "x-denouncer-key": denouncer_key,
+        }
+        if account_id is not None:
+            headers["x-account-id"] = str(account_id)
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                f"/internal/v1/shelter-offers/{shelter_offer_id}/reports",
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=202,
+                content=ShelterOfferReportReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible registrar la denuncia en este momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.post(
+        "/api/v1/public/shelter-offers/{shelter_offer_id}/reports",
+        status_code=202,
+        response_model=ShelterOfferReportReceipt,
+        response_model_by_alias=True,
+        responses={
+            404: {"description": "Oferta inexistente"},
+            422: {"description": "Datos inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_anonymous_shelter_offer_report(
+        shelter_offer_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        if not anonymous_contribution_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de denuncias por minuto."
+            )
+        return await _forward_shelter_offer_report(
+            shelter_offer_id,
+            request,
+            upstream,
+            "anonymous",
+            _denouncer_key_anonymous(request),
+            None,
+        )
+
+    @application.post(
+        "/api/v1/me/shelter-offers/{shelter_offer_id}/reports",
+        status_code=202,
+        response_model=ShelterOfferReportReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Origen no permitido"},
+            404: {"description": "Oferta inexistente"},
+            422: {"description": "Datos inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_account_shelter_offer_report(
+        shelter_offer_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not account_contribution_limiter.allow(f"account:{account.id}"):
+            return rate_limited_response(
+                "Se superó el límite de denuncias por minuto."
+            )
+        return await _forward_shelter_offer_report(
+            shelter_offer_id,
+            request,
+            upstream,
+            "authenticated",
+            f"account:{account.id}",
+            account.id,
+        )
+
+    @application.get(
+        "/api/v1/shelter-offers/{shelter_offer_id}/comments",
+        response_model=AidLocationCommentsResponse,
+        response_model_by_alias=True,
+        responses={
+            404: {"description": "Oferta inexistente"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def list_shelter_offer_comments(
+        shelter_offer_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    ):
+        if not directory_search_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        try:
+            response = await upstream.get(
+                f"/internal/v1/shelter-offers/{shelter_offer_id}/comments",
+                params={"limit": limit},
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return AidLocationCommentsResponse.model_validate(
+                response.json()
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar los comentarios en este "
+                "momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.post(
+        "/api/v1/shelter-offers/{shelter_offer_id}/comments",
+        status_code=201,
+        response_model=AidLocationComment,
+        response_model_by_alias=True,
+        responses={
+            403: {"description": "Origen no permitido"},
+            404: {"description": "Oferta inexistente"},
+            422: {"description": "Datos inválidos"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["HumanitarianDirectory"],
+    )
+    async def create_shelter_offer_comment(
+        shelter_offer_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        account = await resolve_optional_account(request, identity)
+        if account is not None:
+            if not account_contribution_limiter.allow(
+                f"account:{account.id}"
+            ):
+                return rate_limited_response(
+                    "Se superó el límite de comentarios por minuto."
+                )
+        elif not anonymous_contribution_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de comentarios por minuto."
+            )
+        headers = {
+            "content-type": request.headers.get(
+                "content-type", "application/json"
+            ),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": (
+                "authenticated" if account is not None else "anonymous"
+            ),
+        }
+        if account is not None:
+            headers["x-account-id"] = str(account.id)
+            headers["x-actor-display"] = base64.b64encode(
+                account.display_name.encode()
+            ).decode()
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                f"/internal/v1/shelter-offers/{shelter_offer_id}/comments",
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=201,
+                content=AidLocationComment.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible publicar el comentario en este momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.delete(
+        "/api/v1/admin/shelter-offers/{shelter_offer_id}/comments/{comment_id}",
+        response_model=AidLocationCommentDeleteReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Rol insuficiente u origen no permitido"},
+            404: {"description": "Comentario inexistente"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_delete_shelter_offer_comment(
+        shelter_offer_id: UUID,
+        comment_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "DELETE",
+            f"/internal/v1/admin/shelter-offers/{shelter_offer_id}"
+            f"/comments/{comment_id}",
+            AidLocationCommentDeleteReceipt,
+        )
+
+    @application.delete(
+        "/api/v1/admin/shelter-offers/{shelter_offer_id}",
+        response_model=ShelterOfferDeleteReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión ausente, vencida o revocada"},
+            403: {"description": "Rol insuficiente u origen no permitido"},
+            404: {"description": "Oferta inexistente"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Administration"],
+    )
+    async def admin_delete_shelter_offer(
+        shelter_offer_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        return await admin_mutation(
+            request,
+            upstream,
+            identity,
+            "DELETE",
+            f"/internal/v1/admin/shelter-offers/{shelter_offer_id}",
+            ShelterOfferDeleteReceipt,
+        )
+
+    @application.post(
+        "/api/v1/shelter-offers",
+        status_code=201,
+        response_model=ShelterOfferReceipt,
+        response_model_by_alias=True,
+        responses={
+            422: {"description": "Oferta inválida"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["ShelterOffers"],
+    )
+    async def create_shelter_offer(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        idempotency_key = request.headers.get(
+            "idempotency-key", ""
+        ).strip()
+        if not 16 <= len(idempotency_key) <= 128:
+            return problem_response(
+                "Idempotency-Key debe tener entre 16 y 128 caracteres.",
+                title="Encabezado requerido",
+                status_code=422,
+                problem_type="validation-error",
+            )
+        account = await resolve_optional_account(request, identity)
+        if account is not None:
+            if not account_contribution_limiter.allow(
+                f"account:{account.id}"
+            ):
+                return rate_limited_response(
+                    "Se superó el límite de registros por minuto."
+                )
+        elif not anonymous_contribution_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de registros por minuto."
+            )
+        headers = {
+            "content-type": request.headers.get(
+                "content-type", "application/json"
+            ),
+            "idempotency-key": idempotency_key,
+            "x-actor-kind": (
+                "authenticated" if account is not None else "anonymous"
+            ),
+        }
+        if account is not None:
+            headers["x-account-id"] = str(account.id)
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                "/internal/v1/shelter-offers",
+                content=body,
+                headers=headers,
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=201,
+                content=ShelterOfferReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible registrar la oferta en este momento.",
+                title="Servicio no disponible",
+            )
+
+    @application.get(
+        "/api/v1/shelter-offers",
+        response_model=ShelterOfferPage,
+        response_model_by_alias=True,
+        responses={
+            422: {"description": "Paginación inválida"},
+            429: {"description": "Límite de consultas excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["ShelterOffers"],
+    )
+    async def list_active_shelter_offers(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        limit: Annotated[int, Query(ge=1, le=50)] = 25,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        if not shelter_offer_read_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        if limit not in (10, 25, 50):
+            return problem_response(
+                "El tamaño de página debe ser 10, 25 o 50.",
+                title="Tamaño de página inválido",
+                status_code=422,
+                problem_type="invalid-parameters",
+            )
+        try:
+            response = await upstream.get(
+                "/internal/v1/shelter-offers",
+                params={"limit": limit, "offset": offset},
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return ShelterOfferPage.model_validate(response.json())
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return problem_response(
+                "No fue posible consultar las ofertas en este momento.",
+                title="Servicio de ofertas no disponible",
             )
 
     # CHG-171 — Feed público del mapa: viajes vivos con su rastro;

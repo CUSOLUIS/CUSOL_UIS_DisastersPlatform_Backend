@@ -43,6 +43,9 @@ class Settings:
     # limitadores de contribución; la lectura tiene el suyo (el
     # dashboard sondea cada 30 s, como las solicitudes).
     food_offer_read_rate_limit_per_minute: int = 60
+    # CHG-205: la gemela de alojamiento lleva su propio cupo de
+    # lectura; el mapa consulta las dos listas por separado.
+    shelter_offer_read_rate_limit_per_minute: int = 60
     # CHG-171: lectura pública de La Mulera (ciudades + viajes activos,
     # el mapa sondea) y posiciones del GPS del conductor (~cada 20 s).
     transport_read_rate_limit_per_minute: int = 60
@@ -161,6 +164,11 @@ class Settings:
             food_offer_read_rate_limit_per_minute=int(
                 os.getenv(
                     "FOOD_OFFER_READ_RATE_LIMIT_PER_MINUTE", "60"
+                )
+            ),
+            shelter_offer_read_rate_limit_per_minute=int(
+                os.getenv(
+                    "SHELTER_OFFER_READ_RATE_LIMIT_PER_MINUTE", "60"
                 )
             ),
             transport_read_rate_limit_per_minute=int(
