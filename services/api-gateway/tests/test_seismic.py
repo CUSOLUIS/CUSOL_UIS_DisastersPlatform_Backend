@@ -6,6 +6,8 @@ visible y el teléfono salen de la sesión, jamás del navegador, y la
 cookie nunca se reenvía al servicio interno.
 """
 
+import json
+
 import httpx
 import pytest
 
@@ -402,3 +404,122 @@ async def test_contactos_reenvian_cuerpo_con_cuenta():
     assert response.status_code == 201
     assert seen["account"] == USER_ACCOUNT["id"]
     assert b"Ana" in seen["body"]
+
+
+# CHG-215 — Consulta de ID compartible y alta directa por shareCode.
+
+
+def identity_with_share_code(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/internal/v1/accounts/by-share-code/CUSOL-ABC234":
+        return httpx.Response(
+            200,
+            json={
+                "accountId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb02",
+                "firstNames": "María Paz",
+                "lastNames": "Rueda",
+                "phone": "+57 3001234567",
+            },
+        )
+    if request.url.path.startswith("/internal/v1/accounts/by-share-code/"):
+        return httpx.Response(
+            404,
+            json={
+                "type": "about:blank",
+                "title": "ID no encontrado",
+                "status": 404,
+                "detail": "Ese ID no corresponde a ninguna cuenta.",
+            },
+        )
+    return identity_handler(request)
+
+
+@pytest.mark.anyio
+async def test_consulta_de_id_exige_sesion():
+    upstream, identity = make_clients(
+        lambda request: httpx.Response(500), identity_with_share_code
+    )
+    app = create_app(gateway_settings(), upstream, identity)
+    response = await request_gateway(
+        app, "GET", "/api/v1/accounts/share-code/CUSOL-ABC234"
+    )
+    await upstream.aclose()
+    await identity.aclose()
+    assert response.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_consulta_de_id_autollena_sin_correo_ni_uuid():
+    upstream, identity = make_clients(
+        lambda request: httpx.Response(500), identity_with_share_code
+    )
+    app = create_app(gateway_settings(), upstream, identity)
+    response = await request_gateway(
+        app,
+        "GET",
+        "/api/v1/accounts/share-code/CUSOL-ABC234",
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "firstNames": "María Paz",
+        "lastNames": "Rueda",
+        "phone": "+57 3001234567",
+    }
+
+
+@pytest.mark.anyio
+async def test_consulta_de_id_desconocido_devuelve_404():
+    upstream, identity = make_clients(
+        lambda request: httpx.Response(500), identity_with_share_code
+    )
+    app = create_app(gateway_settings(), upstream, identity)
+    response = await request_gateway(
+        app,
+        "GET",
+        "/api/v1/accounts/share-code/CUSOL-ZZZ999",
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+    assert response.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_alta_por_share_code_va_a_la_via_directa():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            201,
+            json={
+                "id": "cccccccc-cccc-4ccc-8ccc-cccccccccc03",
+                "status": "PENDING",
+                "displayName": "María Paz Rueda",
+                "linked": True,
+                "createdAt": "2026-08-27T20:00:00Z",
+            },
+        )
+
+    upstream, identity = make_clients(handler, identity_with_share_code)
+    app = create_app(gateway_settings(), upstream, identity)
+    response = await request_gateway(
+        app,
+        "POST",
+        "/api/v1/seismic/contacts",
+        json={"shareCode": "CUSOL-ABC234"},
+        cookies={"cusol_session": "token-user"},
+    )
+    await upstream.aclose()
+    await identity.aclose()
+    assert response.status_code == 201
+    assert seen["path"] == "/internal/v1/seismic/contacts/direct"
+    # El nombre visible lo fija el gateway desde la cuenta, no el navegador.
+    assert seen["body"] == {
+        "contactAccountId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb02",
+        "displayName": "María Paz Rueda",
+    }

@@ -163,6 +163,9 @@ class AuthenticatedAccount(ApiModel):
     # CHG-077: bandera del sector salud (profesión + registro
     # declarados al crear las credenciales).
     is_health_sector: bool = False
+    # CHG-215: ID compartible del dueño de la sesión, para mostrarlo en
+    # Mi espacio y en el paso post-registro.
+    share_code: str | None = None
 
 
 class SessionEnvelope(ApiModel):

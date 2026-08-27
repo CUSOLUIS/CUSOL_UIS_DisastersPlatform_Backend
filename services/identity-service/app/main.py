@@ -45,6 +45,7 @@ from .repository import (
     NewAccount,
     PostgresIdentityRepository,
 )
+from .share_codes import generate_share_code, normalize_share_code
 from .security import (
     build_password_hasher,
     generate_token,
@@ -109,6 +110,8 @@ def authenticated_account(
         is_health_sector=getattr(account, "is_health_sector", False),
         # CHG-083: el teléfono del perfil precarga formularios.
         phone=getattr(account, "phone", None),
+        # CHG-215: el ID compartible viaja en la sesión.
+        share_code=getattr(account, "share_code", None),
     )
 
 
@@ -230,8 +233,9 @@ def create_app(
             hours=resolved_settings.verification_ttl_hours
         )
         account_id = uuid4()
-        created = await data.create_account(
-            NewAccount(
+
+        def new_account(share_code: str) -> NewAccount:
+            return NewAccount(
                 id=account_id,
                 email=email,
                 first_names=payload.first_names.strip(),
@@ -270,8 +274,21 @@ def create_app(
                     and payload.health_institution.strip()
                     else None
                 ),
+                # CHG-215: el ID compartible nace con la cuenta.
+                share_code=share_code,
             )
-        )
+
+        # CHG-215: ante la colisión improbable del código se reintenta
+        # con otro; el conflicto de correo sale por ON CONFLICT (False).
+        created = False
+        for _ in range(5):
+            try:
+                created = await data.create_account(
+                    new_account(generate_share_code())
+                )
+                break
+            except asyncpg.UniqueViolationError:
+                continue
         if created:
             token = generate_token()
             await data.create_verification_token(
@@ -482,6 +499,37 @@ def create_app(
         return authenticated_account(
             found.account, found.session_expires_at
         )
+
+    # CHG-215 — Resolución del ID compartible. El gateway exige sesión
+    # antes de llamar; aquí solo se resuelve. Nunca devuelve el correo.
+    @application.get(
+        "/internal/v1/accounts/by-share-code/{code}",
+        tags=["Accounts"],
+    )
+    async def get_account_by_share_code(
+        code: str,
+        data: Annotated[IdentityRepository, Depends(get_repository)],
+    ):
+        normalized = normalize_share_code(code)
+        if normalized is None:
+            return problem(
+                404,
+                "ID no encontrado",
+                "Ese ID no corresponde a ninguna cuenta.",
+            )
+        found = await data.get_account_by_share_code(normalized)
+        if found is None:
+            return problem(
+                404,
+                "ID no encontrado",
+                "Ese ID no corresponde a ninguna cuenta.",
+            )
+        return {
+            "accountId": str(found["id"]),
+            "firstNames": found["first_names"],
+            "lastNames": found["last_names"],
+            "phone": found["phone"],
+        }
 
     # CHG-036 — Administración de cuentas (rutas internas). El gateway
     # autentica la cookie; aquí se revalida el rol de los encabezados

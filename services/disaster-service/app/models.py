@@ -2824,6 +2824,10 @@ class SeismicEventView(ApiModel):
     description: str | None = None
     pending_instrumental_notice: str | None = None
     zones: list[SeismicZoneView] = Field(default_factory=list)
+    # CHG-218: pasadas SEISMIC_EVENT_VISIBILITY_HOURS desde el origen las
+    # zonas se retiran (viajan vacías) aunque el evento siga vivo por sus
+    # alertas activas; los triángulos no cambian.
+    zones_expired: bool = False
 
 
 class SeismicEventsResponse(ApiModel):
@@ -2882,6 +2886,15 @@ class EmergencyContactInput(ApiModel):
                 "documentType debe ser uno de los tipos permitidos"
             )
         return value
+
+
+class EmergencyContactDirectInput(ApiModel):
+    """CHG-215: vínculo directo por ID compartible. El gateway resolvió
+    el código contra el identity-service y fija el nombre visible desde
+    la cuenta (el navegador nunca decide nombres, patrón CHG-193)."""
+
+    contact_account_id: UUID
+    display_name: str = Field(min_length=1, max_length=161)
 
 
 class EmergencyContactView(ApiModel):

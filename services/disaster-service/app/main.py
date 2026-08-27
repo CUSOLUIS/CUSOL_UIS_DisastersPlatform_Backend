@@ -176,6 +176,7 @@ from .models import SourceReference
 from .models import (
     ConfirmSafeInput,
     ConfirmSafeReceipt,
+    EmergencyContactDirectInput,
     EmergencyContactInput,
     EmergencyContactView,
     EmergencyContactsResponse,
@@ -7298,6 +7299,11 @@ def create_app(
         preliminary = (
             event["processing_status"] == "SEISMIC_DATA_PRELIMINARY"
         )
+        # CHG-218: los círculos se retiran a las N horas del origen; el
+        # evento puede seguir vivo (alertas activas) sin ellos.
+        zones_expired = event["origin_time_utc"] <= datetime.now(
+            UTC
+        ) - timedelta(hours=resolved_settings.seismic_visibility_hours)
         return SeismicEventView(
             id=event["id"],
             source=event["source"],
@@ -7320,7 +7326,8 @@ def create_app(
                 if preliminary and not event["is_simulated"]
                 else None
             ),
-            zones=zones,
+            zones=[] if zones_expired else zones,
+            zones_expired=zones_expired,
         )
 
     def resolve_super_admin(
@@ -7506,6 +7513,10 @@ def create_app(
 
     def _contact_view(row: dict) -> EmergencyContactView:
         display_name = row.get("contact_display_name")
+        # CHG-215: la vía directa por ID no tiene candidato; el nombre
+        # lo fijó el gateway desde la cuenta al vincular.
+        if not display_name:
+            display_name = row.get("direct_display_name")
         if not display_name:
             first = row.get("candidate_first_names") or ""
             last = row.get("candidate_last_names") or ""
@@ -7583,7 +7594,8 @@ def create_app(
             return problem(
                 422,
                 "Límite de contactos",
-                "La red de emergencia admite máximo cinco contactos.",
+                "La red de emergencia admite máximo "
+                f"{seismic_rules.MAX_EMERGENCY_CONTACTS} contactos.",
             )
         if result == "duplicate":
             return problem(
@@ -7596,6 +7608,65 @@ def create_app(
                 **result,
                 "candidate_first_names": candidate["first_names"],
                 "candidate_last_names": candidate["last_names"],
+                "contact_display_name": None,
+            }
+        )
+
+    # CHG-215 — Vínculo directo por ID compartible: sin candidato ni
+    # matching; la invitación nace PENDING apuntando a la cuenta y le
+    # aparece a esa persona sin teclear su documento.
+    @application.post(
+        "/internal/v1/seismic/contacts/direct",
+        response_model=EmergencyContactView,
+        response_model_by_alias=True,
+        status_code=201,
+        tags=["Seismic"],
+    )
+    async def create_emergency_contact_direct(
+        request: Request,
+        payload: EmergencyContactDirectInput,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = require_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        settings_row = await data.get_seismic_settings(account_id)
+        if not (settings_row and settings_row["enabled"]):
+            return problem(
+                409,
+                "Servicio desactivado",
+                "Activa «Alertas sísmicas y red de emergencia» antes "
+                "de registrar contactos.",
+            )
+        result = await data.create_emergency_contact(
+            account_id,
+            payload.contact_account_id,
+            None,
+            direct_display_name=payload.display_name.strip(),
+        )
+        if result == "limit":
+            return problem(
+                422,
+                "Límite de contactos",
+                "La red de emergencia admite máximo "
+                f"{seismic_rules.MAX_EMERGENCY_CONTACTS} contactos.",
+            )
+        if result == "duplicate":
+            return problem(
+                409,
+                "Contacto duplicado",
+                "Esa persona ya está en tu red de emergencia.",
+            )
+        if result == "self":
+            return problem(
+                422,
+                "ID propio",
+                "Ese es tu propio ID: elige a otra persona.",
+            )
+        return _contact_view(
+            {
+                **result,
+                "direct_display_name": payload.display_name.strip(),
                 "contact_display_name": None,
             }
         )

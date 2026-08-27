@@ -142,9 +142,25 @@ class FakeIdentityRepository:
                         # CHG-083: el teléfono del perfil viaja en
                         # la sesión.
                         phone=account.phone,
+                        # CHG-215: el ID compartible viaja en la sesión.
+                        share_code=account.share_code,
                     ),
                     session_expires_at=session["expires_at"],
                 )
+        return None
+
+    async def get_account_by_share_code(self, share_code):
+        for email, account in self.accounts.items():
+            if (
+                account.share_code == share_code
+                and self.status[email] == "active"
+            ):
+                return {
+                    "id": account.id,
+                    "first_names": account.first_names,
+                    "last_names": account.last_names,
+                    "phone": account.phone,
+                }
         return None
 
 
@@ -587,6 +603,8 @@ async def test_me_valid_expired_and_revoked_sessions():
     assert set(valid.json().keys()) == {
         "id", "displayName", "email", "phone", "assignedRole",
         "status", "sessionExpiresAt", "isHealthSector",
+        # CHG-215: el ID compartible viaja en la sesión.
+        "shareCode",
     }
     # CHG-077: sin datos de salud declarados, la bandera es falsa.
     assert valid.json()["isHealthSector"] is False
@@ -780,3 +798,106 @@ async def test_me_exposes_health_sector_flag():
 
     assert me.status_code == 200
     assert me.json()["isHealthSector"] is True
+
+
+# --- CHG-215: ID compartible ---
+
+
+@pytest.mark.anyio
+async def test_el_registro_genera_un_id_compartible():
+    repository = FakeIdentityRepository()
+    app = build_app(repository, CaptureMailer())
+    response = await request(
+        app,
+        "POST",
+        "/internal/v1/auth/registrations",
+        json=registration_payload(),
+    )
+    assert response.status_code == 202
+    cuenta = next(iter(repository.accounts.values()))
+    assert cuenta.share_code is not None
+    assert cuenta.share_code.startswith("CUSOL-")
+    assert len(cuenta.share_code) == len("CUSOL-") + 6
+    # Sin caracteres ambiguos (0/O/1/I/L quedan fuera del alfabeto).
+    assert not set(cuenta.share_code[6:]) & set("0O1IL")
+
+
+@pytest.mark.anyio
+async def test_la_sesion_expone_el_id_compartible():
+    repository = FakeIdentityRepository()
+    mailer = CaptureMailer()
+    app = build_app(repository, mailer)
+    await request(
+        app,
+        "POST",
+        "/internal/v1/auth/registrations",
+        json=registration_payload(),
+    )
+    token = mailer.sent[-1]["token"]
+    verified = await request(
+        app,
+        "POST",
+        "/internal/v1/auth/email-verifications",
+        json={"token": token},
+    )
+    session_token = verified.json()["sessionToken"]
+    me = await request(
+        app,
+        "GET",
+        "/internal/v1/auth/me",
+        headers={"X-Session-Token": session_token},
+    )
+    assert me.status_code == 200
+    cuenta = next(iter(repository.accounts.values()))
+    assert me.json()["shareCode"] == cuenta.share_code
+
+
+@pytest.mark.anyio
+async def test_resolucion_de_id_compartible():
+    repository = FakeIdentityRepository()
+    mailer = CaptureMailer()
+    app = build_app(repository, mailer)
+    await request(
+        app,
+        "POST",
+        "/internal/v1/auth/registrations",
+        json=registration_payload(),
+    )
+    cuenta = next(iter(repository.accounts.values()))
+    # Cuenta sin verificar: el ID aún no resuelve.
+    pendiente = await request(
+        app,
+        "GET",
+        f"/internal/v1/accounts/by-share-code/{cuenta.share_code}",
+    )
+    assert pendiente.status_code == 404
+    token = mailer.sent[-1]["token"]
+    await request(
+        app,
+        "POST",
+        "/internal/v1/auth/email-verifications",
+        json={"token": token},
+    )
+    # Activa: resuelve con lo autollenable, sin correo ni credenciales.
+    activa = await request(
+        app,
+        "GET",
+        f"/internal/v1/accounts/by-share-code/{cuenta.share_code}",
+    )
+    assert activa.status_code == 200
+    body = activa.json()
+    assert body["firstNames"] == cuenta.first_names
+    assert "email" not in body
+    # Normalización: minúsculas y sin prefijo también resuelven.
+    sin_prefijo = cuenta.share_code.removeprefix("CUSOL-").lower()
+    normalizada = await request(
+        app,
+        "GET",
+        f"/internal/v1/accounts/by-share-code/{sin_prefijo}",
+    )
+    assert normalizada.status_code == 200
+    # Un ID con forma inválida responde 404, no 500.
+    invalido = await request(
+        app, "GET", "/internal/v1/accounts/by-share-code/XX"
+    )
+    assert invalido.status_code == 404

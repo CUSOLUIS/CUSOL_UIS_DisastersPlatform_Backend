@@ -19,6 +19,8 @@ class AccountRecord:
     is_health_sector: bool = False
     # CHG-083: teléfono del perfil para precargar formularios.
     phone: str | None = None
+    # CHG-215: ID compartible para vincular contactos de emergencia.
+    share_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,8 @@ class NewAccount:
     health_profession: str | None = None
     health_license_number: str | None = None
     health_institution: str | None = None
+    # CHG-215: lo genera el servicio al registrar; nunca el navegador.
+    share_code: str | None = None
 
 
 class IdentityRepository(Protocol):
@@ -86,6 +90,13 @@ class IdentityRepository(Protocol):
         self, token_hash: str, now: datetime
     ) -> SessionAccount | None: ...
 
+    async def get_account_by_share_code(
+        self, share_code: str
+    ) -> dict | None:
+        """CHG-215: cuenta activa dueña de ese ID compartible, con lo
+        que el formulario de contacto autollena (nombres y teléfono)."""
+        ...
+
 
 class PostgresIdentityRepository:
     def __init__(self, pool: asyncpg.Pool):
@@ -102,11 +113,11 @@ class PostgresIdentityRepository:
                 department, municipality, requested_account_type,
                 organization_name, organization_role, password_hash,
                 health_profession, health_license_number,
-                health_institution
+                health_institution, share_code
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7,
                 $8::identity_service.requested_account_type, $9, $10, $11,
-                $12, $13, $14
+                $12, $13, $14, $15
             )
             ON CONFLICT (email) DO NOTHING
             RETURNING id
@@ -125,6 +136,7 @@ class PostgresIdentityRepository:
             account.health_profession,
             account.health_license_number,
             account.health_institution,
+            account.share_code,
         )
         return row is not None
 
@@ -181,7 +193,8 @@ class PostgresIdentityRepository:
         row = await self._pool.fetchrow(
             """
             SELECT id, email, first_names, last_names,
-                   assigned_role, status, password_hash
+                   assigned_role, status, password_hash, phone,
+                   share_code
             FROM identity_service.accounts
             WHERE id = $1
             """,
@@ -197,6 +210,8 @@ class PostgresIdentityRepository:
             assigned_role=row["assigned_role"],
             status=row["status"],
             password_hash=row["password_hash"],
+            phone=row["phone"],
+            share_code=row["share_code"],
         )
 
     async def get_account_by_email(
@@ -205,7 +220,8 @@ class PostgresIdentityRepository:
         row = await self._pool.fetchrow(
             """
             SELECT id, email, first_names, last_names,
-                   assigned_role, status, password_hash
+                   assigned_role, status, password_hash, phone,
+                   share_code
             FROM identity_service.accounts
             WHERE email = $1
             """,
@@ -221,6 +237,8 @@ class PostgresIdentityRepository:
             assigned_role=row["assigned_role"],
             status=row["status"],
             password_hash=row["password_hash"],
+            phone=row["phone"],
+            share_code=row["share_code"],
         )
 
     async def create_session(
@@ -254,7 +272,7 @@ class PostgresIdentityRepository:
             """
             SELECT a.id, a.email, a.first_names, a.last_names,
                    a.assigned_role, a.status, a.password_hash,
-                   a.phone,
+                   a.phone, a.share_code,
                    (a.health_profession IS NOT NULL
                     AND a.health_license_number IS NOT NULL)
                        AS is_health_sector,
@@ -283,9 +301,25 @@ class PostgresIdentityRepository:
                 password_hash=row["password_hash"],
                 is_health_sector=row["is_health_sector"],
                 phone=row["phone"],
+                share_code=row["share_code"],
             ),
             session_expires_at=row["expires_at"],
         )
+
+    async def get_account_by_share_code(
+        self, share_code: str
+    ) -> dict | None:
+        # CHG-215: solo cuentas activas; nunca email ni credenciales.
+        row = await self._pool.fetchrow(
+            """
+            SELECT id, first_names, last_names, phone
+            FROM identity_service.accounts
+            WHERE share_code = $1
+              AND status = 'active'
+            """,
+            share_code,
+        )
+        return dict(row) if row else None
 
     # CHG-036 — Administración de cuentas. Nunca se selecciona
     # password_hash ni tokens; el teléfono tampoco viaja a la consola.

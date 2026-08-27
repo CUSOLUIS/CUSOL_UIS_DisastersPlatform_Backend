@@ -5,6 +5,7 @@ import json
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from datetime import UTC, datetime
 from typing import Annotated, Literal
+from urllib.parse import quote
 from uuid import UUID
 
 import httpx
@@ -29,6 +30,7 @@ from .models import (
     SeismicSettingsView,
     SeismicSimulationReceipt,
     SeismicTestAccountsReceipt,
+    ShareCodeLookupView,
 )
 from .models import (
 
@@ -7172,6 +7174,55 @@ def create_app(
             headers=seismic_actor_headers(account),
         )
 
+    # CHG-215 — Consulta de un ID compartible para autollenar el
+    # formulario de contacto. Exige sesión (nunca es un directorio
+    # anónimo) y jamás devuelve el correo ni el UUID de la cuenta.
+    @application.get(
+        "/api/v1/accounts/share-code/{code}",
+        response_model=ShareCodeLookupView,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            404: {"description": "ID no encontrado"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Accounts"],
+    )
+    async def gateway_lookup_share_code(
+        code: str,
+        request: Request,
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not seismic_write_limiter.allow(str(account.id)):
+            return rate_limited_response(
+                "Se superó el límite de acciones por minuto."
+            )
+        try:
+            response = await identity.get(
+                "/internal/v1/accounts/by-share-code/"
+                + quote(code, safe="")
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            found = response.json()
+            return ShareCodeLookupView(
+                first_names=found["firstNames"],
+                last_names=found["lastNames"],
+                phone=found.get("phone"),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return seismic_unavailable()
+
     @application.post(
         "/api/v1/seismic/contacts",
         response_model=EmergencyContactView,
@@ -7180,7 +7231,7 @@ def create_app(
         responses={
             401: {"description": "Sesión requerida"},
             409: {"description": "Servicio desactivado o duplicado"},
-            422: {"description": "Datos inválidos o límite de cinco"},
+            422: {"description": "Datos inválidos o límite de contactos"},
             429: {"description": "Límite excedido"},
             503: {"description": "Servicio no disponible"},
         },
@@ -7204,15 +7255,48 @@ def create_app(
                 "Se superó el límite de acciones por minuto."
             )
         body = await request.body()
+        # CHG-215: si el cuerpo trae un shareCode, la vía es directa —
+        # el gateway resuelve el ID contra identity y el nombre visible
+        # sale de la cuenta, nunca del navegador (patrón CHG-193).
+        share_code = None
         try:
-            response = await upstream.post(
-                "/internal/v1/seismic/contacts",
-                content=body,
-                headers={
-                    **seismic_actor_headers(account),
-                    "content-type": "application/json",
-                },
-            )
+            parsed = json.loads(body or b"{}")
+            if isinstance(parsed, dict):
+                raw = parsed.get("shareCode")
+                if isinstance(raw, str) and raw.strip():
+                    share_code = raw.strip()
+        except ValueError:
+            share_code = None
+        try:
+            if share_code is not None:
+                lookup = await identity.get(
+                    "/internal/v1/accounts/by-share-code/"
+                    + quote(share_code, safe="")
+                )
+                if 400 <= lookup.status_code < 500:
+                    return passthrough(lookup)
+                lookup.raise_for_status()
+                found = lookup.json()
+                display_name = (
+                    f"{found['firstNames']} {found['lastNames']}"
+                ).strip()[:161]
+                response = await upstream.post(
+                    "/internal/v1/seismic/contacts/direct",
+                    json={
+                        "contactAccountId": found["accountId"],
+                        "displayName": display_name,
+                    },
+                    headers=seismic_actor_headers(account),
+                )
+            else:
+                response = await upstream.post(
+                    "/internal/v1/seismic/contacts",
+                    content=body,
+                    headers={
+                        **seismic_actor_headers(account),
+                        "content-type": "application/json",
+                    },
+                )
             if 400 <= response.status_code < 500:
                 return passthrough(response)
             response.raise_for_status()

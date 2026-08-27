@@ -218,7 +218,9 @@ services:
     environment:
       DISASTER_SERVICE_URL: http://disaster-service:8001
       IDENTITY_SERVICE_URL: http://identity-service:8002
-      UPSTREAM_TIMEOUT_SECONDS: 5
+      # CHG-216: en la Pi el simulacro sísmico tarda ~8 s; el valor se
+      # sube por .env solo en este host (por defecto sigue 5).
+      UPSTREAM_TIMEOUT_SECONDS: ${UPSTREAM_TIMEOUT_SECONDS:-5}
       WATCHFILES_FORCE_POLLING: "true"
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3100,http://127.0.0.1:3100}
@@ -276,6 +278,10 @@ services:
       EXPO_PUBLIC_SEISMIC_DATA_MODE: ${SEISMIC_DATA_MODE:-api}
       # CHG-165: comentarios/denuncias de acopios locales contra la API real.
       EXPO_PUBLIC_AID_LOCATION_COMMUNITY_DATA_MODE: ${AID_LOCATION_COMMUNITY_DATA_MODE:-api}
+      # CHG-214: ubicación simulada cuando el navegador visita el server
+      # de pruebas por http://<ip> (contexto no seguro, sin geolocalización).
+      # «lat,lon»; vacío = Bucaramanga por defecto en el código.
+      EXPO_PUBLIC_TEST_LOCATION: ${TEST_LOCATION:-}
     volumes:
       - ../CUSOL_UIS_DisastersPlatform_Frontend:/app
       - frontend-node-modules:/app/node_modules

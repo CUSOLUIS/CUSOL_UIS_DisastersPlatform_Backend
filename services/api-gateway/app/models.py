@@ -285,6 +285,18 @@ class AuthenticatedAccount(ApiModel):
     is_health_sector: bool = False
     # CHG-083: teléfono del perfil para precargar formularios.
     phone: str | None = None
+    # CHG-215: ID compartible del dueño de la sesión (Mi espacio y
+    # paso post-registro).
+    share_code: str | None = None
+
+
+class ShareCodeLookupView(ApiModel):
+    """CHG-215: lo que el formulario de contacto autollena al resolver
+    un ID. Nunca el correo ni el identificador interno de la cuenta."""
+
+    first_names: str
+    last_names: str
+    phone: str | None = None
 
 
 class SessionEnvelope(ApiModel):
@@ -1576,6 +1588,8 @@ class SeismicEventView(ApiModel):
     description: str | None = None
     pending_instrumental_notice: str | None = None
     zones: list[SeismicZoneView] = Field(default_factory=list)
+    # CHG-218: zonas retiradas por edad; los triángulos siguen.
+    zones_expired: bool = False
 
 
 class SeismicEventsResponse(ApiModel):

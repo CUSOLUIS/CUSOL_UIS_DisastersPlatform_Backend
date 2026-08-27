@@ -690,6 +690,7 @@ class DisasterRepository(Protocol):
         owner_account_id: UUID,
         contact_account_id: UUID | None,
         candidate_id: UUID | None,
+        direct_display_name: str | None = None,
     ) -> dict | str: ...
 
     async def list_emergency_contacts_of_owner(
@@ -9037,6 +9038,7 @@ class PostgresDisasterRepository:
         owner_account_id: UUID,
         contact_account_id: UUID | None,
         candidate_id: UUID | None,
+        direct_display_name: str | None = None,
     ) -> dict | str:
         live = await self._pool.fetchval(
             """
@@ -9053,17 +9055,23 @@ class PostgresDisasterRepository:
             row = await self._pool.fetchrow(
                 """
                 INSERT INTO disaster_service.emergency_contacts (
-                    owner_account_id, contact_account_id, candidate_id
-                ) VALUES ($1, $2, $3)
+                    owner_account_id, contact_account_id, candidate_id,
+                    direct_display_name
+                ) VALUES ($1, $2, $3, $4)
                 RETURNING id, owner_account_id, contact_account_id,
                           candidate_id, status, created_at
                 """,
                 owner_account_id,
                 contact_account_id,
                 candidate_id,
+                direct_display_name,
             )
         except asyncpg.UniqueViolationError:
             return "duplicate"
+        except asyncpg.CheckViolationError:
+            # CHG-215: emergency_contact_not_self — el dueño puso su
+            # propio ID.
+            return "self"
         return dict(row)
 
     async def list_emergency_contacts_of_owner(
@@ -9073,6 +9081,7 @@ class PostgresDisasterRepository:
             """
             SELECT ec.id, ec.status, ec.contact_account_id,
                    ec.candidate_id, ec.created_at, ec.accepted_at,
+                   ec.direct_display_name,
                    c.first_names AS candidate_first_names,
                    c.last_names AS candidate_last_names,
                    c.document_type AS candidate_document_type,

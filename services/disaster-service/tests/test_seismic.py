@@ -161,11 +161,26 @@ class FakeSeismicRepository:
 
     async def list_public_seismic_events(self, visibility_hours, limit):
         cutoff = datetime.now(UTC) - timedelta(hours=visibility_hours)
+        now = datetime.now(UTC)
+
+        def alive_by_alert(event_id):
+            # Espejo del OR EXISTS del SQL real: una alerta ACTIVE sin
+            # vencer mantiene el evento vivo más allá de la ventana.
+            return any(
+                a["seismic_event_id"] == event_id
+                and a["status"] == "ACTIVE"
+                and (a["expires_at"] is None or a["expires_at"] > now)
+                for a in self.alerts.values()
+            )
+
         rows = [
             dict(event)
             for event in self.events.values()
             if event["deactivated_at"] is None
-            and event["origin_time_utc"] > cutoff
+            and (
+                event["origin_time_utc"] > cutoff
+                or alive_by_alert(event["id"])
+            )
         ]
         rows.sort(key=lambda row: row["origin_time_utc"], reverse=True)
         return rows[:limit]
@@ -248,7 +263,11 @@ class FakeSeismicRepository:
         return dict(row)
 
     async def create_emergency_contact(
-        self, owner_account_id, contact_account_id, candidate_id
+        self,
+        owner_account_id,
+        contact_account_id,
+        candidate_id,
+        direct_display_name=None,
     ):
         live = [
             c
@@ -263,11 +282,15 @@ class FakeSeismicRepository:
             for c in live
         ):
             return "duplicate"
+        # CHG-215: espejo del CHECK emergency_contact_not_self.
+        if contact_account_id == owner_account_id:
+            return "self"
         row = {
             "id": uuid4(),
             "owner_account_id": owner_account_id,
             "contact_account_id": contact_account_id,
             "candidate_id": candidate_id,
+            "direct_display_name": direct_display_name,
             "status": "PENDING",
             "created_at": datetime.now(UTC),
         }
@@ -1549,3 +1572,169 @@ async def test_cuentas_de_prueba_configurables_por_admin():
         and c["status"] == "ACCEPTED"
         for c in repo.contacts.values()
     )
+
+
+# CHG-215 — Vínculo directo por ID compartible (sin candidato).
+
+
+@pytest.mark.anyio
+async def test_vinculo_directo_crea_invitacion_pendiente():
+    repo = FakeSeismicRepository()
+    app = seismic_app(repo)
+    await request_app(
+        app,
+        "PUT",
+        "/internal/v1/seismic/settings",
+        json={"enabled": True, "displayName": "Julián Villamizar"},
+        headers=headers_for(OWNER),
+    )
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/seismic/contacts/direct",
+        json={
+            "contactAccountId": str(CONTACT),
+            "displayName": "María Paz Rueda",
+        },
+        headers=headers_for(OWNER),
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "PENDING"
+    assert body["displayName"] == "María Paz Rueda"
+    assert body["linked"] is True
+    # El dueño la ve en su lista con el nombre fijado por el gateway.
+    listado = await request_app(
+        app,
+        "GET",
+        "/internal/v1/seismic/contacts",
+        headers=headers_for(OWNER),
+    )
+    nombres = [c["displayName"] for c in listado.json()["contacts"]]
+    assert "María Paz Rueda" in nombres
+    # Y a la persona le aparece la invitación sin teclear documento.
+    invitaciones = await request_app(
+        app,
+        "POST",
+        "/internal/v1/seismic/invitations/match",
+        json={"displayName": "María Paz Rueda"},
+        headers=headers_for(CONTACT),
+    )
+    assert len(invitaciones.json()["invitations"]) == 1
+
+
+@pytest.mark.anyio
+async def test_vinculo_directo_rechaza_el_id_propio():
+    repo = FakeSeismicRepository()
+    app = seismic_app(repo)
+    await request_app(
+        app,
+        "PUT",
+        "/internal/v1/seismic/settings",
+        json={"enabled": True, "displayName": "Julián Villamizar"},
+        headers=headers_for(OWNER),
+    )
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/seismic/contacts/direct",
+        json={
+            "contactAccountId": str(OWNER),
+            "displayName": "Julián Villamizar",
+        },
+        headers=headers_for(OWNER),
+    )
+    assert response.status_code == 422
+    assert "propio" in response.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_vinculo_directo_duplicado_y_limite():
+    repo = FakeSeismicRepository()
+    app = seismic_app(repo)
+    await request_app(
+        app,
+        "PUT",
+        "/internal/v1/seismic/settings",
+        json={"enabled": True, "displayName": "Julián Villamizar"},
+        headers=headers_for(OWNER),
+    )
+    primero = await request_app(
+        app,
+        "POST",
+        "/internal/v1/seismic/contacts/direct",
+        json={
+            "contactAccountId": str(CONTACT),
+            "displayName": "María Paz Rueda",
+        },
+        headers=headers_for(OWNER),
+    )
+    assert primero.status_code == 201
+    repetido = await request_app(
+        app,
+        "POST",
+        "/internal/v1/seismic/contacts/direct",
+        json={
+            "contactAccountId": str(CONTACT),
+            "displayName": "María Paz Rueda",
+        },
+        headers=headers_for(OWNER),
+    )
+    assert repetido.status_code == 409
+    for index in range(seismic.MAX_EMERGENCY_CONTACTS - 1):
+        extra = await request_app(
+            app,
+            "POST",
+            "/internal/v1/seismic/contacts/direct",
+            json={
+                "contactAccountId": str(uuid4()),
+                "displayName": f"Contacto Directo {index}",
+            },
+            headers=headers_for(OWNER),
+        )
+        assert extra.status_code == 201
+    desbordado = await request_app(
+        app,
+        "POST",
+        "/internal/v1/seismic/contacts/direct",
+        json={
+            "contactAccountId": str(uuid4()),
+            "displayName": "Contacto Sobrante",
+        },
+        headers=headers_for(OWNER),
+    )
+    assert desbordado.status_code == 422
+
+
+
+# CHG-218 — A las 24 h se retiran los círculos; los triángulos siguen.
+
+
+@pytest.mark.anyio
+async def test_las_zonas_se_retiran_a_las_24_horas_pero_el_evento_sigue():
+    repo = FakeSeismicRepository()
+    viejo, zona_vieja = seed_event(repo, magnitude=6.5)
+    repo.events[viejo]["origin_time_utc"] = datetime.now(UTC) - timedelta(
+        hours=25
+    )
+    # Alerta M ≥ 4.5 sin confirmar: mantiene vivo el evento (regla de
+    # intensidad intacta) aunque ya no tenga círculos.
+    seed_alert(repo, viejo, zona_vieja, expires_at=None)
+    reciente, _ = seed_event(repo, magnitude=5.0)
+    app = seismic_app(repo)
+
+    response = await request_app(app, "GET", "/internal/v1/seismic/events")
+    assert response.status_code == 200
+    por_id = {e["id"]: e for e in response.json()["events"]}
+
+    assert por_id[str(viejo)]["zonesExpired"] is True
+    assert por_id[str(viejo)]["zones"] == []
+    assert por_id[str(reciente)]["zonesExpired"] is False
+    assert len(por_id[str(reciente)]["zones"]) >= 1
+
+    # Los triángulos del evento viejo siguen ahí, como siempre.
+    afectados = await request_app(
+        app, "GET", f"/internal/v1/seismic/events/{viejo}/affected"
+    )
+    assert afectados.status_code == 200
+    assert len(afectados.json()["markers"]) == 1
