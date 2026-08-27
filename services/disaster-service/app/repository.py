@@ -35,6 +35,7 @@ from .models import (
 )
 from . import admin as admin_rules
 from . import moderation, offers
+from . import seismic as seismic_rules
 
 # CHG-075: hora local de Colombia (sin horario de verano) para fijar
 # el instante público del último avistamiento.
@@ -630,6 +631,139 @@ class DisasterRepository(Protocol):
     async def list_visitor_presence(
         self, window_minutes: int, limit: int
     ) -> tuple[list[dict], int]: ...
+
+    # --- CHG-208: monitoreo sísmico y red privada de emergencia ---
+
+    async def get_seismic_checkpoint(self, source: str) -> dict | None: ...
+
+    async def update_seismic_checkpoint(
+        self,
+        source: str,
+        *,
+        last_event_time: datetime | None,
+        success: bool,
+    ) -> None: ...
+
+    async def get_seismic_event_by_source(
+        self, source: str, source_event_id: str
+    ) -> dict | None: ...
+
+    async def insert_seismic_event(self, **fields: object) -> dict: ...
+
+    async def apply_seismic_revision(
+        self, event_id: UUID, previous: dict, **fields: object
+    ) -> dict: ...
+
+    async def list_public_seismic_events(
+        self, visibility_hours: int, limit: int
+    ) -> list[dict]: ...
+
+    async def get_seismic_event(self, event_id: UUID) -> dict | None: ...
+
+    async def list_intensity_zones_for_events(
+        self, event_ids: list[UUID]
+    ) -> list[dict]: ...
+
+    async def replace_intensity_zones(
+        self, event_id: UUID, zones: list[dict], supersede: bool
+    ) -> list[dict]: ...
+
+    async def get_seismic_settings(
+        self, account_id: UUID
+    ) -> dict | None: ...
+
+    async def upsert_seismic_settings(
+        self,
+        account_id: UUID,
+        enabled: bool,
+        display_name: str | None,
+        *,
+        is_test_account: bool | None = None,
+    ) -> dict: ...
+
+    async def create_emergency_candidate(
+        self, **fields: object
+    ) -> dict: ...
+
+    async def create_emergency_contact(
+        self,
+        owner_account_id: UUID,
+        contact_account_id: UUID | None,
+        candidate_id: UUID | None,
+    ) -> dict | str: ...
+
+    async def list_emergency_contacts_of_owner(
+        self, owner_account_id: UUID
+    ) -> list[dict]: ...
+
+    async def list_emergency_invitations_for(
+        self, contact_account_id: UUID
+    ) -> list[dict]: ...
+
+    async def match_unregistered_candidates(
+        self, document_hash: str | None, phone_normalized: str | None
+    ) -> list[dict]: ...
+
+    async def link_candidate_to_account(
+        self, candidate_id: UUID, account_id: UUID
+    ) -> dict | None: ...
+
+    async def respond_emergency_contact(
+        self, contact_id: UUID, contact_account_id: UUID, accept: bool
+    ) -> dict | None: ...
+
+    async def revoke_emergency_contact(
+        self, contact_id: UUID, owner_account_id: UUID
+    ) -> bool: ...
+
+    async def compute_affected_accounts(
+        self, event_id: UUID
+    ) -> list[dict]: ...
+
+    async def create_seismic_alerts(
+        self, event_id: UUID, alerts: list[dict]
+    ) -> list[dict]: ...
+
+    async def list_alerts_for_event(
+        self, event_id: UUID
+    ) -> list[dict]: ...
+
+    async def accepted_owner_alerts_for_viewer(
+        self, event_id: UUID, viewer_account_id: UUID
+    ) -> list[dict]: ...
+
+    async def get_alert_for_authorized_viewer(
+        self, alert_id: UUID, viewer_account_id: UUID
+    ) -> dict | None: ...
+
+    async def list_my_seismic_alerts(
+        self, account_id: UUID
+    ) -> list[dict]: ...
+
+    async def confirm_safe(
+        self, account_id: UUID, event_id: UUID | None
+    ) -> list[dict]: ...
+
+    async def list_accepted_contact_recipients(
+        self, owner_account_id: UUID
+    ) -> list[dict]: ...
+
+    async def record_seismic_notifications(
+        self, rows: list[dict]
+    ) -> None: ...
+
+    async def log_emergency_access(
+        self,
+        viewer_account_id: UUID,
+        affected_account_id: UUID,
+        seismic_event_id: UUID | None,
+        alert_id: UUID | None,
+        access_type: str,
+    ) -> None: ...
+
+    async def deactivate_simulation(self, event_id: UUID) -> bool: ...
+
+    async def expire_my_active_alerts(self, account_id: UUID) -> int: ...
 
 
 # Tarjeta de persona sin fuente registrada: atribución genérica pública.
@@ -8509,6 +8643,879 @@ class PostgresDisasterRepository:
             offset,
         )
         return [dict(row) for row in rows], int(total)
+
+    # ------------------------------------------------------------------
+    # CHG-208 — Monitoreo sísmico y red privada de emergencia.
+    # ------------------------------------------------------------------
+
+    async def get_seismic_checkpoint(self, source: str) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT source, last_event_time, last_run_at,
+                   last_success_at, consecutive_failures
+            FROM disaster_service.seismic_poll_checkpoint
+            WHERE source = $1
+            """,
+            source,
+        )
+        return dict(row) if row else None
+
+    async def update_seismic_checkpoint(
+        self,
+        source: str,
+        *,
+        last_event_time: datetime | None,
+        success: bool,
+    ) -> None:
+        if success:
+            await self._pool.execute(
+                """
+                INSERT INTO disaster_service.seismic_poll_checkpoint (
+                    source, last_event_time, last_run_at,
+                    last_success_at, consecutive_failures, updated_at
+                ) VALUES ($1, $2, NOW(), NOW(), 0, NOW())
+                ON CONFLICT (source) DO UPDATE SET
+                    last_event_time = GREATEST(
+                        COALESCE(
+                            disaster_service.seismic_poll_checkpoint
+                                .last_event_time,
+                            to_timestamp(0)
+                        ),
+                        COALESCE(EXCLUDED.last_event_time,
+                                 to_timestamp(0))
+                    ),
+                    last_run_at = NOW(),
+                    last_success_at = NOW(),
+                    consecutive_failures = 0,
+                    updated_at = NOW()
+                """,
+                source,
+                last_event_time,
+            )
+        else:
+            await self._pool.execute(
+                """
+                INSERT INTO disaster_service.seismic_poll_checkpoint (
+                    source, last_run_at, consecutive_failures, updated_at
+                ) VALUES ($1, NOW(), 1, NOW())
+                ON CONFLICT (source) DO UPDATE SET
+                    last_run_at = NOW(),
+                    consecutive_failures =
+                        disaster_service.seismic_poll_checkpoint
+                            .consecutive_failures + 1,
+                    updated_at = NOW()
+                """,
+                source,
+            )
+
+    _SEISMIC_EVENT_COLUMNS = """
+        id, source, source_event_id, source_location_solution_id,
+        source_magnitude_solution_id, origin_time_utc, magnitude,
+        depth_km, latitude, longitude, municipality_code,
+        department_code, magnitude_source, location_source,
+        description, first_detected_at, last_updated_at, is_simulated,
+        notify_real_users, processing_status, deactivated_at
+    """
+
+    async def get_seismic_event_by_source(
+        self, source: str, source_event_id: str
+    ) -> dict | None:
+        row = await self._pool.fetchrow(
+            f"""
+            SELECT {self._SEISMIC_EVENT_COLUMNS}
+            FROM disaster_service.seismic_events
+            WHERE source = $1 AND source_event_id = $2
+            """,
+            source,
+            source_event_id,
+        )
+        return dict(row) if row else None
+
+    async def insert_seismic_event(self, **fields: object) -> dict:
+        row = await self._pool.fetchrow(
+            f"""
+            INSERT INTO disaster_service.seismic_events (
+                source, source_event_id, source_location_solution_id,
+                source_magnitude_solution_id, origin_time_utc,
+                magnitude, depth_km, latitude, longitude, epicenter,
+                municipality_code, department_code, magnitude_source,
+                location_source, description, source_payload,
+                is_simulated, simulated_by_account_id, notify_real_users
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                ST_SetSRID(ST_MakePoint($9, $8), 4326)::geography,
+                $10, $11, $12, $13, $14, $15, $16, $17, $18
+            )
+            RETURNING {self._SEISMIC_EVENT_COLUMNS}
+            """,
+            fields["source"],
+            fields["source_event_id"],
+            fields.get("source_location_solution_id"),
+            fields.get("source_magnitude_solution_id"),
+            fields["origin_time_utc"],
+            fields["magnitude"],
+            fields.get("depth_km"),
+            fields["latitude"],
+            fields["longitude"],
+            fields.get("municipality_code"),
+            fields.get("department_code"),
+            fields.get("magnitude_source"),
+            fields.get("location_source"),
+            fields.get("description"),
+            fields.get("source_payload"),
+            fields.get("is_simulated", False),
+            fields.get("simulated_by_account_id"),
+            fields.get("notify_real_users", True),
+        )
+        return dict(row)
+
+    async def apply_seismic_revision(
+        self, event_id: UUID, previous: dict, **fields: object
+    ) -> dict:
+        """Spec §10: la versión anterior queda en el histórico; nunca
+        se sobrescribe en silencio."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    INSERT INTO
+                        disaster_service.seismic_event_revisions (
+                        seismic_event_id, revision_number, magnitude,
+                        depth_km, latitude, longitude, origin_time_utc,
+                        source_location_solution_id,
+                        source_magnitude_solution_id, source_payload
+                    )
+                    SELECT $1,
+                           COALESCE(MAX(revision_number), 0) + 1,
+                           $2, $3, $4, $5, $6, $7, $8, $9
+                    FROM disaster_service.seismic_event_revisions
+                    WHERE seismic_event_id = $1
+                    """,
+                    event_id,
+                    previous["magnitude"],
+                    previous.get("depth_km"),
+                    previous["latitude"],
+                    previous["longitude"],
+                    previous["origin_time_utc"],
+                    previous.get("source_location_solution_id"),
+                    previous.get("source_magnitude_solution_id"),
+                    previous.get("source_payload"),
+                )
+                row = await connection.fetchrow(
+                    f"""
+                    UPDATE disaster_service.seismic_events SET
+                        source_location_solution_id = $2,
+                        source_magnitude_solution_id = $3,
+                        origin_time_utc = $4,
+                        magnitude = $5,
+                        depth_km = $6,
+                        latitude = $7,
+                        longitude = $8,
+                        epicenter = ST_SetSRID(
+                            ST_MakePoint($8, $7), 4326
+                        )::geography,
+                        source_payload = $9,
+                        last_updated_at = NOW()
+                    WHERE id = $1
+                    RETURNING {self._SEISMIC_EVENT_COLUMNS}
+                    """,
+                    event_id,
+                    fields.get("source_location_solution_id"),
+                    fields.get("source_magnitude_solution_id"),
+                    fields["origin_time_utc"],
+                    fields["magnitude"],
+                    fields.get("depth_km"),
+                    fields["latitude"],
+                    fields["longitude"],
+                    fields.get("source_payload"),
+                )
+        return dict(row)
+
+    async def list_public_seismic_events(
+        self, visibility_hours: int, limit: int
+    ) -> list[dict]:
+        rows = await self._pool.fetch(
+            f"""
+            SELECT {self._SEISMIC_EVENT_COLUMNS}
+            FROM disaster_service.seismic_events e
+            WHERE e.deactivated_at IS NULL
+              AND (
+                e.origin_time_utc >
+                    NOW() - make_interval(hours => $1)
+                OR EXISTS (
+                    SELECT 1
+                    FROM disaster_service.seismic_user_alerts a
+                    WHERE a.seismic_event_id = e.id
+                      AND a.status = 'ACTIVE'
+                      AND (a.expires_at IS NULL
+                           OR a.expires_at > NOW())
+                )
+              )
+            ORDER BY e.origin_time_utc DESC
+            LIMIT $2
+            """,
+            visibility_hours,
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+    async def get_seismic_event(self, event_id: UUID) -> dict | None:
+        row = await self._pool.fetchrow(
+            f"""
+            SELECT {self._SEISMIC_EVENT_COLUMNS}
+            FROM disaster_service.seismic_events
+            WHERE id = $1
+            """,
+            event_id,
+        )
+        return dict(row) if row else None
+
+    async def list_intensity_zones_for_events(
+        self, event_ids: list[UUID]
+    ) -> list[dict]:
+        if not event_ids:
+            return []
+        rows = await self._pool.fetch(
+            """
+            SELECT id, seismic_event_id, source, severity_level,
+                   intensity_min, intensity_max, generated_at,
+                   ST_AsGeoJSON(geometry)::text AS geometry_geojson
+            FROM disaster_service.seismic_intensity_zones
+            WHERE seismic_event_id = ANY($1::uuid[])
+              AND superseded_at IS NULL
+            ORDER BY seismic_event_id,
+                     CASE severity_level
+                         WHEN 'STRONG' THEN 0
+                         WHEN 'MODERATE' THEN 1
+                         ELSE 2
+                     END
+            """,
+            event_ids,
+        )
+        return [dict(row) for row in rows]
+
+    async def replace_intensity_zones(
+        self, event_id: UUID, zones: list[dict], supersede: bool
+    ) -> list[dict]:
+        """Spec §23: al llegar información nueva las zonas anteriores
+        se marcan reemplazadas, jamás se borran (auditoría de ambas)."""
+        stored: list[dict] = []
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                if supersede:
+                    await connection.execute(
+                        """
+                        UPDATE disaster_service.seismic_intensity_zones
+                        SET superseded_at = NOW()
+                        WHERE seismic_event_id = $1
+                          AND superseded_at IS NULL
+                        """,
+                        event_id,
+                    )
+                for zone in zones:
+                    row = await connection.fetchrow(
+                        """
+                        INSERT INTO
+                            disaster_service.seismic_intensity_zones (
+                            seismic_event_id, source, severity_level,
+                            intensity_min, intensity_max, geometry,
+                            source_revision
+                        ) VALUES (
+                            $1, $2, $3, $4, $5,
+                            ST_Multi(ST_SetSRID(
+                                ST_GeomFromGeoJSON($6), 4326
+                            )),
+                            $7
+                        )
+                        RETURNING id, seismic_event_id, source,
+                                  severity_level, intensity_min,
+                                  intensity_max, generated_at,
+                                  ST_AsGeoJSON(geometry)::text
+                                      AS geometry_geojson
+                        """,
+                        event_id,
+                        zone["source"],
+                        zone["severity_level"],
+                        zone.get("intensity_min"),
+                        zone.get("intensity_max"),
+                        zone["geometry_geojson"],
+                        zone.get("source_revision"),
+                    )
+                    stored.append(dict(row))
+        return stored
+
+    async def get_seismic_settings(
+        self, account_id: UUID
+    ) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT account_id, enabled, display_name, is_test_account,
+                   enabled_at, disabled_at
+            FROM disaster_service.user_seismic_settings
+            WHERE account_id = $1
+            """,
+            account_id,
+        )
+        return dict(row) if row else None
+
+    async def upsert_seismic_settings(
+        self,
+        account_id: UUID,
+        enabled: bool,
+        display_name: str | None,
+        *,
+        is_test_account: bool | None = None,
+    ) -> dict:
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO disaster_service.user_seismic_settings (
+                account_id, enabled, display_name, is_test_account,
+                enabled_at, disabled_at
+            ) VALUES (
+                $1, $2, $3, COALESCE($4, FALSE),
+                CASE WHEN $2 THEN NOW() END,
+                CASE WHEN NOT $2 THEN NOW() END
+            )
+            ON CONFLICT (account_id) DO UPDATE SET
+                enabled = EXCLUDED.enabled,
+                display_name = COALESCE(
+                    EXCLUDED.display_name,
+                    disaster_service.user_seismic_settings.display_name
+                ),
+                is_test_account = COALESCE(
+                    $4,
+                    disaster_service.user_seismic_settings
+                        .is_test_account
+                ),
+                enabled_at = CASE
+                    WHEN EXCLUDED.enabled THEN NOW()
+                    ELSE disaster_service.user_seismic_settings
+                        .enabled_at
+                END,
+                disabled_at = CASE
+                    WHEN NOT EXCLUDED.enabled THEN NOW()
+                    ELSE NULL
+                END,
+                updated_at = NOW()
+            RETURNING account_id, enabled, display_name,
+                      is_test_account, enabled_at, disabled_at
+            """,
+            account_id,
+            enabled,
+            display_name,
+            is_test_account,
+        )
+        return dict(row)
+
+    async def create_emergency_candidate(
+        self, **fields: object
+    ) -> dict:
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO
+                disaster_service.emergency_contact_candidates (
+                created_by_account_id, first_names, last_names,
+                document_type, document_encrypted, document_hash,
+                phone_normalized, name_normalized
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id, created_by_account_id, first_names,
+                      last_names, document_type, status, created_at
+            """,
+            fields["created_by_account_id"],
+            fields["first_names"],
+            fields["last_names"],
+            fields["document_type"],
+            fields["document_encrypted"],
+            fields["document_hash"],
+            fields["phone_normalized"],
+            fields["name_normalized"],
+        )
+        return dict(row)
+
+    async def create_emergency_contact(
+        self,
+        owner_account_id: UUID,
+        contact_account_id: UUID | None,
+        candidate_id: UUID | None,
+    ) -> dict | str:
+        live = await self._pool.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM disaster_service.emergency_contacts
+            WHERE owner_account_id = $1
+              AND status IN ('PENDING', 'ACCEPTED')
+            """,
+            owner_account_id,
+        )
+        if int(live) >= seismic_rules.MAX_EMERGENCY_CONTACTS:
+            return "limit"
+        try:
+            row = await self._pool.fetchrow(
+                """
+                INSERT INTO disaster_service.emergency_contacts (
+                    owner_account_id, contact_account_id, candidate_id
+                ) VALUES ($1, $2, $3)
+                RETURNING id, owner_account_id, contact_account_id,
+                          candidate_id, status, created_at
+                """,
+                owner_account_id,
+                contact_account_id,
+                candidate_id,
+            )
+        except asyncpg.UniqueViolationError:
+            return "duplicate"
+        return dict(row)
+
+    async def list_emergency_contacts_of_owner(
+        self, owner_account_id: UUID
+    ) -> list[dict]:
+        rows = await self._pool.fetch(
+            """
+            SELECT ec.id, ec.status, ec.contact_account_id,
+                   ec.candidate_id, ec.created_at, ec.accepted_at,
+                   c.first_names AS candidate_first_names,
+                   c.last_names AS candidate_last_names,
+                   c.document_type AS candidate_document_type,
+                   c.status AS candidate_status,
+                   s.display_name AS contact_display_name
+            FROM disaster_service.emergency_contacts ec
+            LEFT JOIN disaster_service.emergency_contact_candidates c
+                ON c.id = ec.candidate_id
+            LEFT JOIN disaster_service.user_seismic_settings s
+                ON s.account_id = ec.contact_account_id
+            WHERE ec.owner_account_id = $1
+              AND ec.status IN ('PENDING', 'ACCEPTED')
+            ORDER BY ec.created_at
+            """,
+            owner_account_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def list_emergency_invitations_for(
+        self, contact_account_id: UUID
+    ) -> list[dict]:
+        rows = await self._pool.fetch(
+            """
+            SELECT ec.id, ec.owner_account_id, ec.status,
+                   ec.created_at,
+                   s.display_name AS owner_display_name
+            FROM disaster_service.emergency_contacts ec
+            LEFT JOIN disaster_service.user_seismic_settings s
+                ON s.account_id = ec.owner_account_id
+            WHERE ec.contact_account_id = $1
+              AND ec.status = 'PENDING'
+            ORDER BY ec.created_at
+            """,
+            contact_account_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def match_unregistered_candidates(
+        self, document_hash: str | None, phone_normalized: str | None
+    ) -> list[dict]:
+        """Spec §29: solo invitaciones previamente creadas para esa
+        identidad; jamás un directorio por nombre."""
+        if document_hash is None and phone_normalized is None:
+            return []
+        rows = await self._pool.fetch(
+            """
+            SELECT id, created_by_account_id, first_names, last_names,
+                   document_hash, phone_normalized, name_normalized
+            FROM disaster_service.emergency_contact_candidates
+            WHERE status = 'UNREGISTERED'
+              AND (
+                ($1::text IS NOT NULL AND document_hash = $1)
+                OR ($2::text IS NOT NULL AND phone_normalized = $2)
+              )
+            ORDER BY created_at
+            """,
+            document_hash,
+            phone_normalized,
+        )
+        return [dict(row) for row in rows]
+
+    async def link_candidate_to_account(
+        self, candidate_id: UUID, account_id: UUID
+    ) -> dict | None:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    UPDATE disaster_service.emergency_contact_candidates
+                    SET status = 'MATCHED',
+                        matched_account_id = $2,
+                        matched_at = NOW()
+                    WHERE id = $1 AND status = 'UNREGISTERED'
+                    RETURNING id, created_by_account_id
+                    """,
+                    candidate_id,
+                    account_id,
+                )
+                if row is None:
+                    return None
+                await connection.execute(
+                    """
+                    UPDATE disaster_service.emergency_contacts
+                    SET contact_account_id = $2, updated_at = NOW()
+                    WHERE candidate_id = $1
+                      AND contact_account_id IS NULL
+                      AND status = 'PENDING'
+                      AND owner_account_id <> $2
+                    """,
+                    candidate_id,
+                    account_id,
+                )
+        return dict(row)
+
+    async def respond_emergency_contact(
+        self, contact_id: UUID, contact_account_id: UUID, accept: bool
+    ) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            UPDATE disaster_service.emergency_contacts
+            SET status = CASE WHEN $3 THEN 'ACCEPTED'
+                              ELSE 'REJECTED' END,
+                accepted_at = CASE WHEN $3 THEN NOW() END,
+                rejected_at = CASE WHEN NOT $3 THEN NOW() END,
+                updated_at = NOW()
+            WHERE id = $1
+              AND contact_account_id = $2
+              AND status = 'PENDING'
+            RETURNING id, owner_account_id, contact_account_id, status
+            """,
+            contact_id,
+            contact_account_id,
+            accept,
+        )
+        return dict(row) if row else None
+
+    async def revoke_emergency_contact(
+        self, contact_id: UUID, owner_account_id: UUID
+    ) -> bool:
+        """Spec §85: efecto inmediato — desde ya, esa persona vuelve a
+        ver el triángulo anónimo."""
+        result = await self._pool.execute(
+            """
+            UPDATE disaster_service.emergency_contacts
+            SET status = 'REVOKED', revoked_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1
+              AND owner_account_id = $2
+              AND status IN ('PENDING', 'ACCEPTED')
+            """,
+            contact_id,
+            owner_account_id,
+        )
+        return result.endswith("1")
+
+    async def compute_affected_accounts(
+        self, event_id: UUID
+    ) -> list[dict]:
+        """Spec §40: zonas activas × última ubicación conocida de las
+        cuentas con el servicio activado. Si un simulacro no alcanza a
+        cuentas reales (spec §67), solo entran las de prueba."""
+        rows = await self._pool.fetch(
+            """
+            WITH last_location AS (
+                SELECT DISTINCT ON (vp.account_id)
+                    vp.account_id, vp.latitude, vp.longitude,
+                    vp.accuracy_meters, vp.updated_at
+                FROM disaster_service.visitor_presence vp
+                WHERE vp.account_id IS NOT NULL
+                ORDER BY vp.account_id, vp.updated_at DESC
+            )
+            SELECT DISTINCT ON (l.account_id)
+                l.account_id, l.latitude, l.longitude,
+                l.accuracy_meters, l.updated_at AS located_at,
+                z.id AS zone_id, z.severity_level, s.display_name
+            FROM disaster_service.seismic_events e
+            JOIN disaster_service.seismic_intensity_zones z
+                ON z.seismic_event_id = e.id
+               AND z.superseded_at IS NULL
+            JOIN last_location l ON ST_Contains(
+                z.geometry,
+                ST_SetSRID(ST_MakePoint(l.longitude, l.latitude), 4326)
+            )
+            JOIN disaster_service.user_seismic_settings s
+                ON s.account_id = l.account_id
+               AND s.enabled
+               AND (e.notify_real_users OR s.is_test_account)
+            WHERE e.id = $1 AND e.deactivated_at IS NULL
+            ORDER BY l.account_id,
+                     CASE z.severity_level
+                         WHEN 'STRONG' THEN 0
+                         WHEN 'MODERATE' THEN 1
+                         ELSE 2
+                     END
+            """,
+            event_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def create_seismic_alerts(
+        self, event_id: UUID, alerts: list[dict]
+    ) -> list[dict]:
+        created: list[dict] = []
+        for alert in alerts:
+            row = await self._pool.fetchrow(
+                """
+                INSERT INTO disaster_service.seismic_user_alerts (
+                    seismic_event_id, account_id, zone_id,
+                    severity_level, event_latitude, event_longitude,
+                    event_location_accuracy, event_location_timestamp,
+                    resolved_address, expires_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (seismic_event_id, account_id) DO NOTHING
+                RETURNING id, seismic_event_id, account_id,
+                          severity_level, status, event_latitude,
+                          event_longitude, expires_at, created_at
+                """,
+                event_id,
+                alert["account_id"],
+                alert.get("zone_id"),
+                alert["severity_level"],
+                alert["event_latitude"],
+                alert["event_longitude"],
+                alert.get("event_location_accuracy"),
+                alert.get("event_location_timestamp"),
+                alert.get("resolved_address"),
+                alert.get("expires_at"),
+            )
+            if row is not None:
+                created.append(dict(row))
+        return created
+
+    async def _expire_due_alerts(self, event_id: UUID | None) -> None:
+        """Expiración perezosa (spec §52): al consultar, lo vencido
+        pasa a EXPIRED sin proceso de fondo adicional."""
+        if event_id is None:
+            await self._pool.execute(
+                """
+                UPDATE disaster_service.seismic_user_alerts
+                SET status = 'EXPIRED', updated_at = NOW()
+                WHERE status = 'ACTIVE'
+                  AND expires_at IS NOT NULL AND expires_at <= NOW()
+                """
+            )
+        else:
+            await self._pool.execute(
+                """
+                UPDATE disaster_service.seismic_user_alerts
+                SET status = 'EXPIRED', updated_at = NOW()
+                WHERE seismic_event_id = $1 AND status = 'ACTIVE'
+                  AND expires_at IS NOT NULL AND expires_at <= NOW()
+                """,
+                event_id,
+            )
+
+    async def list_alerts_for_event(
+        self, event_id: UUID
+    ) -> list[dict]:
+        await self._expire_due_alerts(event_id)
+        rows = await self._pool.fetch(
+            """
+            SELECT a.id, a.account_id, a.severity_level, a.status,
+                   a.event_latitude, a.event_longitude,
+                   a.safe_confirmed_at, a.created_at
+            FROM disaster_service.seismic_user_alerts a
+            WHERE a.seismic_event_id = $1
+              AND a.status IN ('ACTIVE', 'SAFE_CONFIRMED')
+            ORDER BY a.created_at
+            """,
+            event_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def accepted_owner_alerts_for_viewer(
+        self, event_id: UUID, viewer_account_id: UUID
+    ) -> list[dict]:
+        """Alertas de quienes eligieron al observador como contacto
+        ACEPTADO y tienen el servicio activo. El filtro es del backend
+        (spec §51), nunca del navegador."""
+        rows = await self._pool.fetch(
+            """
+            SELECT a.id, a.account_id, a.status, a.severity_level,
+                   s.display_name
+            FROM disaster_service.seismic_user_alerts a
+            JOIN disaster_service.emergency_contacts ec
+                ON ec.owner_account_id = a.account_id
+               AND ec.contact_account_id = $2
+               AND ec.status = 'ACCEPTED'
+            JOIN disaster_service.user_seismic_settings s
+                ON s.account_id = a.account_id AND s.enabled
+            WHERE a.seismic_event_id = $1
+              AND a.status IN ('ACTIVE', 'SAFE_CONFIRMED')
+            """,
+            event_id,
+            viewer_account_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def get_alert_for_authorized_viewer(
+        self, alert_id: UUID, viewer_account_id: UUID
+    ) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT a.id, a.account_id, a.status, a.severity_level,
+                   a.event_latitude, a.event_longitude,
+                   a.event_location_accuracy,
+                   a.event_location_timestamp, a.resolved_address,
+                   a.safe_confirmed_at, a.created_at,
+                   a.seismic_event_id,
+                   s.display_name,
+                   e.magnitude, e.origin_time_utc, e.is_simulated
+            FROM disaster_service.seismic_user_alerts a
+            JOIN disaster_service.emergency_contacts ec
+                ON ec.owner_account_id = a.account_id
+               AND ec.contact_account_id = $2
+               AND ec.status = 'ACCEPTED'
+            JOIN disaster_service.user_seismic_settings s
+                ON s.account_id = a.account_id AND s.enabled
+            JOIN disaster_service.seismic_events e
+                ON e.id = a.seismic_event_id
+            WHERE a.id = $1
+            """,
+            alert_id,
+            viewer_account_id,
+        )
+        return dict(row) if row else None
+
+    async def list_my_seismic_alerts(
+        self, account_id: UUID
+    ) -> list[dict]:
+        await self._expire_due_alerts(None)
+        rows = await self._pool.fetch(
+            """
+            SELECT a.id, a.seismic_event_id, a.status,
+                   a.severity_level, a.created_at, a.safe_confirmed_at,
+                   e.magnitude, e.origin_time_utc, e.is_simulated
+            FROM disaster_service.seismic_user_alerts a
+            JOIN disaster_service.seismic_events e
+                ON e.id = a.seismic_event_id
+            WHERE a.account_id = $1
+              AND a.status IN ('ACTIVE', 'SAFE_CONFIRMED')
+              AND e.deactivated_at IS NULL
+            ORDER BY a.created_at DESC
+            """,
+            account_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def confirm_safe(
+        self, account_id: UUID, event_id: UUID | None
+    ) -> list[dict]:
+        clause = "" if event_id is None else "AND seismic_event_id = $2"
+        values: list[object] = [account_id]
+        if event_id is not None:
+            values.append(event_id)
+        rows = await self._pool.fetch(
+            f"""
+            UPDATE disaster_service.seismic_user_alerts
+            SET status = 'SAFE_CONFIRMED',
+                safe_confirmed_at = NOW(), updated_at = NOW()
+            WHERE account_id = $1 AND status = 'ACTIVE' {clause}
+            RETURNING id, seismic_event_id, account_id,
+                      safe_confirmed_at
+            """,
+            *values,
+        )
+        return [dict(row) for row in rows]
+
+    async def list_accepted_contact_recipients(
+        self, owner_account_id: UUID
+    ) -> list[dict]:
+        rows = await self._pool.fetch(
+            """
+            SELECT ec.contact_account_id
+            FROM disaster_service.emergency_contacts ec
+            WHERE ec.owner_account_id = $1
+              AND ec.status = 'ACCEPTED'
+              AND ec.contact_account_id IS NOT NULL
+            """,
+            owner_account_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def record_seismic_notifications(
+        self, rows: list[dict]
+    ) -> None:
+        for entry in rows:
+            await self._pool.execute(
+                """
+                INSERT INTO disaster_service.seismic_notifications (
+                    alert_id, recipient_account_id, kind, channel,
+                    title, body, sent_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                entry["alert_id"],
+                entry["recipient_account_id"],
+                entry["kind"],
+                entry.get("channel", "RECORD"),
+                entry["title"],
+                entry["body"],
+                entry.get("sent_at"),
+            )
+
+    async def log_emergency_access(
+        self,
+        viewer_account_id: UUID,
+        affected_account_id: UUID,
+        seismic_event_id: UUID | None,
+        alert_id: UUID | None,
+        access_type: str,
+    ) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO
+                disaster_service.emergency_location_access_log (
+                viewer_account_id, affected_account_id,
+                seismic_event_id, alert_id, access_type
+            ) VALUES ($1, $2, $3, $4, $5)
+            """,
+            viewer_account_id,
+            affected_account_id,
+            seismic_event_id,
+            alert_id,
+            access_type,
+        )
+
+    async def deactivate_simulation(self, event_id: UUID) -> bool:
+        result = await self._pool.execute(
+            """
+            UPDATE disaster_service.seismic_events
+            SET deactivated_at = NOW(), last_updated_at = NOW()
+            WHERE id = $1 AND is_simulated
+              AND deactivated_at IS NULL
+            """,
+            event_id,
+        )
+        if not result.endswith("1"):
+            return False
+        await self._pool.execute(
+            """
+            UPDATE disaster_service.seismic_user_alerts
+            SET status = 'EXPIRED', updated_at = NOW()
+            WHERE seismic_event_id = $1 AND status = 'ACTIVE'
+            """,
+            event_id,
+        )
+        return True
+
+    async def expire_my_active_alerts(self, account_id: UUID) -> int:
+        """Spec §84: apagar el servicio detiene la compartición futura
+        de ubicación en el acto."""
+        result = await self._pool.execute(
+            """
+            UPDATE disaster_service.seismic_user_alerts
+            SET status = 'EXPIRED', updated_at = NOW()
+            WHERE account_id = $1 AND status = 'ACTIVE'
+            """,
+            account_id,
+        )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
 
 
 # CHG-044 — Helpers de ofertas comunitarias.

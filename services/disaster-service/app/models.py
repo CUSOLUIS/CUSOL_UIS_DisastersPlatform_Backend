@@ -2780,3 +2780,241 @@ class DamagedHomeComplaintReceipt(ApiModel):
 
 class DamagedHomeDeleteReceipt(ApiModel):
     deleted: int = Field(ge=0)
+
+
+# ---------------------------------------------------------------------------
+# CHG-208 — Monitoreo sísmico y red privada de emergencia.
+# ---------------------------------------------------------------------------
+
+SeismicSeverityLevel = Literal["STRONG", "MODERATE", "LIGHT"]
+SeismicAlertStatus = Literal["ACTIVE", "SAFE_CONFIRMED", "EXPIRED"]
+EmergencyContactStatus = Literal[
+    "PENDING", "ACCEPTED", "REJECTED", "REVOKED"
+]
+
+
+class SeismicZoneView(ApiModel):
+    id: UUID
+    severity_level: SeismicSeverityLevel
+    # 'SGC_INSTRUMENTAL', 'PROVISIONAL_ESTIMATE' o 'SIMULATED': el
+    # origen viaja siempre para que la interfaz jamás presente una
+    # estimación propia como dato oficial (spec §22).
+    source: Literal[
+        "SGC_INSTRUMENTAL", "PROVISIONAL_ESTIMATE", "SIMULATED"
+    ]
+    title: str
+    description: str
+    geometry: dict
+
+
+class SeismicEventView(ApiModel):
+    id: UUID
+    source: Literal["SGC", "SIMULATED"]
+    source_event_id: str
+    magnitude: float = Field(ge=-2, le=10)
+    depth_km: float | None = None
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    origin_time_utc: datetime
+    processing_status: Literal[
+        "SEISMIC_DATA_PRELIMINARY", "SEISMIC_DATA_INSTRUMENTAL"
+    ]
+    is_simulated: bool = False
+    simulated_banner: str | None = None
+    description: str | None = None
+    pending_instrumental_notice: str | None = None
+    zones: list[SeismicZoneView] = Field(default_factory=list)
+
+
+class SeismicEventsResponse(ApiModel):
+    events: list[SeismicEventView] = Field(max_length=20)
+    generated_at: datetime
+
+
+class SeismicAffectedMarker(ApiModel):
+    # Redondeada (~1,1 km) para el público; también para los marcadores
+    # identificados — la coordenada exacta solo viaja en el panel
+    # autorizado y auditado (spec §42/§50).
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    severity_level: SeismicSeverityLevel
+    status: SeismicAlertStatus
+    identified: bool = False
+    display_name: str | None = None
+    alert_id: UUID | None = None
+    is_self: bool = False
+
+
+class SeismicAffectedResponse(ApiModel):
+    event_id: UUID
+    markers: list[SeismicAffectedMarker] = Field(max_length=500)
+    generated_at: datetime
+
+
+class SeismicSettingsView(ApiModel):
+    enabled: bool
+    max_contacts: int = Field(default=5, ge=1, le=5)
+
+
+class SeismicSettingsUpdate(ApiModel):
+    enabled: bool
+    # La pone el gateway desde la sesión (patrón CHG-193); el navegador
+    # nunca decide con qué nombre figura nadie.
+    display_name: str | None = Field(default=None, max_length=161)
+
+
+class EmergencyContactInput(ApiModel):
+    first_names: str = Field(min_length=1, max_length=80)
+    last_names: str = Field(min_length=1, max_length=80)
+    document_type: str = Field(min_length=1, max_length=60)
+    document_number: str = Field(min_length=3, max_length=30)
+    phone: str = Field(
+        min_length=7,
+        max_length=PHONE_MAX_LENGTH,
+        pattern=PHONE_PATTERN,
+    )
+
+    @field_validator("document_type")
+    @classmethod
+    def documento_permitido(cls, value: str) -> str:
+        if value not in DOCUMENT_TYPES:
+            raise ValueError(
+                "documentType debe ser uno de los tipos permitidos"
+            )
+        return value
+
+
+class EmergencyContactView(ApiModel):
+    id: UUID
+    status: EmergencyContactStatus
+    display_name: str
+    linked: bool = False
+    created_at: datetime
+
+
+class EmergencyContactsResponse(ApiModel):
+    contacts: list[EmergencyContactView] = Field(max_length=5)
+    max_contacts: int = Field(default=5)
+
+
+class EmergencyInvitationView(ApiModel):
+    id: UUID
+    owner_display_name: str
+    created_at: datetime
+    # 'document' o 'phone': con qué se reforzó la coincidencia.
+    match_strength: Literal["document", "phone"] | None = None
+
+
+class EmergencyInvitationsResponse(ApiModel):
+    invitations: list[EmergencyInvitationView] = Field(max_length=20)
+
+
+class EmergencyInvitationMatchInput(ApiModel):
+    # Identidad puesta por el gateway desde la sesión.
+    display_name: str = Field(min_length=1, max_length=161)
+    phone: str | None = Field(default=None, max_length=PHONE_MAX_LENGTH)
+    # Documento tecleado voluntariamente por la persona para reforzar
+    # su coincidencia; jamás se guarda en claro.
+    document_number: str | None = Field(default=None, max_length=30)
+
+
+class EmergencyInvitationRespondInput(EmergencyInvitationMatchInput):
+    accept: bool
+
+
+class MySeismicAlertView(ApiModel):
+    id: UUID
+    event_id: UUID
+    status: SeismicAlertStatus
+    severity_level: SeismicSeverityLevel
+    magnitude: float
+    requires_confirmation: bool
+    is_simulated: bool
+    created_at: datetime
+
+
+class MySeismicAlertsResponse(ApiModel):
+    alerts: list[MySeismicAlertView] = Field(max_length=20)
+
+
+class ConfirmSafeInput(ApiModel):
+    event_id: UUID | None = None
+
+
+class ConfirmSafeReceipt(ApiModel):
+    confirmed: int = Field(ge=0)
+    confirmed_at: datetime
+
+
+class EmergencyPanelView(ApiModel):
+    """Lo que ve SOLO un contacto aceptado (spec §48): nunca incluye
+    el documento de identidad (spec §49)."""
+
+    alert_id: UUID
+    display_name: str
+    status: SeismicAlertStatus
+    magnitude: float
+    origin_time_utc: datetime
+    severity_level: SeismicSeverityLevel
+    zone_title: str
+    latitude: float
+    longitude: float
+    accuracy_meters: float | None = None
+    located_at: datetime | None = None
+    resolved_address: str | None = None
+    alert_created_at: datetime
+    safe_confirmed_at: datetime | None = None
+    is_simulated: bool = False
+
+
+class SeismicSimulationZoneInput(ApiModel):
+    severity_level: SeismicSeverityLevel
+    geometry: dict
+
+
+class SeismicSimulationInput(ApiModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    magnitude: float = Field(ge=0, le=10)
+    depth_km: float | None = Field(default=None, ge=0, le=800)
+    description: str | None = Field(default=None, max_length=300)
+    # Spec §67: por defecto un simulacro SOLO alcanza cuentas de
+    # prueba; alcanzar cuentas reales exige decisión explícita.
+    notify_real_users: bool = False
+    zones: list[SeismicSimulationZoneInput] | None = Field(
+        default=None, max_length=3
+    )
+
+
+class SeismicSimulationReceipt(ApiModel):
+    event_id: UUID
+    source_event_id: str
+    zones_created: int = Field(ge=0)
+    alerts_activated: int = Field(ge=0)
+    banner: str
+
+
+class SeismicTestAccountInput(ApiModel):
+    account_id: UUID
+    display_name: str = Field(min_length=1, max_length=161)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+
+
+class SeismicTestRelationInput(ApiModel):
+    owner_account_id: UUID
+    contact_account_id: UUID
+
+
+class SeismicTestAccountsInput(ApiModel):
+    accounts: list[SeismicTestAccountInput] = Field(
+        min_length=1, max_length=12
+    )
+    relations: list[SeismicTestRelationInput] = Field(
+        default_factory=list, max_length=40
+    )
+
+
+class SeismicTestAccountsReceipt(ApiModel):
+    accounts_configured: int = Field(ge=0)
+    relations_created: int = Field(ge=0)

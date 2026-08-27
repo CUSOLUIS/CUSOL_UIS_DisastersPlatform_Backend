@@ -46,6 +46,11 @@ class Settings:
     # CHG-205: la gemela de alojamiento lleva su propio cupo de
     # lectura; el mapa consulta las dos listas por separado.
     shelter_offer_read_rate_limit_per_minute: int = 60
+    # CHG-208: capa sísmica — el mapa sondea eventos/afectados con la
+    # señal de cambio; las escrituras (ajustes, contactos, ESTOY BIEN)
+    # son esporádicas y por cuenta.
+    seismic_read_rate_limit_per_minute: int = 60
+    seismic_write_rate_limit_per_minute: int = 20
     # CHG-171: lectura pública de La Mulera (ciudades + viajes activos,
     # el mapa sondea) y posiciones del GPS del conductor (~cada 20 s).
     transport_read_rate_limit_per_minute: int = 60
@@ -170,6 +175,12 @@ class Settings:
                 os.getenv(
                     "SHELTER_OFFER_READ_RATE_LIMIT_PER_MINUTE", "60"
                 )
+            ),
+            seismic_read_rate_limit_per_minute=int(
+                os.getenv("SEISMIC_READ_RATE_LIMIT_PER_MINUTE", "60")
+            ),
+            seismic_write_rate_limit_per_minute=int(
+                os.getenv("SEISMIC_WRITE_RATE_LIMIT_PER_MINUTE", "20")
             ),
             transport_read_rate_limit_per_minute=int(
                 os.getenv("TRANSPORT_READ_RATE_LIMIT_PER_MINUTE", "60")

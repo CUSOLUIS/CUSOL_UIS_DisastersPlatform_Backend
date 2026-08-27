@@ -1,8 +1,10 @@
+import asyncio as _asyncio
 import base64
 import hashlib
+import json as _json
 import secrets
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
@@ -15,6 +17,8 @@ from pydantic import Field, TypeAdapter, ValidationError
 from . import admin as admin_rules
 from . import notifications
 from . import offers as offer_rules
+from . import seismic as seismic_rules
+from . import seismic_ingest
 from .config import Settings
 from .models import (
     AidOfferKind,
@@ -169,6 +173,31 @@ from .photos import (
     strip_metadata,
 )
 from .models import SourceReference
+from .models import (
+    ConfirmSafeInput,
+    ConfirmSafeReceipt,
+    EmergencyContactInput,
+    EmergencyContactView,
+    EmergencyContactsResponse,
+    EmergencyInvitationMatchInput,
+    EmergencyInvitationRespondInput,
+    EmergencyInvitationView,
+    EmergencyInvitationsResponse,
+    EmergencyPanelView,
+    MySeismicAlertView,
+    MySeismicAlertsResponse,
+    SeismicAffectedMarker,
+    SeismicAffectedResponse,
+    SeismicEventView,
+    SeismicEventsResponse,
+    SeismicSettingsUpdate,
+    SeismicSettingsView,
+    SeismicSimulationInput,
+    SeismicSimulationReceipt,
+    SeismicTestAccountsInput,
+    SeismicTestAccountsReceipt,
+    SeismicZoneView,
+)
 from .repository import (
     AidOfferIdempotencyConflictError,
     DeceasedOutcomeFinalError,
@@ -797,6 +826,8 @@ def create_app(
     storage: ObjectStorage | None = None,
     scanner: MalwareScanner | None = None,
     notifier: notifications.ReportNotifier | None = None,
+    # CHG-208: adaptador del catálogo del SGC inyectable en pruebas.
+    sgc_provider: seismic_rules.SgcEventProvider | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_environment()
     object_storage = storage or LocalObjectStorage(
@@ -845,11 +876,47 @@ def create_app(
             "ningún dato quedó registrado.",
         )
 
+    # CHG-208: el poller del SGC es una tarea de fondo SUPERVISADA.
+    # Sus fallos no tocan los endpoints (aislamiento, spec §4/§81) y
+    # solo arranca cuando SGC_POLL_ENABLED lo pide.
+    async def start_sgc_poller(application: FastAPI):
+        if not resolved_settings.sgc_poll_enabled:
+            return None, None
+        provider = sgc_provider or seismic_ingest.HttpSgcEventProvider(
+            resolved_settings.sgc_catalog_url
+        )
+        stop_event = _asyncio.Event()
+        task = _asyncio.create_task(
+            seismic_ingest.supervised_poll_loop(
+                application.state.repository,
+                provider,
+                report_notifier,
+                resolved_settings.sgc_poll_interval_seconds,
+                stop_event,
+            )
+        )
+        return task, stop_event
+
+    async def stop_sgc_poller(task, stop_event):
+        if task is None:
+            return
+        stop_event.set()
+        try:
+            await _asyncio.wait_for(task, timeout=5)
+        except (TimeoutError, _asyncio.CancelledError):
+            task.cancel()
+
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         if repository is not None:
             application.state.repository = repository
-            yield
+            poller_task, poller_stop = await start_sgc_poller(
+                application
+            )
+            try:
+                yield
+            finally:
+                await stop_sgc_poller(poller_task, poller_stop)
             return
 
         pool = await asyncpg.create_pool(
@@ -859,9 +926,11 @@ def create_app(
             command_timeout=5,
         )
         application.state.repository = PostgresDisasterRepository(pool)
+        poller_task, poller_stop = await start_sgc_poller(application)
         try:
             yield
         finally:
+            await stop_sgc_poller(poller_task, poller_stop)
             await pool.close()
 
     application = FastAPI(
@@ -7197,6 +7266,775 @@ def create_app(
             limit=limit,
             offset=offset,
             generated_at=datetime.now(UTC),
+        )
+
+    # ------------------------------------------------------------------
+    # CHG-208 — Monitoreo sísmico y red privada de emergencia.
+    # ------------------------------------------------------------------
+
+    def _seismic_zone_views(
+        zone_rows: list[dict],
+    ) -> dict[UUID, list[SeismicZoneView]]:
+        by_event: dict[UUID, list[SeismicZoneView]] = {}
+        for row in zone_rows:
+            title, description = seismic_rules.ZONE_TEXTS[
+                row["severity_level"]
+            ]
+            by_event.setdefault(row["seismic_event_id"], []).append(
+                SeismicZoneView(
+                    id=row["id"],
+                    severity_level=row["severity_level"],
+                    source=row["source"],
+                    title=title,
+                    description=description,
+                    geometry=_json.loads(row["geometry_geojson"]),
+                )
+            )
+        return by_event
+
+    def _seismic_event_view(
+        event: dict, zones: list[SeismicZoneView]
+    ) -> SeismicEventView:
+        preliminary = (
+            event["processing_status"] == "SEISMIC_DATA_PRELIMINARY"
+        )
+        return SeismicEventView(
+            id=event["id"],
+            source=event["source"],
+            source_event_id=event["source_event_id"],
+            magnitude=event["magnitude"],
+            depth_km=event.get("depth_km"),
+            latitude=event["latitude"],
+            longitude=event["longitude"],
+            origin_time_utc=event["origin_time_utc"],
+            processing_status=event["processing_status"],
+            is_simulated=event["is_simulated"],
+            simulated_banner=(
+                seismic_rules.SIMULATED_BANNER
+                if event["is_simulated"]
+                else None
+            ),
+            description=event.get("description"),
+            pending_instrumental_notice=(
+                seismic_rules.PENDING_INSTRUMENTAL_NOTICE
+                if preliminary and not event["is_simulated"]
+                else None
+            ),
+            zones=zones,
+        )
+
+    def resolve_super_admin(
+        request: Request,
+    ) -> UUID | JSONResponse:
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401,
+                "Sesión requerida",
+                "Esta operación exige una cuenta autenticada.",
+            )
+        role = request.headers.get("x-actor-role", "").strip()
+        if role != "super_admin":
+            return problem(
+                403,
+                "Permiso insuficiente",
+                "Solo el Super Administrador puede operar el "
+                "generador sísmico.",
+            )
+        return account_id
+
+    def require_account(
+        request: Request,
+    ) -> UUID | JSONResponse:
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        actor_kind, account_id = actor
+        if actor_kind != "authenticated" or account_id is None:
+            return problem(
+                401,
+                "Sesión requerida",
+                "Esta operación exige una cuenta autenticada "
+                "resuelta por el gateway.",
+            )
+        return account_id
+
+    @application.get(
+        "/internal/v1/seismic/events",
+        response_model=SeismicEventsResponse,
+        response_model_by_alias=True,
+        tags=["Seismic"],
+    )
+    async def list_seismic_events(
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        events = await data.list_public_seismic_events(
+            resolved_settings.seismic_visibility_hours, 20
+        )
+        zones = await data.list_intensity_zones_for_events(
+            [event["id"] for event in events]
+        )
+        zone_views = _seismic_zone_views(zones)
+        return SeismicEventsResponse(
+            events=[
+                _seismic_event_view(
+                    event, zone_views.get(event["id"], [])
+                )
+                for event in events
+            ],
+            generated_at=datetime.now(UTC),
+        )
+
+    @application.get(
+        "/internal/v1/seismic/events/{event_id}/affected",
+        response_model=SeismicAffectedResponse,
+        response_model_by_alias=True,
+        tags=["Seismic"],
+    )
+    async def list_seismic_affected(
+        event_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        """Spec §41-45 y §51: el backend filtra la autorización. El
+        público recibe triángulos ANÓNIMOS con coordenada redondeada;
+        solo el contacto ACEPTADO recibe nombre y alertId — y la
+        coordenada exacta únicamente en el panel auditado."""
+        event = await data.get_seismic_event(event_id)
+        if event is None or event.get("deactivated_at") is not None:
+            return problem(
+                404,
+                "Evento no disponible",
+                "El evento sísmico no existe o fue retirado.",
+            )
+        actor = resolve_actor(request)
+        if isinstance(actor, JSONResponse):
+            return actor
+        _actor_kind, viewer_account_id = actor
+        alerts = await data.list_alerts_for_event(event_id)
+        identified: dict[UUID, dict] = {}
+        if viewer_account_id is not None:
+            authorized = await data.accepted_owner_alerts_for_viewer(
+                event_id, viewer_account_id
+            )
+            identified = {row["id"]: row for row in authorized}
+        markers: list[SeismicAffectedMarker] = []
+        for alert in alerts:
+            latitude, longitude = seismic_rules.anonymize_coordinate(
+                alert["event_latitude"], alert["event_longitude"]
+            )
+            marker = SeismicAffectedMarker(
+                latitude=latitude,
+                longitude=longitude,
+                severity_level=alert["severity_level"],
+                status=alert["status"],
+            )
+            if (
+                viewer_account_id is not None
+                and alert["account_id"] == viewer_account_id
+            ):
+                marker.is_self = True
+                marker.alert_id = alert["id"]
+            elif alert["id"] in identified:
+                row = identified[alert["id"]]
+                marker.identified = True
+                marker.display_name = row["display_name"]
+                marker.alert_id = alert["id"]
+                # Spec §79: la identificación en el mapa ya es acceso
+                # a información sensible; queda auditada.
+                await data.log_emergency_access(
+                    viewer_account_id,
+                    alert["account_id"],
+                    event_id,
+                    alert["id"],
+                    "MARKER",
+                )
+            markers.append(marker)
+        return SeismicAffectedResponse(
+            event_id=event_id,
+            markers=markers,
+            generated_at=datetime.now(UTC),
+        )
+
+    @application.get(
+        "/internal/v1/seismic/settings",
+        response_model=SeismicSettingsView,
+        response_model_by_alias=True,
+        tags=["Seismic"],
+    )
+    async def get_seismic_settings(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = require_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        settings_row = await data.get_seismic_settings(account_id)
+        return SeismicSettingsView(
+            enabled=bool(settings_row and settings_row["enabled"]),
+            max_contacts=seismic_rules.MAX_EMERGENCY_CONTACTS,
+        )
+
+    @application.put(
+        "/internal/v1/seismic/settings",
+        response_model=SeismicSettingsView,
+        response_model_by_alias=True,
+        tags=["Seismic"],
+    )
+    async def update_seismic_settings(
+        request: Request,
+        payload: SeismicSettingsUpdate,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = require_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        row = await data.upsert_seismic_settings(
+            account_id, payload.enabled, payload.display_name
+        )
+        if not payload.enabled:
+            # Spec §84: apagar detiene alertas y compartición futura
+            # en el acto; el histórico queda para auditoría.
+            await data.expire_my_active_alerts(account_id)
+        return SeismicSettingsView(
+            enabled=row["enabled"],
+            max_contacts=seismic_rules.MAX_EMERGENCY_CONTACTS,
+        )
+
+    def _contact_view(row: dict) -> EmergencyContactView:
+        display_name = row.get("contact_display_name")
+        if not display_name:
+            first = row.get("candidate_first_names") or ""
+            last = row.get("candidate_last_names") or ""
+            display_name = f"{first} {last}".strip() or "Contacto"
+        return EmergencyContactView(
+            id=row["id"],
+            status=row["status"],
+            display_name=display_name,
+            linked=row.get("contact_account_id") is not None,
+            created_at=row["created_at"],
+        )
+
+    @application.get(
+        "/internal/v1/seismic/contacts",
+        response_model=EmergencyContactsResponse,
+        response_model_by_alias=True,
+        tags=["Seismic"],
+    )
+    async def list_emergency_contacts(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = require_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        rows = await data.list_emergency_contacts_of_owner(account_id)
+        return EmergencyContactsResponse(
+            contacts=[_contact_view(row) for row in rows],
+            max_contacts=seismic_rules.MAX_EMERGENCY_CONTACTS,
+        )
+
+    @application.post(
+        "/internal/v1/seismic/contacts",
+        response_model=EmergencyContactView,
+        response_model_by_alias=True,
+        status_code=201,
+        tags=["Seismic"],
+    )
+    async def create_emergency_contact(
+        request: Request,
+        payload: EmergencyContactInput,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = require_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        settings_row = await data.get_seismic_settings(account_id)
+        if not (settings_row and settings_row["enabled"]):
+            return problem(
+                409,
+                "Servicio desactivado",
+                "Activa «Alertas sísmicas y red de emergencia» antes "
+                "de registrar contactos.",
+            )
+        candidate = await data.create_emergency_candidate(
+            created_by_account_id=account_id,
+            first_names=payload.first_names.strip(),
+            last_names=payload.last_names.strip(),
+            document_type=payload.document_type,
+            document_encrypted=encrypt(payload.document_number),
+            document_hash=seismic_rules.document_hash(
+                payload.document_number
+            ),
+            phone_normalized=seismic_rules.normalize_phone(
+                payload.phone
+            ),
+            name_normalized=seismic_rules.normalize_name(
+                f"{payload.first_names} {payload.last_names}"
+            ),
+        )
+        result = await data.create_emergency_contact(
+            account_id, None, candidate["id"]
+        )
+        if result == "limit":
+            return problem(
+                422,
+                "Límite de contactos",
+                "La red de emergencia admite máximo cinco contactos.",
+            )
+        if result == "duplicate":
+            return problem(
+                409,
+                "Contacto duplicado",
+                "Esa persona ya está en tu red de emergencia.",
+            )
+        return _contact_view(
+            {
+                **result,
+                "candidate_first_names": candidate["first_names"],
+                "candidate_last_names": candidate["last_names"],
+                "contact_display_name": None,
+            }
+        )
+
+    @application.delete(
+        "/internal/v1/seismic/contacts/{contact_id}",
+        status_code=204,
+        tags=["Seismic"],
+    )
+    async def revoke_emergency_contact(
+        contact_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = require_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        revoked = await data.revoke_emergency_contact(
+            contact_id, account_id
+        )
+        if not revoked:
+            return problem(
+                404,
+                "Contacto no disponible",
+                "El contacto no existe, no es tuyo o ya estaba "
+                "revocado.",
+            )
+        return JSONResponse(status_code=204, content=None)
+
+    @application.post(
+        "/internal/v1/seismic/invitations/match",
+        response_model=EmergencyInvitationsResponse,
+        response_model_by_alias=True,
+        tags=["Seismic"],
+    )
+    async def match_emergency_invitations(
+        request: Request,
+        payload: EmergencyInvitationMatchInput,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        """Spec §29-§32: coincidencias SOLO desde invitaciones creadas
+        para esa identidad, reforzadas por documento o por teléfono con
+        nombre coherente. Jamás un directorio por nombre (spec §74)."""
+        account_id = require_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        claimed_document = payload.document_number
+        claimed_phone = payload.phone
+        document_hashed = (
+            seismic_rules.document_hash(claimed_document)
+            if claimed_document
+            else None
+        )
+        phone_normalized = (
+            seismic_rules.normalize_phone(claimed_phone)
+            if claimed_phone
+            else None
+        )
+        strengths: dict[UUID, str] = {}
+        candidates = await data.match_unregistered_candidates(
+            document_hashed, phone_normalized
+        )
+        for candidate in candidates:
+            strength = seismic_rules.match_strength(
+                candidate_document_hash=candidate["document_hash"],
+                candidate_phone_normalized=candidate[
+                    "phone_normalized"
+                ],
+                candidate_name_normalized=candidate["name_normalized"],
+                claimed_document=claimed_document,
+                claimed_phone=claimed_phone,
+                claimed_full_name=payload.display_name,
+            )
+            if strength is None:
+                continue
+            linked = await data.link_candidate_to_account(
+                candidate["id"], account_id
+            )
+            if linked is not None:
+                strengths[candidate["id"]] = strength
+        invitations = await data.list_emergency_invitations_for(
+            account_id
+        )
+        return EmergencyInvitationsResponse(
+            invitations=[
+                EmergencyInvitationView(
+                    id=row["id"],
+                    owner_display_name=(
+                        row.get("owner_display_name")
+                        or "Una persona registrada"
+                    ),
+                    created_at=row["created_at"],
+                    match_strength=strengths.get(
+                        row.get("candidate_id")
+                    ),
+                )
+                for row in invitations
+            ]
+        )
+
+    @application.post(
+        "/internal/v1/seismic/invitations/{contact_id}/respond",
+        response_model=EmergencyContactView,
+        response_model_by_alias=True,
+        tags=["Seismic"],
+    )
+    async def respond_emergency_invitation(
+        contact_id: UUID,
+        request: Request,
+        payload: EmergencyInvitationRespondInput,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        """Spec §33: el vínculo solo queda activo tras ACEPTAR."""
+        account_id = require_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        row = await data.respond_emergency_contact(
+            contact_id, account_id, payload.accept
+        )
+        if row is None:
+            return problem(
+                404,
+                "Invitación no disponible",
+                "La invitación no existe, no es para ti o ya fue "
+                "respondida.",
+            )
+        return EmergencyContactView(
+            id=row["id"],
+            status=row["status"],
+            display_name=payload.display_name,
+            linked=True,
+            created_at=datetime.now(UTC),
+        )
+
+    @application.get(
+        "/internal/v1/seismic/alerts/mine",
+        response_model=MySeismicAlertsResponse,
+        response_model_by_alias=True,
+        tags=["Seismic"],
+    )
+    async def list_my_seismic_alerts(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        account_id = require_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        rows = await data.list_my_seismic_alerts(account_id)
+        return MySeismicAlertsResponse(
+            alerts=[
+                MySeismicAlertView(
+                    id=row["id"],
+                    event_id=row["seismic_event_id"],
+                    status=row["status"],
+                    severity_level=row["severity_level"],
+                    magnitude=row["magnitude"],
+                    requires_confirmation=(
+                        row["status"] == "ACTIVE"
+                        and seismic_rules.requires_confirmation(
+                            row["magnitude"]
+                        )
+                    ),
+                    is_simulated=row["is_simulated"],
+                    created_at=row["created_at"],
+                )
+                for row in rows[:20]
+            ]
+        )
+
+    @application.post(
+        "/internal/v1/seismic/alerts/mine/confirm-safe",
+        response_model=ConfirmSafeReceipt,
+        response_model_by_alias=True,
+        tags=["Seismic"],
+    )
+    async def confirm_safe(
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        """«ESTOY BIEN» (spec §54/§59): ACTIVE → SAFE_CONFIRMED y sus
+        contactos aceptados reciben la confirmación."""
+        account_id = require_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        raw_body = await request.body()
+        try:
+            payload = (
+                ConfirmSafeInput.model_validate_json(raw_body)
+                if raw_body
+                else ConfirmSafeInput()
+            )
+        except ValidationError as error:
+            return invalid_fields_problem(error)
+        confirmed = await data.confirm_safe(
+            account_id, payload.event_id
+        )
+        now = datetime.now(UTC)
+        if confirmed:
+            settings_row = await data.get_seismic_settings(account_id)
+            display_name = (
+                settings_row.get("display_name")
+                if settings_row
+                else None
+            ) or "Una persona"
+            hora_local = confirmed[0]["safe_confirmed_at"].astimezone(
+                timezone(timedelta(hours=-5))
+            ).strftime("%H:%M")
+            title, body = seismic_rules.safe_notification_texts(
+                display_name, hora_local
+            )
+            for alert in confirmed:
+                await seismic_ingest._notify_alert_recipients(
+                    data,
+                    report_notifier,
+                    alert_id=alert["id"],
+                    owner_account_id=account_id,
+                    kind="SAFE_CONFIRMED",
+                    title=title,
+                    body=body,
+                    tracking_code=str(alert["seismic_event_id"]),
+                )
+        return ConfirmSafeReceipt(
+            confirmed=len(confirmed), confirmed_at=now
+        )
+
+    @application.get(
+        "/internal/v1/seismic/alerts/{alert_id}",
+        response_model=EmergencyPanelView,
+        response_model_by_alias=True,
+        tags=["Seismic"],
+    )
+    async def get_emergency_panel(
+        alert_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        """Panel privado (spec §46-§50): solo contactos ACEPTADOS; una
+        alerta ajena responde lo mismo que una inexistente. Cada
+        apertura queda en la auditoría de accesos. El documento de
+        identidad JAMÁS se incluye (spec §49)."""
+        account_id = require_account(request)
+        if isinstance(account_id, JSONResponse):
+            return account_id
+        row = await data.get_alert_for_authorized_viewer(
+            alert_id, account_id
+        )
+        if row is None:
+            return problem(
+                404,
+                "Alerta no disponible",
+                "La alerta no existe o no estás autorizado para "
+                "consultarla.",
+            )
+        await data.log_emergency_access(
+            account_id,
+            row["account_id"],
+            row["seismic_event_id"],
+            alert_id,
+            "PANEL",
+        )
+        return EmergencyPanelView(
+            alert_id=row["id"],
+            display_name=row["display_name"] or "Una persona",
+            status=row["status"],
+            magnitude=row["magnitude"],
+            origin_time_utc=row["origin_time_utc"],
+            severity_level=row["severity_level"],
+            zone_title=seismic_rules.ZONE_TEXTS[
+                row["severity_level"]
+            ][0],
+            latitude=row["event_latitude"],
+            longitude=row["event_longitude"],
+            accuracy_meters=row.get("event_location_accuracy"),
+            located_at=row.get("event_location_timestamp"),
+            resolved_address=row.get("resolved_address"),
+            alert_created_at=row["created_at"],
+            safe_confirmed_at=row.get("safe_confirmed_at"),
+            is_simulated=row["is_simulated"],
+        )
+
+    @application.post(
+        "/internal/v1/admin/seismic/simulations",
+        response_model=SeismicSimulationReceipt,
+        response_model_by_alias=True,
+        status_code=201,
+        tags=["Seismic"],
+    )
+    async def create_seismic_simulation(
+        request: Request,
+        payload: SeismicSimulationInput,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        """Generador del Super Admin (spec §62-§67): epicentro elegido
+        en el mapa, zonas automáticas o polígonos manuales irregulares,
+        `is_simulated` siempre, y por defecto SOLO cuentas de prueba."""
+        admin_id = resolve_super_admin(request)
+        if isinstance(admin_id, JSONResponse):
+            return admin_id
+        manual_zones: list[dict] = []
+        if payload.zones:
+            for zone in payload.zones:
+                reason = seismic_rules.validate_manual_zone_geometry(
+                    zone.geometry
+                )
+                if reason is not None:
+                    return problem(422, "Zona inválida", reason)
+                manual_zones.append(
+                    {
+                        "source": "SIMULATED",
+                        "severity_level": zone.severity_level,
+                        "geometry_geojson": _json.dumps(zone.geometry),
+                    }
+                )
+        now = datetime.now(UTC)
+        event = await data.insert_seismic_event(
+            source="SIMULATED",
+            source_event_id=seismic_rules.simulation_event_id(
+                now, secrets.token_hex(4)
+            ),
+            origin_time_utc=now,
+            magnitude=payload.magnitude,
+            depth_km=payload.depth_km,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            description=payload.description,
+            is_simulated=True,
+            simulated_by_account_id=admin_id,
+            notify_real_users=payload.notify_real_users,
+        )
+        if manual_zones:
+            zones_created = len(
+                await data.replace_intensity_zones(
+                    event["id"], manual_zones, supersede=False
+                )
+            )
+        else:
+            auto = seismic_rules.provisional_zones_geojson(
+                magnitude=payload.magnitude,
+                depth_km=payload.depth_km,
+                latitude=payload.latitude,
+                longitude=payload.longitude,
+            )
+            zones_created = len(
+                await data.replace_intensity_zones(
+                    event["id"],
+                    [
+                        {
+                            "source": "SIMULATED",
+                            "severity_level": severity,
+                            "geometry_geojson": _json.dumps(geometry),
+                        }
+                        for severity, geometry in auto
+                    ],
+                    supersede=False,
+                )
+            )
+        created = await seismic_ingest.activate_alerts_for_event(
+            data, report_notifier, event
+        )
+        return SeismicSimulationReceipt(
+            event_id=event["id"],
+            source_event_id=event["source_event_id"],
+            zones_created=zones_created,
+            alerts_activated=len(created),
+            banner=seismic_rules.SIMULATED_BANNER,
+        )
+
+    @application.delete(
+        "/internal/v1/admin/seismic/simulations/{event_id}",
+        status_code=204,
+        tags=["Seismic"],
+    )
+    async def delete_seismic_simulation(
+        event_id: UUID,
+        request: Request,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        admin_id = resolve_super_admin(request)
+        if isinstance(admin_id, JSONResponse):
+            return admin_id
+        removed = await data.deactivate_simulation(event_id)
+        if not removed:
+            return problem(
+                404,
+                "Simulacro no disponible",
+                "El evento no existe, no es un simulacro o ya fue "
+                "retirado.",
+            )
+        return JSONResponse(status_code=204, content=None)
+
+    @application.post(
+        "/internal/v1/admin/seismic/test-accounts",
+        response_model=SeismicTestAccountsReceipt,
+        response_model_by_alias=True,
+        tags=["Seismic"],
+    )
+    async def configure_seismic_test_accounts(
+        request: Request,
+        payload: SeismicTestAccountsInput,
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+    ):
+        """Spec §68-§70: cuentas de prueba con ubicación y relaciones
+        cruzadas para verificar privacidad de punta a punta."""
+        admin_id = resolve_super_admin(request)
+        if isinstance(admin_id, JSONResponse):
+            return admin_id
+        for account in payload.accounts:
+            await data.upsert_seismic_settings(
+                account.account_id,
+                True,
+                account.display_name,
+                is_test_account=True,
+            )
+            await data.upsert_visitor_presence(
+                uuid4(),
+                account.account_id,
+                account.latitude,
+                account.longitude,
+                10.0,
+                "web",
+            )
+        relations_created = 0
+        for relation in payload.relations:
+            result = await data.create_emergency_contact(
+                relation.owner_account_id,
+                relation.contact_account_id,
+                None,
+            )
+            if isinstance(result, dict):
+                accepted = await data.respond_emergency_contact(
+                    result["id"],
+                    relation.contact_account_id,
+                    True,
+                )
+                if accepted is not None:
+                    relations_created += 1
+        return SeismicTestAccountsReceipt(
+            accounts_configured=len(payload.accounts),
+            relations_created=relations_created,
         )
 
     return application

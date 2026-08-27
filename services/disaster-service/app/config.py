@@ -27,6 +27,17 @@ class Settings:
     notification_timeout_seconds: float = 5.0
     # CHG-111: commit del que salió la imagen, inyectado por el build.
     git_revision: str = "unknown"
+    # CHG-208: polling del catálogo de sismos del SGC. Apagado por
+    # defecto (la Pi es testing); el intervalo es parametrizable y
+    # nunca vive cableado en el código (spec §6).
+    sgc_poll_enabled: bool = False
+    sgc_poll_interval_seconds: int = 15
+    sgc_catalog_url: str = (
+        "https://services1.arcgis.com/121aH0BAWntBBTHM/arcgis/rest/"
+        "services/catalogo_de_sismos_2/FeatureServer/0"
+    )
+    # Ventana de visibilidad de un evento en el mapa público.
+    seismic_visibility_hours: int = 24
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -61,4 +72,19 @@ class Settings:
             ),
             git_revision=os.getenv("GIT_REVISION", "unknown").strip()
             or "unknown",
+            sgc_poll_enabled=(
+                os.getenv("SGC_POLL_ENABLED", "false").strip().lower()
+                == "true"
+            ),
+            sgc_poll_interval_seconds=max(
+                5, int(os.getenv("SGC_POLL_INTERVAL_SECONDS", "15"))
+            ),
+            sgc_catalog_url=os.getenv(
+                "SGC_CATALOG_URL",
+                "https://services1.arcgis.com/121aH0BAWntBBTHM/arcgis/"
+                "rest/services/catalogo_de_sismos_2/FeatureServer/0",
+            ).rstrip("/"),
+            seismic_visibility_hours=int(
+                os.getenv("SEISMIC_EVENT_VISIBILITY_HOURS", "24")
+            ),
         )

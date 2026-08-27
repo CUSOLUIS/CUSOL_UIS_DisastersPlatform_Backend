@@ -1537,3 +1537,162 @@ class DamagedHomeReportReceipt(ApiModel):
     # CHG-182: código público para citar la casita en avisos y correos.
     public_code: str | None = Field(default=None, max_length=40)
     created_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# CHG-208 — Monitoreo sísmico y red privada de emergencia (espejos de
+# los modelos del disaster-service; el gateway revalida lo que sirve).
+# ---------------------------------------------------------------------------
+
+SeismicSeverityLevel = Literal["STRONG", "MODERATE", "LIGHT"]
+SeismicAlertStatus = Literal["ACTIVE", "SAFE_CONFIRMED", "EXPIRED"]
+
+
+class SeismicZoneView(ApiModel):
+    id: UUID
+    severity_level: SeismicSeverityLevel
+    source: Literal[
+        "SGC_INSTRUMENTAL", "PROVISIONAL_ESTIMATE", "SIMULATED"
+    ]
+    title: str
+    description: str
+    geometry: dict
+
+
+class SeismicEventView(ApiModel):
+    id: UUID
+    source: Literal["SGC", "SIMULATED"]
+    source_event_id: str
+    magnitude: float
+    depth_km: float | None = None
+    latitude: float
+    longitude: float
+    origin_time_utc: datetime
+    processing_status: Literal[
+        "SEISMIC_DATA_PRELIMINARY", "SEISMIC_DATA_INSTRUMENTAL"
+    ]
+    is_simulated: bool = False
+    simulated_banner: str | None = None
+    description: str | None = None
+    pending_instrumental_notice: str | None = None
+    zones: list[SeismicZoneView] = Field(default_factory=list)
+
+
+class SeismicEventsResponse(ApiModel):
+    events: list[SeismicEventView] = Field(max_length=20)
+    generated_at: datetime
+
+
+class SeismicAffectedMarker(ApiModel):
+    latitude: float
+    longitude: float
+    severity_level: SeismicSeverityLevel
+    status: SeismicAlertStatus
+    identified: bool = False
+    display_name: str | None = None
+    alert_id: UUID | None = None
+    is_self: bool = False
+
+
+class SeismicAffectedResponse(ApiModel):
+    event_id: UUID
+    markers: list[SeismicAffectedMarker] = Field(max_length=500)
+    generated_at: datetime
+
+
+class SeismicSettingsView(ApiModel):
+    enabled: bool
+    max_contacts: int = 5
+
+
+class SeismicSettingsClientUpdate(ApiModel):
+    """Lo único que declara el navegador: encendido o apagado. El
+    nombre visible lo pone el gateway desde la sesión (CHG-193)."""
+
+    enabled: bool
+
+
+class EmergencyContactView(ApiModel):
+    id: UUID
+    status: Literal["PENDING", "ACCEPTED", "REJECTED", "REVOKED"]
+    display_name: str
+    linked: bool = False
+    created_at: datetime
+
+
+class EmergencyContactsResponse(ApiModel):
+    contacts: list[EmergencyContactView] = Field(max_length=5)
+    max_contacts: int = 5
+
+
+class EmergencyInvitationView(ApiModel):
+    id: UUID
+    owner_display_name: str
+    created_at: datetime
+    match_strength: Literal["document", "phone"] | None = None
+
+
+class EmergencyInvitationsResponse(ApiModel):
+    invitations: list[EmergencyInvitationView] = Field(max_length=20)
+
+
+class EmergencyInvitationClientMatch(ApiModel):
+    """El documento lo teclea la persona para reforzar SU coincidencia;
+    la identidad restante sale de la sesión, no del navegador."""
+
+    document_number: str | None = Field(default=None, max_length=30)
+
+
+class EmergencyInvitationClientRespond(ApiModel):
+    accept: bool
+
+
+class MySeismicAlertView(ApiModel):
+    id: UUID
+    event_id: UUID
+    status: SeismicAlertStatus
+    severity_level: SeismicSeverityLevel
+    magnitude: float
+    requires_confirmation: bool
+    is_simulated: bool
+    created_at: datetime
+
+
+class MySeismicAlertsResponse(ApiModel):
+    alerts: list[MySeismicAlertView] = Field(max_length=20)
+
+
+class ConfirmSafeReceipt(ApiModel):
+    confirmed: int
+    confirmed_at: datetime
+
+
+class EmergencyPanelView(ApiModel):
+    alert_id: UUID
+    display_name: str
+    status: SeismicAlertStatus
+    magnitude: float
+    origin_time_utc: datetime
+    severity_level: SeismicSeverityLevel
+    zone_title: str
+    latitude: float
+    longitude: float
+    accuracy_meters: float | None = None
+    located_at: datetime | None = None
+    resolved_address: str | None = None
+    alert_created_at: datetime
+    safe_confirmed_at: datetime | None = None
+    is_simulated: bool = False
+
+
+class SeismicSimulationReceipt(ApiModel):
+    event_id: UUID
+    source_event_id: str
+    zones_created: int
+    alerts_activated: int
+    banner: str
+
+
+class SeismicTestAccountsReceipt(ApiModel):
+    accounts_configured: int
+    relations_created: int

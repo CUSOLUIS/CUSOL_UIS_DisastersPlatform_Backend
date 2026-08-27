@@ -15,6 +15,23 @@ from pydantic import ValidationError
 
 from .config import Settings
 from .models import (
+    ConfirmSafeReceipt,
+    EmergencyContactView,
+    EmergencyContactsResponse,
+    EmergencyInvitationClientMatch,
+    EmergencyInvitationClientRespond,
+    EmergencyInvitationsResponse,
+    EmergencyPanelView,
+    MySeismicAlertsResponse,
+    SeismicAffectedResponse,
+    SeismicEventsResponse,
+    SeismicSettingsClientUpdate,
+    SeismicSettingsView,
+    SeismicSimulationReceipt,
+    SeismicTestAccountsReceipt,
+)
+from .models import (
+
     AccountRegistrationReceipt,
     AccountRole,
     AidOfferKind,
@@ -6932,6 +6949,635 @@ def create_app(
             f"{comment_id}",
             AidLocationCommentDeleteReceipt,
         )
+
+
+    # ------------------------------------------------------------------
+    # CHG-208 — Monitoreo sísmico y red privada de emergencia.
+    # ------------------------------------------------------------------
+
+    seismic_read_limiter = SlidingWindowRateLimiter(
+        resolved_settings.seismic_read_rate_limit_per_minute
+    )
+    seismic_write_limiter = SlidingWindowRateLimiter(
+        resolved_settings.seismic_write_rate_limit_per_minute
+    )
+
+    def seismic_unavailable() -> JSONResponse:
+        return problem_response(
+            "El servicio sísmico no está disponible en este momento; "
+            "el resto de la plataforma sigue operando.",
+            title="Servicio sísmico no disponible",
+        )
+
+    def seismic_actor_headers(
+        account: AuthenticatedAccount | None,
+        *,
+        with_role: bool = False,
+    ) -> dict[str, str]:
+        if account is None:
+            return {"x-actor-kind": "anonymous"}
+        headers = {
+            "x-actor-kind": "authenticated",
+            "x-account-id": str(account.id),
+        }
+        if with_role:
+            headers["x-actor-role"] = account.assigned_role
+        return headers
+
+    async def seismic_forward(
+        upstream: httpx.AsyncClient,
+        method: str,
+        path: str,
+        model,
+        *,
+        headers: dict[str, str],
+        payload: dict | None = None,
+        success_status: int = 200,
+    ):
+        try:
+            response = await upstream.request(
+                method, path, json=payload, headers=headers
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            if response.status_code == 204 or model is None:
+                return Response(status_code=response.status_code)
+            return JSONResponse(
+                status_code=success_status,
+                content=model.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return seismic_unavailable()
+
+    @application.get(
+        "/api/v1/seismic/events",
+        response_model=SeismicEventsResponse,
+        response_model_by_alias=True,
+        responses={
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_list_seismic_events(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+    ):
+        if not seismic_read_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        return await seismic_forward(
+            upstream,
+            "GET",
+            "/internal/v1/seismic/events",
+            SeismicEventsResponse,
+            headers={"x-actor-kind": "anonymous"},
+        )
+
+    @application.get(
+        "/api/v1/seismic/events/{event_id}/affected",
+        response_model=SeismicAffectedResponse,
+        response_model_by_alias=True,
+        responses={
+            404: {"description": "Evento no disponible"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_list_seismic_affected(
+        event_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        """Con sesión válida el backend identifica SOLO a quienes
+        eligieron al observador como contacto aceptado; sin sesión (o
+        con sesión ajena) todo marcador llega anónimo (spec §41-45)."""
+        if not seismic_read_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        account = await resolve_optional_account(request, identity)
+        return await seismic_forward(
+            upstream,
+            "GET",
+            f"/internal/v1/seismic/events/{event_id}/affected",
+            SeismicAffectedResponse,
+            headers=seismic_actor_headers(account),
+        )
+
+    @application.get(
+        "/api/v1/seismic/settings",
+        response_model=SeismicSettingsView,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_get_seismic_settings(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        return await seismic_forward(
+            upstream,
+            "GET",
+            "/internal/v1/seismic/settings",
+            SeismicSettingsView,
+            headers=seismic_actor_headers(account),
+        )
+
+    @application.put(
+        "/api/v1/seismic/settings",
+        response_model=SeismicSettingsView,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_update_seismic_settings(
+        request: Request,
+        payload: SeismicSettingsClientUpdate,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not seismic_write_limiter.allow(str(account.id)):
+            return rate_limited_response(
+                "Se superó el límite de acciones por minuto."
+            )
+        # CHG-193: el nombre visible sale de la sesión, jamás del
+        # navegador.
+        return await seismic_forward(
+            upstream,
+            "PUT",
+            "/internal/v1/seismic/settings",
+            SeismicSettingsView,
+            headers=seismic_actor_headers(account),
+            payload={
+                "enabled": payload.enabled,
+                "displayName": account.display_name,
+            },
+        )
+
+    @application.get(
+        "/api/v1/seismic/contacts",
+        response_model=EmergencyContactsResponse,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_list_emergency_contacts(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        return await seismic_forward(
+            upstream,
+            "GET",
+            "/internal/v1/seismic/contacts",
+            EmergencyContactsResponse,
+            headers=seismic_actor_headers(account),
+        )
+
+    @application.post(
+        "/api/v1/seismic/contacts",
+        response_model=EmergencyContactView,
+        response_model_by_alias=True,
+        status_code=201,
+        responses={
+            401: {"description": "Sesión requerida"},
+            409: {"description": "Servicio desactivado o duplicado"},
+            422: {"description": "Datos inválidos o límite de cinco"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_create_emergency_contact(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not seismic_write_limiter.allow(str(account.id)):
+            return rate_limited_response(
+                "Se superó el límite de acciones por minuto."
+            )
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                "/internal/v1/seismic/contacts",
+                content=body,
+                headers={
+                    **seismic_actor_headers(account),
+                    "content-type": "application/json",
+                },
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=201,
+                content=EmergencyContactView.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return seismic_unavailable()
+
+    @application.delete(
+        "/api/v1/seismic/contacts/{contact_id}",
+        status_code=204,
+        responses={
+            401: {"description": "Sesión requerida"},
+            404: {"description": "Contacto no disponible"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_revoke_emergency_contact(
+        contact_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not seismic_write_limiter.allow(str(account.id)):
+            return rate_limited_response(
+                "Se superó el límite de acciones por minuto."
+            )
+        return await seismic_forward(
+            upstream,
+            "DELETE",
+            f"/internal/v1/seismic/contacts/{contact_id}",
+            None,
+            headers=seismic_actor_headers(account),
+        )
+
+    @application.post(
+        "/api/v1/seismic/invitations/match",
+        response_model=EmergencyInvitationsResponse,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_match_emergency_invitations(
+        request: Request,
+        payload: EmergencyInvitationClientMatch,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not seismic_write_limiter.allow(str(account.id)):
+            return rate_limited_response(
+                "Se superó el límite de acciones por minuto."
+            )
+        # Identidad de la sesión + documento voluntario de la persona:
+        # el backend solo casa invitaciones creadas para esa identidad.
+        return await seismic_forward(
+            upstream,
+            "POST",
+            "/internal/v1/seismic/invitations/match",
+            EmergencyInvitationsResponse,
+            headers=seismic_actor_headers(account),
+            payload={
+                "displayName": account.display_name,
+                "phone": account.phone,
+                "documentNumber": payload.document_number,
+            },
+        )
+
+    @application.post(
+        "/api/v1/seismic/invitations/{contact_id}/respond",
+        response_model=EmergencyContactView,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            404: {"description": "Invitación no disponible"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_respond_emergency_invitation(
+        contact_id: UUID,
+        request: Request,
+        payload: EmergencyInvitationClientRespond,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not seismic_write_limiter.allow(str(account.id)):
+            return rate_limited_response(
+                "Se superó el límite de acciones por minuto."
+            )
+        return await seismic_forward(
+            upstream,
+            "POST",
+            f"/internal/v1/seismic/invitations/{contact_id}/respond",
+            EmergencyContactView,
+            headers=seismic_actor_headers(account),
+            payload={
+                "accept": payload.accept,
+                "displayName": account.display_name,
+                "phone": account.phone,
+            },
+        )
+
+    @application.get(
+        "/api/v1/seismic/alerts/mine",
+        response_model=MySeismicAlertsResponse,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_list_my_seismic_alerts(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        return await seismic_forward(
+            upstream,
+            "GET",
+            "/internal/v1/seismic/alerts/mine",
+            MySeismicAlertsResponse,
+            headers=seismic_actor_headers(account),
+        )
+
+    @application.post(
+        "/api/v1/seismic/alerts/mine/confirm-safe",
+        response_model=ConfirmSafeReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_confirm_safe(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        if not seismic_write_limiter.allow(str(account.id)):
+            return rate_limited_response(
+                "Se superó el límite de acciones por minuto."
+            )
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                "/internal/v1/seismic/alerts/mine/confirm-safe",
+                content=body if body else b"{}",
+                headers={
+                    **seismic_actor_headers(account),
+                    "content-type": "application/json",
+                },
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return ConfirmSafeReceipt.model_validate(response.json())
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return seismic_unavailable()
+
+    @application.get(
+        "/api/v1/seismic/alerts/{alert_id}",
+        response_model=EmergencyPanelView,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            404: {"description": "Alerta no disponible"},
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_get_emergency_panel(
+        alert_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        if not seismic_read_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        account = await resolve_account(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        return await seismic_forward(
+            upstream,
+            "GET",
+            f"/internal/v1/seismic/alerts/{alert_id}",
+            EmergencyPanelView,
+            headers=seismic_actor_headers(account),
+        )
+
+    @application.post(
+        "/api/v1/admin/seismic/simulations",
+        response_model=SeismicSimulationReceipt,
+        response_model_by_alias=True,
+        status_code=201,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            422: {"description": "Simulacro inválido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_create_seismic_simulation(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                "/internal/v1/admin/seismic/simulations",
+                content=body,
+                headers={
+                    **seismic_actor_headers(account, with_role=True),
+                    "content-type": "application/json",
+                },
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return JSONResponse(
+                status_code=201,
+                content=SeismicSimulationReceipt.model_validate(
+                    response.json()
+                ).model_dump(mode="json", by_alias=True),
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return seismic_unavailable()
+
+    @application.delete(
+        "/api/v1/admin/seismic/simulations/{event_id}",
+        status_code=204,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            404: {"description": "Simulacro no disponible"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_delete_seismic_simulation(
+        event_id: UUID,
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        return await seismic_forward(
+            upstream,
+            "DELETE",
+            f"/internal/v1/admin/seismic/simulations/{event_id}",
+            None,
+            headers=seismic_actor_headers(account, with_role=True),
+        )
+
+    @application.post(
+        "/api/v1/admin/seismic/test-accounts",
+        response_model=SeismicTestAccountsReceipt,
+        response_model_by_alias=True,
+        responses={
+            401: {"description": "Sesión requerida"},
+            403: {"description": "Rol insuficiente"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_configure_seismic_test_accounts(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        identity: Annotated[
+            httpx.AsyncClient, Depends(get_identity_client)
+        ],
+    ):
+        forbidden = origin_not_allowed(request)
+        if forbidden is not None:
+            return forbidden
+        account = await require_super_admin(request, identity)
+        if isinstance(account, JSONResponse):
+            return account
+        body = await request.body()
+        try:
+            response = await upstream.post(
+                "/internal/v1/admin/seismic/test-accounts",
+                content=body,
+                headers={
+                    **seismic_actor_headers(account, with_role=True),
+                    "content-type": "application/json",
+                },
+            )
+            if 400 <= response.status_code < 500:
+                return passthrough(response)
+            response.raise_for_status()
+            return SeismicTestAccountsReceipt.model_validate(
+                response.json()
+            )
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+            return seismic_unavailable()
 
     return application
 
