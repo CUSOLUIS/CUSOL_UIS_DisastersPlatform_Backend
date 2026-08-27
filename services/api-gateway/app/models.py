@@ -1693,6 +1693,9 @@ class EmergencyPanelView(ApiModel):
     latitude: float
     longitude: float
     accuracy_meters: float | None = None
+    # CHG-220: altitud de la instantánea.
+    altitude_meters: float | None = None
+    altitude_accuracy_meters: float | None = None
     located_at: datetime | None = None
     resolved_address: str | None = None
     alert_created_at: datetime

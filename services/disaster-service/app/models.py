@@ -1645,6 +1645,12 @@ class VisitorPresenceInput(ApiModel):
     latitude: float = Field(ge=-90, le=90)
     longitude: float = Field(ge=-180, le=180)
     accuracy_meters: float | None = Field(default=None, ge=0, le=100_000)
+    # CHG-220: altitud del GPS (m sobre WGS84) y su precisión; nulas sin
+    # fix real (escritorio, red, ubicación simulada).
+    altitude_meters: float | None = Field(default=None, ge=-500, le=10_000)
+    altitude_accuracy_meters: float | None = Field(
+        default=None, ge=0, le=100_000
+    )
     platform: VisitorPlatform = "web"
 
 
@@ -2975,6 +2981,9 @@ class EmergencyPanelView(ApiModel):
     latitude: float
     longitude: float
     accuracy_meters: float | None = None
+    # CHG-220: altitud congelada en la instantánea, con su precisión.
+    altitude_meters: float | None = None
+    altitude_accuracy_meters: float | None = None
     located_at: datetime | None = None
     resolved_address: str | None = None
     alert_created_at: datetime

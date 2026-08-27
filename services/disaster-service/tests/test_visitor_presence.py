@@ -51,6 +51,8 @@ class FakePresenceRepository:
         longitude,
         accuracy_meters,
         platform,
+        altitude_meters=None,
+        altitude_accuracy_meters=None,
     ):
         self.upserts.append(
             {
@@ -60,6 +62,8 @@ class FakePresenceRepository:
                 "longitude": longitude,
                 "accuracy_meters": accuracy_meters,
                 "platform": platform,
+                "altitude_meters": altitude_meters,
+                "altitude_accuracy_meters": altitude_accuracy_meters,
             }
         )
 
@@ -168,3 +172,28 @@ async def test_admin_presence_lists_recent_positions():
     assert item["authenticated"] is True
     # La cuenta jamás se expone: solo el hecho de estar autenticado.
     assert "accountId" not in item
+
+
+# CHG-220 — La altitud del GPS se guarda con la presencia cuando llega.
+
+
+@pytest.mark.anyio
+async def test_la_presencia_guarda_la_altitud_cuando_llega():
+    repository = FakePresenceRepository()
+    app = create_app(repository=repository)
+    response = await request_app(
+        app,
+        "POST",
+        "/internal/v1/presence",
+        content=json.dumps(
+            presence_payload(altitudeMeters=959, altitudeAccuracyMeters=12)
+        ),
+        headers={
+            "Content-Type": "application/json",
+            "X-Actor-Kind": "authenticated",
+            "X-Account-Id": ACCOUNT_ID,
+        },
+    )
+    assert response.status_code == 202
+    assert repository.upserts[-1]["altitude_meters"] == 959
+    assert repository.upserts[-1]["altitude_accuracy_meters"] == 12

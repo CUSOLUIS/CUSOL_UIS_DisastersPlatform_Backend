@@ -445,6 +445,10 @@ class FakeSeismicRepository:
                         "accuracy_meters": location.get(
                             "accuracy_meters"
                         ),
+                        "altitude_meters": location.get("altitude_meters"),
+                        "altitude_accuracy_meters": location.get(
+                            "altitude_accuracy_meters"
+                        ),
                         "located_at": location.get("updated_at"),
                         "zone_id": best[1]["id"],
                         "severity_level": best[1]["severity_level"],
@@ -652,12 +656,16 @@ class FakeSeismicRepository:
         longitude,
         accuracy_meters,
         platform,
+        altitude_meters=None,
+        altitude_accuracy_meters=None,
     ):
         if account_id is not None:
             self.presence[account_id] = {
                 "latitude": latitude,
                 "longitude": longitude,
                 "accuracy_meters": accuracy_meters,
+                "altitude_meters": altitude_meters,
+                "altitude_accuracy_meters": altitude_accuracy_meters,
                 "updated_at": datetime.now(UTC),
             }
 
@@ -1738,3 +1746,45 @@ async def test_las_zonas_se_retiran_a_las_24_horas_pero_el_evento_sigue():
     )
     assert afectados.status_code == 200
     assert len(afectados.json()["markers"]) == 1
+
+
+# CHG-220 — La altitud viaja de la presencia a la instantánea y al panel.
+
+
+@pytest.mark.anyio
+async def test_la_altitud_llega_al_panel_del_contacto():
+    repo = FakeSeismicRepository()
+    seed_network(repo)
+    event_id, zone_id = seed_event(repo)
+    alert_id = seed_alert(repo, event_id, zone_id)
+    repo.alerts[alert_id]["event_altitude"] = 959.0
+    repo.alerts[alert_id]["event_altitude_accuracy"] = 12.0
+    app = seismic_app(repo)
+    response = await request_app(
+        app,
+        "GET",
+        f"/internal/v1/seismic/alerts/{alert_id}",
+        headers=headers_for(CONTACT),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["altitudeMeters"] == 959.0
+    assert body["altitudeAccuracyMeters"] == 12.0
+    assert "document" not in json.dumps(body).lower()
+
+
+@pytest.mark.anyio
+async def test_sin_altitud_el_panel_la_declara_nula():
+    repo = FakeSeismicRepository()
+    seed_network(repo)
+    event_id, zone_id = seed_event(repo)
+    alert_id = seed_alert(repo, event_id, zone_id)
+    app = seismic_app(repo)
+    response = await request_app(
+        app,
+        "GET",
+        f"/internal/v1/seismic/alerts/{alert_id}",
+        headers=headers_for(CONTACT),
+    )
+    assert response.status_code == 200
+    assert response.json()["altitudeMeters"] is None

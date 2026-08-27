@@ -4784,6 +4784,9 @@ def create_app(
                 payload.longitude,
                 payload.accuracy_meters,
                 payload.platform,
+                # CHG-220: altitud y su precisión, nulas sin fix real.
+                altitude_meters=payload.altitude_meters,
+                altitude_accuracy_meters=payload.altitude_accuracy_meters,
             )
         except asyncpg.PostgresError:
             return problem(
@@ -7940,6 +7943,8 @@ def create_app(
             latitude=row["event_latitude"],
             longitude=row["event_longitude"],
             accuracy_meters=row.get("event_location_accuracy"),
+            altitude_meters=row.get("event_altitude"),
+            altitude_accuracy_meters=row.get("event_altitude_accuracy"),
             located_at=row.get("event_location_timestamp"),
             resolved_address=row.get("resolved_address"),
             alert_created_at=row["created_at"],

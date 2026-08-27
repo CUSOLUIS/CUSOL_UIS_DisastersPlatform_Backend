@@ -6821,13 +6821,16 @@ class PostgresDisasterRepository:
         longitude: float,
         accuracy_meters: float | None,
         platform: str,
+        altitude_meters: float | None = None,
+        altitude_accuracy_meters: float | None = None,
     ) -> None:
         await self._pool.execute(
             """
             INSERT INTO disaster_service.visitor_presence (
                 presence_id, account_id, latitude, longitude,
-                accuracy_meters, platform
-            ) VALUES ($1, $2, $3, $4, $5, $6)
+                accuracy_meters, platform,
+                altitude_meters, altitude_accuracy_meters
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (presence_id) DO UPDATE SET
                 account_id = COALESCE(
                     EXCLUDED.account_id,
@@ -6837,6 +6840,8 @@ class PostgresDisasterRepository:
                 longitude = EXCLUDED.longitude,
                 accuracy_meters = EXCLUDED.accuracy_meters,
                 platform = EXCLUDED.platform,
+                altitude_meters = EXCLUDED.altitude_meters,
+                altitude_accuracy_meters = EXCLUDED.altitude_accuracy_meters,
                 updated_at = NOW()
             """,
             presence_id,
@@ -6845,6 +6850,8 @@ class PostgresDisasterRepository:
             longitude,
             accuracy_meters,
             platform,
+            altitude_meters,
+            altitude_accuracy_meters,
         )
 
     async def list_visitor_presence(
@@ -9228,7 +9235,8 @@ class PostgresDisasterRepository:
             WITH last_location AS (
                 SELECT DISTINCT ON (vp.account_id)
                     vp.account_id, vp.latitude, vp.longitude,
-                    vp.accuracy_meters, vp.updated_at
+                    vp.accuracy_meters, vp.updated_at,
+                    vp.altitude_meters, vp.altitude_accuracy_meters
                 FROM disaster_service.visitor_presence vp
                 WHERE vp.account_id IS NOT NULL
                 ORDER BY vp.account_id, vp.updated_at DESC
@@ -9236,6 +9244,7 @@ class PostgresDisasterRepository:
             SELECT DISTINCT ON (l.account_id)
                 l.account_id, l.latitude, l.longitude,
                 l.accuracy_meters, l.updated_at AS located_at,
+                l.altitude_meters, l.altitude_accuracy_meters,
                 z.id AS zone_id, z.severity_level, s.display_name
             FROM disaster_service.seismic_events e
             JOIN disaster_service.seismic_intensity_zones z
@@ -9272,8 +9281,10 @@ class PostgresDisasterRepository:
                     seismic_event_id, account_id, zone_id,
                     severity_level, event_latitude, event_longitude,
                     event_location_accuracy, event_location_timestamp,
-                    resolved_address, expires_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    resolved_address, expires_at,
+                    event_altitude, event_altitude_accuracy
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                          $11, $12)
                 ON CONFLICT (seismic_event_id, account_id) DO NOTHING
                 RETURNING id, seismic_event_id, account_id,
                           severity_level, status, event_latitude,
@@ -9289,6 +9300,8 @@ class PostgresDisasterRepository:
                 alert.get("event_location_timestamp"),
                 alert.get("resolved_address"),
                 alert.get("expires_at"),
+                alert.get("event_altitude"),
+                alert.get("event_altitude_accuracy"),
             )
             if row is not None:
                 created.append(dict(row))
@@ -9368,6 +9381,7 @@ class PostgresDisasterRepository:
             SELECT a.id, a.account_id, a.status, a.severity_level,
                    a.event_latitude, a.event_longitude,
                    a.event_location_accuracy,
+                   a.event_altitude, a.event_altitude_accuracy,
                    a.event_location_timestamp, a.resolved_address,
                    a.safe_confirmed_at, a.created_at,
                    a.seismic_event_id,

@@ -147,6 +147,11 @@ async def activate_alerts_for_event(
                 "event_longitude": row["longitude"],
                 "event_location_accuracy": row.get("accuracy_meters"),
                 "event_location_timestamp": row.get("located_at"),
+                # CHG-220: la altitud viaja congelada con la instantánea.
+                "event_altitude": row.get("altitude_meters"),
+                "event_altitude_accuracy": row.get(
+                    "altitude_accuracy_meters"
+                ),
                 "expires_at": expires_at,
             }
             for row in affected
