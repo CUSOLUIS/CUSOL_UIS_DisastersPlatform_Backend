@@ -30,8 +30,9 @@ ContactStatus = Literal["PENDING", "ACCEPTED", "REJECTED", "REVOKED"]
 # severa (spec §40).
 SEVERITY_ORDER: tuple[SeverityLevel, ...] = ("STRONG", "MODERATE", "LIGHT")
 
-# Máximo de contactos de emergencia por usuario (spec §26).
-MAX_EMERGENCY_CONTACTS = 5
+# Máximo de contactos de emergencia por usuario (spec §26 pedía 5;
+# CHG-213 lo baja a 3 por decisión del usuario).
+MAX_EMERGENCY_CONTACTS = 3
 
 # Banda permanente de los simulacros (spec §66).
 SIMULATED_BANNER = "🧪 EVENTO SIMULADO — NO ES UN SISMO REAL"

@@ -1602,7 +1602,7 @@ class SeismicAffectedResponse(ApiModel):
 
 class SeismicSettingsView(ApiModel):
     enabled: bool
-    max_contacts: int = 5
+    max_contacts: int = 3
 
 
 class SeismicSettingsClientUpdate(ApiModel):
@@ -1621,8 +1621,9 @@ class EmergencyContactView(ApiModel):
 
 
 class EmergencyContactsResponse(ApiModel):
+    # max_length=5 tolera contactos heredados del tope anterior (CHG-213).
     contacts: list[EmergencyContactView] = Field(max_length=5)
-    max_contacts: int = 5
+    max_contacts: int = 3
 
 
 class EmergencyInvitationView(ApiModel):

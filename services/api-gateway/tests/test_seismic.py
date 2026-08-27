@@ -79,7 +79,7 @@ AFFECTED_PAYLOAD = {
     "generatedAt": "2026-08-26T17:41:00Z",
 }
 
-SETTINGS_PAYLOAD = {"enabled": True, "maxContacts": 5}
+SETTINGS_PAYLOAD = {"enabled": True, "maxContacts": 3}
 
 PANEL_PAYLOAD = {
     "alertId": ALERT_ID,

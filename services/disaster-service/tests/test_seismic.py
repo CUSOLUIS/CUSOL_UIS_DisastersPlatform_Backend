@@ -1179,7 +1179,7 @@ async def test_opt_in_apagado_por_defecto_y_contactos_exigen_activarlo():
 
 
 @pytest.mark.anyio
-async def test_maximo_cinco_contactos():
+async def test_maximo_tres_contactos():
     repo = FakeSeismicRepository()
     app = seismic_app(repo)
     await request_app(
@@ -1189,7 +1189,7 @@ async def test_maximo_cinco_contactos():
         json={"enabled": True, "displayName": "Julián Villamizar"},
         headers=headers_for(OWNER),
     )
-    for index in range(5):
+    for index in range(3):
         response = await request_app(
             app,
             "POST",
@@ -1209,7 +1209,7 @@ async def test_maximo_cinco_contactos():
         "POST",
         "/internal/v1/seismic/contacts",
         json={
-            "firstNames": "Sexto",
+            "firstNames": "Cuarto",
             "lastNames": "Sobrante",
             "documentType": "Cédula de ciudadanía",
             "documentNumber": "999999999",
