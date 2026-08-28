@@ -38,6 +38,9 @@ class Settings:
     sgc_catalog_url: str = (
         "https://apicatalogador.sgc.gov.co/api/events/search/"
     )
+    # CHG-223: el catalogador tarda 5–12 s por página de 100 sismos;
+    # con 10 s el poller vencía en ~1 de cada 7 ciclos.
+    sgc_timeout_seconds: float = 30.0
     # Ventana de visibilidad de un evento en el mapa público.
     seismic_visibility_hours: int = 24
 
@@ -86,6 +89,9 @@ class Settings:
                 "https://services1.arcgis.com/121aH0BAWntBBTHM/arcgis/"
                 "rest/services/catalogo_de_sismos_2/FeatureServer/0",
             ).rstrip("/"),
+            sgc_timeout_seconds=float(
+                os.getenv("SGC_TIMEOUT_SECONDS", "30")
+            ),
             seismic_visibility_hours=int(
                 os.getenv("SEISMIC_EVENT_VISIBILITY_HOURS", "24")
             ),

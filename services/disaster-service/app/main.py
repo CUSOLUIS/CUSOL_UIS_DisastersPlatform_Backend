@@ -886,7 +886,8 @@ def create_app(
         if not resolved_settings.sgc_poll_enabled:
             return None, None
         provider = sgc_provider or seismic_ingest.HttpSgcEventProvider(
-            resolved_settings.sgc_catalog_url
+            resolved_settings.sgc_catalog_url,
+            timeout_seconds=resolved_settings.sgc_timeout_seconds,
         )
         stop_event = _asyncio.Event()
         task = _asyncio.create_task(

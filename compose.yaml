@@ -50,6 +50,8 @@ services:
       SGC_POLL_INTERVAL_SECONDS: ${SGC_POLL_INTERVAL_SECONDS:-15}
       # CHG-222: API del catalogador del SGC; sobrescribible por .env.
       SGC_CATALOG_URL: ${SGC_CATALOG_URL:-https://apicatalogador.sgc.gov.co/api/events/search/}
+      # CHG-223: el catalogador tarda 5–12 s por página.
+      SGC_TIMEOUT_SECONDS: ${SGC_TIMEOUT_SECONDS:-30}
     volumes:
       - ./services/disaster-service/app:/app/app:ro
       - report-uploads:/data/uploads

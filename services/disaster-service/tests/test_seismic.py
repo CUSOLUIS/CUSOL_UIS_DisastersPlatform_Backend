@@ -1961,3 +1961,15 @@ async def test_el_ciclo_guarda_el_lugar_del_sgc():
     assert summary["created"] == 1
     stored = next(iter(repo.events.values()))
     assert stored["description"] == "Istmina - Chocó, Colombia"
+
+
+# CHG-223 — El timeout del catalogador es configurable (tarda 5–12 s).
+
+
+def test_el_timeout_del_sgc_se_lee_del_entorno(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setenv("SGC_TIMEOUT_SECONDS", "45")
+    assert Settings.from_environment().sgc_timeout_seconds == 45.0
+    monkeypatch.delenv("SGC_TIMEOUT_SECONDS")
+    assert Settings.from_environment().sgc_timeout_seconds == 30.0
