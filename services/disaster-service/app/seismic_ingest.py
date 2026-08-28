@@ -36,7 +36,15 @@ _BOOTSTRAP_WINDOW_HOURS = 6
 
 
 class HttpSgcEventProvider:
-    """Adaptador del FeatureServer del catálogo de sismos del SGC."""
+    """Adaptador de la API del catalogador del SGC (CHG-222): la misma
+    que consume el Visor Sismos oficial. `POST /api/events/search/?page=N`
+    con cuerpo JSON devuelve los eventos del más reciente al más antiguo;
+    se recorren páginas hasta pasar `since` (tope de seguridad) y se
+    entrega al normalizador el diccionario ESP_* que ya entiende, más
+    ESP_LUGAR con el lugar en palabras. Un evento «not existing» del SGC
+    jamás entra."""
+
+    _MAX_PAGES = 5
 
     def __init__(
         self,
@@ -44,36 +52,87 @@ class HttpSgcEventProvider:
         timeout_seconds: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
-        self._catalog_url = catalog_url.rstrip("/") + "/query"
+        self._catalog_url = catalog_url.rstrip("/") + "/"
         self._timeout_seconds = timeout_seconds
         self._transport = transport
+
+    @staticmethod
+    def _to_feature(event: dict[str, Any]) -> dict[str, Any] | None:
+        utc_text = event.get("utc_time")
+        if not isinstance(utc_text, str) or not utc_text.strip():
+            return None
+        try:
+            origin = datetime.strptime(
+                utc_text.strip(), "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=UTC)
+        except ValueError:
+            return None
+        status = str(event.get("status") or "automatic")
+        return {
+            "ESP_ID_EVENTO_TXT": event.get("id"),
+            # El catalogador no publica ids de solución: una revisión
+            # manual tras la automática cambia el estado, y eso basta
+            # para que cuente como REVISIÓN (spec §8), nunca como
+            # terremoto nuevo.
+            "ESP_ID_SOL_LOCALIZACION": status,
+            "ESP_ID_SOL_MAGNITUD": status,
+            "ESP_MAGNITUD": event.get("magnitude"),
+            "ESP_FUENTE_MAGNITUD": event.get("mag_type") or event.get("agency"),
+            "ESP_PROFUNDIDAD": event.get("depth"),
+            "ESP_FUENTE_LOCALIZACION": event.get("agency"),
+            "ESP_FECHA": int(origin.timestamp() * 1000),
+            "ESP_LATITUD": event.get("latitude"),
+            "ESP_LONGITUD": event.get("longitude"),
+            "ESP_LUGAR": event.get("place"),
+            "ESP_TIPO": event.get("event_type"),
+            "MUN_CODIGO": None,
+            "DEPT_CODIGO": None,
+        }
 
     async def fetch_recent(
         self, since: datetime
     ) -> list[dict[str, Any]]:
-        epoch_ms = int(since.timestamp() * 1000)
-        params = {
-            "where": f"ESP_FECHA > {epoch_ms}",
-            "outFields": "*",
-            "orderByFields": "ESP_FECHA ASC",
-            "resultRecordCount": "200",
-            "f": "json",
-        }
+        collected: list[dict[str, Any]] = []
         async with httpx.AsyncClient(
             timeout=self._timeout_seconds,
             transport=self._transport,
         ) as client:
-            response = await client.get(self._catalog_url, params=params)
-            response.raise_for_status()
-            payload = response.json()
-        if "error" in payload:
-            raise RuntimeError(
-                f"SGC devolvió error: {payload['error']!r}"
-            )
-        return [
-            feature.get("attributes", {})
-            for feature in payload.get("features", [])
-        ]
+            for page in range(1, self._MAX_PAGES + 1):
+                response = await client.post(
+                    self._catalog_url,
+                    params={"page": str(page)},
+                    json={},
+                    headers={"Accept": "application/json"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if "detail" in payload and "results" not in payload:
+                    raise RuntimeError(
+                        f"SGC devolvió error: {payload['detail']!r}"
+                    )
+                block = payload.get("results") or {}
+                events = (
+                    block.get("results")
+                    if isinstance(block, dict)
+                    else block
+                ) or []
+                reached_since = False
+                for event in events:
+                    if event.get("event_type") == "not existing":
+                        continue
+                    feature = self._to_feature(event)
+                    if feature is None:
+                        continue
+                    if feature["ESP_FECHA"] <= int(since.timestamp() * 1000):
+                        reached_since = True
+                        continue
+                    collected.append(feature)
+                if reached_since or not payload.get("next"):
+                    break
+        # El ciclo espera orden ascendente (el checkpoint avanza con el
+        # más nuevo); la API los entrega descendentes.
+        collected.sort(key=lambda feature: feature["ESP_FECHA"])
+        return collected
 
 
 async def _notify_alert_recipients(
@@ -266,6 +325,8 @@ async def run_sgc_poll_cycle(
                     department_code=normalized.department_code,
                     magnitude_source=normalized.magnitude_source,
                     location_source=normalized.location_source,
+                    # CHG-222: el lugar en palabras del SGC.
+                    description=normalized.description,
                     source_payload=payload_json,
                 )
                 summary["created"] += 1

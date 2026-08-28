@@ -13,6 +13,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 
 from app import seismic, seismic_ingest
@@ -1843,3 +1844,120 @@ async def test_el_registro_lista_todo_lo_guardado_reciente_primero():
         app, "GET", "/internal/v1/seismic/history?limit=1&offset=1"
     )
     assert [i["id"] for i in pagina2.json()["items"]] == [str(viejo)]
+
+
+# CHG-222 — El proveedor consume la API del catalogador del SGC.
+
+
+def catalogador_event(event_id, utc_time, magnitude=3.1, **extra):
+    base = {
+        "id": event_id,
+        "status": "manual",
+        "agency": "SGC",
+        "place": "Istmina - Chocó, Colombia",
+        "closer_towns": "Sipí (Chocó) a 16 km",
+        "utc_time": utc_time,
+        "local_time": utc_time,
+        "magnitude": magnitude,
+        "mag_type": "MLr_1",
+        "event_type": "earthquake",
+        "latitude": 4.5568,
+        "longitude": -76.7518,
+        "depth": 22.0,
+    }
+    base.update(extra)
+    return base
+
+
+@pytest.mark.anyio
+async def test_proveedor_catalogador_pagina_filtra_y_ordena():
+    calls = []
+    now = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+
+    def handler(request):
+        calls.append((request.method, dict(request.url.params)))
+        page = request.url.params.get("page")
+        if page == "1":
+            body = {
+                "count": 3,
+                "next": "https://apicatalogador.sgc.gov.co/api/events/search/?page=2",
+                "results": {
+                    "success": True,
+                    "results": [
+                        catalogador_event("SGC2026aaa", "2026-08-28 11:30:00", 4.2),
+                        catalogador_event(
+                            "SGC2026fake", "2026-08-28 11:00:00",
+                            event_type="not existing",
+                        ),
+                        catalogador_event("SGC2026bbb", "2026-08-28 09:15:00", 2.8),
+                    ],
+                },
+            }
+        else:
+            body = {
+                "count": 3,
+                "next": None,
+                "results": {
+                    "success": True,
+                    "results": [
+                        catalogador_event("SGC2026old", "2026-08-27 10:00:00", 5.0),
+                    ],
+                },
+            }
+        return httpx.Response(200, json=body)
+
+    provider = seismic_ingest.HttpSgcEventProvider(
+        "https://apicatalogador.sgc.gov.co/api/events/search/",
+        transport=httpx.MockTransport(handler),
+    )
+    features = await provider.fetch_recent(now - timedelta(hours=6))
+
+    # POST paginado; la segunda página se pidió y ahí se alcanzó `since`.
+    assert [c[0] for c in calls] == ["POST", "POST"]
+    assert [c[1]["page"] for c in calls] == ["1", "2"]
+    # Sin «not existing», sin lo anterior a since, y ASCENDENTE.
+    assert [f["ESP_ID_EVENTO_TXT"] for f in features] == [
+        "SGC2026bbb",
+        "SGC2026aaa",
+    ]
+    primero = features[-1]
+    assert primero["ESP_MAGNITUD"] == 4.2
+    assert primero["ESP_LUGAR"] == "Istmina - Chocó, Colombia"
+    assert primero["ESP_ID_SOL_MAGNITUD"] == "manual"
+    assert primero["ESP_FECHA"] == int(
+        datetime(2026, 8, 28, 11, 30, tzinfo=UTC).timestamp() * 1000
+    )
+    # Y el normalizador lo entiende tal cual, con el lugar en palabras.
+    normalized = seismic.normalize_sgc_feature(primero)
+    assert normalized is not None
+    assert normalized.description == "Istmina - Chocó, Colombia"
+    assert normalized.origin_time_utc == datetime(
+        2026, 8, 28, 11, 30, tzinfo=UTC
+    )
+
+
+@pytest.mark.anyio
+async def test_proveedor_catalogador_traduce_errores_de_la_api():
+    def handler(request):
+        return httpx.Response(200, json={"detail": "Método no permitido."})
+
+    provider = seismic_ingest.HttpSgcEventProvider(
+        "https://apicatalogador.sgc.gov.co/api/events/search/",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(RuntimeError):
+        await provider.fetch_recent(datetime.now(UTC) - timedelta(hours=6))
+
+
+@pytest.mark.anyio
+async def test_el_ciclo_guarda_el_lugar_del_sgc():
+    repo = FakeSeismicRepository()
+    seed_network(repo)
+    feature = seismic_ingest.HttpSgcEventProvider._to_feature(
+        catalogador_event("SGC2026ccc", "2026-08-28 11:30:00", 3.3)
+    )
+    provider = FakeSgcProvider([[feature]])
+    summary = await seismic_ingest.run_sgc_poll_cycle(repo, provider, None)
+    assert summary["created"] == 1
+    stored = next(iter(repo.events.values()))
+    assert stored["description"] == "Istmina - Chocó, Colombia"

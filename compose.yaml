@@ -48,6 +48,8 @@ services:
       # simulador del Super Admin. Encender exige decisión explícita.
       SGC_POLL_ENABLED: ${SGC_POLL_ENABLED:-false}
       SGC_POLL_INTERVAL_SECONDS: ${SGC_POLL_INTERVAL_SECONDS:-15}
+      # CHG-222: API del catalogador del SGC; sobrescribible por .env.
+      SGC_CATALOG_URL: ${SGC_CATALOG_URL:-https://apicatalogador.sgc.gov.co/api/events/search/}
     volumes:
       - ./services/disaster-service/app:/app/app:ro
       - report-uploads:/data/uploads
@@ -73,6 +75,9 @@ services:
     security_opt:
       - no-new-privileges:true
     networks:
+      # CHG-222: el poller del SGC necesita salida a internet; `backend`
+      # es interna. Mismo patrón que mail-service (Brevo).
+      - edge
       - backend
 
   identity-service:

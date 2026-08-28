@@ -300,6 +300,9 @@ class NormalizedSgcEvent:
     magnitude_source: str | None
     location_source: str | None
     payload: dict[str, Any]
+    # CHG-222: lugar en palabras tal como lo publica el SGC («Istmina -
+    # Chocó, Colombia»); None cuando la fuente no lo trae.
+    description: str | None = None
 
 
 def _text_or_none(value: Any) -> str | None:
@@ -365,6 +368,7 @@ def normalize_sgc_feature(
             attributes.get("ESP_FUENTE_LOCALIZACION")
         ),
         payload=dict(attributes),
+        description=_text_or_none(attributes.get("ESP_LUGAR")),
     )
 
 

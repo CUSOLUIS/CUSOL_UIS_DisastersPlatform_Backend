@@ -32,9 +32,11 @@ class Settings:
     # nunca vive cableado en el código (spec §6).
     sgc_poll_enabled: bool = False
     sgc_poll_interval_seconds: int = 15
+    # CHG-222: la API viva del catalogador (la del Visor Sismos oficial).
+    # La capa ArcGIS anterior no existía en esa ruta y el catálogo del
+    # geoportal es histórico (termina en 2020).
     sgc_catalog_url: str = (
-        "https://services1.arcgis.com/121aH0BAWntBBTHM/arcgis/rest/"
-        "services/catalogo_de_sismos_2/FeatureServer/0"
+        "https://apicatalogador.sgc.gov.co/api/events/search/"
     )
     # Ventana de visibilidad de un evento en el mapa público.
     seismic_visibility_hours: int = 24
