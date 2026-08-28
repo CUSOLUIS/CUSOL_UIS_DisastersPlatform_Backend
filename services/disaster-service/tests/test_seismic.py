@@ -189,6 +189,16 @@ class FakeSeismicRepository:
         event = self.events.get(event_id)
         return dict(event) if event else None
 
+    async def list_seismic_history(self, limit, offset, include_simulated):
+        rows = [
+            dict(e)
+            for e in self.events.values()
+            if e["deactivated_at"] is None
+            and (include_simulated or not e["is_simulated"])
+        ]
+        rows.sort(key=lambda r: r["origin_time_utc"], reverse=True)
+        return rows[offset:offset + limit], len(rows)
+
     # --- zonas ---
 
     async def list_intensity_zones_for_events(self, event_ids):
@@ -1788,3 +1798,48 @@ async def test_sin_altitud_el_panel_la_declara_nula():
     )
     assert response.status_code == 200
     assert response.json()["altitudeMeters"] is None
+
+
+
+# CHG-221 — Registro público de sismos.
+
+
+@pytest.mark.anyio
+async def test_el_registro_lista_todo_lo_guardado_reciente_primero():
+    repo = FakeSeismicRepository()
+    viejo, _ = seed_event(repo, magnitude=4.1)
+    repo.events[viejo]["origin_time_utc"] = datetime.now(UTC) - timedelta(
+        days=40
+    )
+    repo.events[viejo]["source"] = "SGC"
+    repo.events[viejo]["is_simulated"] = False
+    reciente, _ = seed_event(repo, magnitude=5.5)
+    app = seismic_app(repo)
+
+    response = await request_app(
+        app, "GET", "/internal/v1/seismic/history?limit=10&offset=0"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert [i["id"] for i in body["items"]] == [str(reciente), str(viejo)]
+    # Más allá de la ventana de 24 h del mapa, el registro lo conserva.
+    assert body["items"][1]["source"] == "SGC"
+    assert body["items"][1]["simulatedBanner"] is None
+    # El simulacro entra con su banda, jamás como sismo real.
+    assert body["items"][0]["isSimulated"] is True
+    assert body["items"][0]["simulatedBanner"].startswith("🧪")
+    assert "zones" not in body["items"][0]
+
+    sin_simulacros = await request_app(
+        app,
+        "GET",
+        "/internal/v1/seismic/history?limit=10&offset=0&includeSimulated=false",
+    )
+    assert sin_simulacros.json()["total"] == 1
+    assert sin_simulacros.json()["items"][0]["id"] == str(viejo)
+
+    pagina2 = await request_app(
+        app, "GET", "/internal/v1/seismic/history?limit=1&offset=1"
+    )
+    assert [i["id"] for i in pagina2.json()["items"]] == [str(viejo)]

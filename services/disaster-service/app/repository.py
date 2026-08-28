@@ -660,6 +660,12 @@ class DisasterRepository(Protocol):
 
     async def get_seismic_event(self, event_id: UUID) -> dict | None: ...
 
+    async def list_seismic_history(
+        self, limit: int, offset: int, include_simulated: bool
+    ) -> tuple[list[dict], int]:
+        """CHG-221: histórico paginado, reciente primero, y su total."""
+        ...
+
     async def list_intensity_zones_for_events(
         self, event_ids: list[UUID]
     ) -> list[dict]: ...
@@ -8866,6 +8872,34 @@ class PostgresDisasterRepository:
             limit,
         )
         return [dict(row) for row in rows]
+
+    async def list_seismic_history(
+        self, limit: int, offset: int, include_simulated: bool
+    ) -> tuple[list[dict], int]:
+        # CHG-221: todo lo guardado (no desactivado), reciente primero.
+        rows = await self._pool.fetch(
+            f"""
+            SELECT {self._SEISMIC_EVENT_COLUMNS}
+            FROM disaster_service.seismic_events
+            WHERE deactivated_at IS NULL
+              AND ($3 OR NOT is_simulated)
+            ORDER BY origin_time_utc DESC
+            LIMIT $1 OFFSET $2
+            """,
+            limit,
+            offset,
+            include_simulated,
+        )
+        total = await self._pool.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM disaster_service.seismic_events
+            WHERE deactivated_at IS NULL
+              AND ($1 OR NOT is_simulated)
+            """,
+            include_simulated,
+        )
+        return [dict(row) for row in rows], int(total)
 
     async def get_seismic_event(self, event_id: UUID) -> dict | None:
         row = await self._pool.fetchrow(

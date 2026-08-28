@@ -26,6 +26,7 @@ from .models import (
     MySeismicAlertsResponse,
     SeismicAffectedResponse,
     SeismicEventsResponse,
+    SeismicHistoryResponse,
     SeismicSettingsClientUpdate,
     SeismicSettingsView,
     SeismicSimulationReceipt,
@@ -7013,6 +7014,41 @@ def create_app(
             )
         except (httpx.HTTPError, httpx.TimeoutException, ValueError):
             return seismic_unavailable()
+
+    # CHG-221 — Registro público de sismos: anónimo, con el mismo límite
+    # de lectura que el mapa; la paginación viaja tal cual al servicio.
+    @application.get(
+        "/api/v1/seismic/history",
+        response_model=SeismicHistoryResponse,
+        response_model_by_alias=True,
+        responses={
+            429: {"description": "Límite excedido"},
+            503: {"description": "Servicio no disponible"},
+        },
+        tags=["Seismic"],
+    )
+    async def gateway_list_seismic_history(
+        request: Request,
+        upstream: Annotated[httpx.AsyncClient, Depends(get_client)],
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        include_simulated: Annotated[
+            bool, Query(alias="includeSimulated")
+        ] = True,
+    ):
+        if not seismic_read_limiter.allow(client_key(request)):
+            return rate_limited_response(
+                "Se superó el límite de consultas por minuto."
+            )
+        return await seismic_forward(
+            upstream,
+            "GET",
+            "/internal/v1/seismic/history"
+            f"?limit={limit}&offset={offset}"
+            f"&includeSimulated={'true' if include_simulated else 'false'}",
+            SeismicHistoryResponse,
+            headers={"x-actor-kind": "anonymous"},
+        )
 
     @application.get(
         "/api/v1/seismic/events",

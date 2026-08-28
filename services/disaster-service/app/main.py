@@ -191,6 +191,8 @@ from .models import (
     SeismicAffectedResponse,
     SeismicEventView,
     SeismicEventsResponse,
+    SeismicHistoryItem,
+    SeismicHistoryResponse,
     SeismicSettingsUpdate,
     SeismicSettingsView,
     SeismicSimulationInput,
@@ -7395,6 +7397,58 @@ def create_app(
                 )
                 for event in events
             ],
+            generated_at=datetime.now(UTC),
+        )
+
+    # CHG-221 — Registro público de sismos: todo lo guardado por la
+    # integración con el SGC (y los simulacros, siempre con su banda),
+    # paginado y del más reciente al más antiguo. Sin zonas: es un
+    # registro, no el mapa.
+    @application.get(
+        "/internal/v1/seismic/history",
+        response_model=SeismicHistoryResponse,
+        response_model_by_alias=True,
+        tags=["Seismic"],
+    )
+    async def list_seismic_history(
+        data: Annotated[DisasterRepository, Depends(get_repository)],
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        include_simulated: Annotated[
+            bool, Query(alias="includeSimulated")
+        ] = True,
+    ):
+        rows, total = await data.list_seismic_history(
+            limit, offset, include_simulated
+        )
+        return SeismicHistoryResponse(
+            items=[
+                SeismicHistoryItem(
+                    id=row["id"],
+                    source=row["source"],
+                    source_event_id=row["source_event_id"],
+                    magnitude=row["magnitude"],
+                    depth_km=row.get("depth_km"),
+                    latitude=row["latitude"],
+                    longitude=row["longitude"],
+                    origin_time_utc=row["origin_time_utc"],
+                    processing_status=row["processing_status"],
+                    is_simulated=row["is_simulated"],
+                    simulated_banner=(
+                        seismic_rules.SIMULATED_BANNER
+                        if row["is_simulated"]
+                        else None
+                    ),
+                    description=row.get("description"),
+                    municipality_code=row.get("municipality_code"),
+                    department_code=row.get("department_code"),
+                    last_updated_at=row["last_updated_at"],
+                )
+                for row in rows
+            ],
+            total=total,
+            limit=limit,
+            offset=offset,
             generated_at=datetime.now(UTC),
         )
 

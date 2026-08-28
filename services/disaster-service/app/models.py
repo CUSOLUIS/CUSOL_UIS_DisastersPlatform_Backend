@@ -2841,6 +2841,36 @@ class SeismicEventsResponse(ApiModel):
     generated_at: datetime
 
 
+# CHG-221 — Registro público de sismos: histórico paginado, sin zonas,
+# independiente de la ventana de 24 h del mapa.
+class SeismicHistoryItem(ApiModel):
+    id: UUID
+    source: Literal["SGC", "SIMULATED"]
+    source_event_id: str
+    magnitude: float
+    depth_km: float | None = None
+    latitude: float
+    longitude: float
+    origin_time_utc: datetime
+    processing_status: Literal[
+        "SEISMIC_DATA_PRELIMINARY", "SEISMIC_DATA_INSTRUMENTAL"
+    ]
+    is_simulated: bool = False
+    simulated_banner: str | None = None
+    description: str | None = None
+    municipality_code: str | None = None
+    department_code: str | None = None
+    last_updated_at: datetime
+
+
+class SeismicHistoryResponse(ApiModel):
+    items: list[SeismicHistoryItem] = Field(max_length=100)
+    total: int = Field(ge=0)
+    limit: int = Field(ge=1, le=100)
+    offset: int = Field(ge=0)
+    generated_at: datetime
+
+
 class SeismicAffectedMarker(ApiModel):
     # Redondeada (~1,1 km) para el público; también para los marcadores
     # identificados — la coordenada exacta solo viaja en el panel

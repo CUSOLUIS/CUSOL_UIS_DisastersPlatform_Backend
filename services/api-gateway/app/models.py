@@ -1597,6 +1597,35 @@ class SeismicEventsResponse(ApiModel):
     generated_at: datetime
 
 
+# CHG-221 — Registro público de sismos (espejo del disaster-service).
+class SeismicHistoryItem(ApiModel):
+    id: UUID
+    source: Literal["SGC", "SIMULATED"]
+    source_event_id: str
+    magnitude: float
+    depth_km: float | None = None
+    latitude: float
+    longitude: float
+    origin_time_utc: datetime
+    processing_status: Literal[
+        "SEISMIC_DATA_PRELIMINARY", "SEISMIC_DATA_INSTRUMENTAL"
+    ]
+    is_simulated: bool = False
+    simulated_banner: str | None = None
+    description: str | None = None
+    municipality_code: str | None = None
+    department_code: str | None = None
+    last_updated_at: datetime
+
+
+class SeismicHistoryResponse(ApiModel):
+    items: list[SeismicHistoryItem] = Field(max_length=100)
+    total: int
+    limit: int
+    offset: int
+    generated_at: datetime
+
+
 class SeismicAffectedMarker(ApiModel):
     latitude: float
     longitude: float

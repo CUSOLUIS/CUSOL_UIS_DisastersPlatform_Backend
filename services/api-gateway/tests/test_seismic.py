@@ -523,3 +523,43 @@ async def test_alta_por_share_code_va_a_la_via_directa():
         "contactAccountId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb02",
         "displayName": "María Paz Rueda",
     }
+
+
+
+# CHG-221 — Registro público de sismos: anónimo y con paginación fiel.
+
+
+@pytest.mark.anyio
+async def test_registro_de_sismos_publico_reenvia_paginacion():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.path
+        seen["query"] = dict(request.url.params)
+        seen["actor"] = request.headers.get("x-actor-kind")
+        return httpx.Response(
+            200,
+            json={
+                "items": [],
+                "total": 0,
+                "limit": 5,
+                "offset": 10,
+                "generatedAt": "2026-08-28T01:00:00Z",
+            },
+        )
+
+    upstream, identity = make_clients(handler)
+    app = create_app(gateway_settings(), upstream, identity)
+    response = await request_gateway(
+        app, "GET", "/api/v1/seismic/history?limit=5&offset=10&includeSimulated=false"
+    )
+    await upstream.aclose()
+    await identity.aclose()
+    assert response.status_code == 200
+    assert seen["path"] == "/internal/v1/seismic/history"
+    assert seen["query"] == {
+        "limit": "5",
+        "offset": "10",
+        "includeSimulated": "false",
+    }
+    assert seen["actor"] == "anonymous"
