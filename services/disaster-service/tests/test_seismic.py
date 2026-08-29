@@ -967,6 +967,7 @@ class FakeSgcProvider:
 
     async def fetch_recent(self, since):
         self.calls += 1
+        self.since_seen = getattr(self, "since_seen", []) + [since]
         if not self.batches:
             return []
         batch = self.batches.pop(0)
@@ -1027,6 +1028,80 @@ async def test_poller_crea_revisa_y_no_duplica():
     assert repo.revisions[0]["previous"]["magnitude"] == 5.1
     # Y la alerta no se duplicó.
     assert len(repo.alerts) == 1
+
+
+@pytest.mark.anyio
+async def test_poller_relee_la_ventana_y_capta_correcciones_del_sgc():
+    """CHG-231: el SGC corrige un sismo sin mover su fecha de origen.
+    Con la ventana de relectura el ciclo vuelve a pedir desde antes del
+    checkpoint y la corrección entra como revisión, sin duplicar el
+    evento ni la alerta."""
+    repo = FakeSeismicRepository()
+    seed_network(repo)
+    origin_ms = int(
+        (datetime.now(UTC) - timedelta(minutes=20)).timestamp() * 1000
+    )
+    first_reading = sgc_feature()
+    first_reading["ESP_FECHA"] = origin_ms
+    corrected = sgc_feature(magnitude=4.6, mag_solution="M2")
+    corrected["ESP_FECHA"] = origin_ms
+    provider = FakeSgcProvider([[first_reading], [corrected]])
+
+    first = await seismic_ingest.run_sgc_poll_cycle(
+        repo, provider, None, revision_lookback_minutes=180
+    )
+    assert first["created"] == 1
+    checkpoint = await repo.get_seismic_checkpoint("SGC")
+    second = await seismic_ingest.run_sgc_poll_cycle(
+        repo, provider, None, revision_lookback_minutes=180
+    )
+    # La segunda petición al SGC pidió desde 3 h ANTES del checkpoint.
+    assert provider.since_seen[1] == (
+        checkpoint["last_event_time"] - timedelta(minutes=180)
+    )
+    assert second == {
+        "created": 0,
+        "revised": 1,
+        "unchanged": 0,
+        "failed": False,
+    }
+    assert len(repo.events) == 1
+    event = next(iter(repo.events.values()))
+    assert event["magnitude"] == 4.6
+    assert len(repo.revisions) == 1
+    assert len(repo.alerts) == 1
+    # Y el checkpoint no retrocede por releer.
+    after = await repo.get_seismic_checkpoint("SGC")
+    assert after["last_event_time"] == checkpoint["last_event_time"]
+
+
+def test_revised_at_solo_cuando_hubo_correccion():
+    """CHG-231: revised_at distingue el sismo corregido del intacto."""
+    first = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+    assert (
+        seismic.revised_at(
+            {"first_detected_at": first, "last_updated_at": first}
+        )
+        is None
+    )
+    # Mismo INSERT: NOW() puede diferir en microsegundos.
+    assert (
+        seismic.revised_at(
+            {
+                "first_detected_at": first,
+                "last_updated_at": first + timedelta(milliseconds=3),
+            }
+        )
+        is None
+    )
+    later = first + timedelta(minutes=7)
+    assert (
+        seismic.revised_at(
+            {"first_detected_at": first, "last_updated_at": later}
+        )
+        == later
+    )
+    assert seismic.revised_at({"last_updated_at": later}) is None
 
 
 @pytest.mark.anyio

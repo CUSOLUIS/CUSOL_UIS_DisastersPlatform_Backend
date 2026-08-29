@@ -2834,6 +2834,8 @@ class SeismicEventView(ApiModel):
     # zonas se retiran (viajan vacías) aunque el evento siga vivo por sus
     # alertas activas; los triángulos no cambian.
     zones_expired: bool = False
+    # CHG-231: última corrección del SGC (nulo si nunca fue revisado).
+    revised_at: datetime | None = None
 
 
 class SeismicEventsResponse(ApiModel):
@@ -2861,6 +2863,9 @@ class SeismicHistoryItem(ApiModel):
     municipality_code: str | None = None
     department_code: str | None = None
     last_updated_at: datetime
+    # CHG-231: instante de la última corrección del SGC; nulo si el
+    # sismo nunca fue revisado desde su primera detección.
+    revised_at: datetime | None = None
 
 
 class SeismicHistoryResponse(ApiModel):

@@ -49,7 +49,10 @@ class Settings:
     # CHG-208: capa sísmica — el mapa sondea eventos/afectados con la
     # señal de cambio; las escrituras (ajustes, contactos, ESTOY BIEN)
     # son esporádicas y por cuenta.
-    seismic_read_rate_limit_per_minute: int = 60
+    # CHG-233: el mapa lee `events` + `affected` de los sismos con zonas
+    # vigentes cada 30 s, y varias pestañas o un NAT comparten la IP; 60
+    # se agotaba y llovían 429. 240 sigue siendo techo contra abuso.
+    seismic_read_rate_limit_per_minute: int = 240
     seismic_write_rate_limit_per_minute: int = 20
     # CHG-171: lectura pública de La Mulera (ciudades + viajes activos,
     # el mapa sondea) y posiciones del GPS del conductor (~cada 20 s).
@@ -177,7 +180,7 @@ class Settings:
                 )
             ),
             seismic_read_rate_limit_per_minute=int(
-                os.getenv("SEISMIC_READ_RATE_LIMIT_PER_MINUTE", "60")
+                os.getenv("SEISMIC_READ_RATE_LIMIT_PER_MINUTE", "240")
             ),
             seismic_write_rate_limit_per_minute=int(
                 os.getenv("SEISMIC_WRITE_RATE_LIMIT_PER_MINUTE", "20")

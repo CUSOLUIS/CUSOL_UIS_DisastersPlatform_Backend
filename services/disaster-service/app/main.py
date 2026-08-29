@@ -897,6 +897,9 @@ def create_app(
                 report_notifier,
                 resolved_settings.sgc_poll_interval_seconds,
                 stop_event,
+                revision_lookback_minutes=(
+                    resolved_settings.sgc_revision_lookback_minutes
+                ),
             )
         )
         return task, stop_event
@@ -7338,6 +7341,7 @@ def create_app(
             ),
             zones=[] if zones_expired else zones,
             zones_expired=zones_expired,
+            revised_at=seismic_rules.revised_at(event),
         )
 
     def resolve_super_admin(
@@ -7448,6 +7452,7 @@ def create_app(
                     municipality_code=row.get("municipality_code"),
                     department_code=row.get("department_code"),
                     last_updated_at=row["last_updated_at"],
+                    revised_at=seismic_rules.revised_at(row),
                 )
                 for row in rows
             ],

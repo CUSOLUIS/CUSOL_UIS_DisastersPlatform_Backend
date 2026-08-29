@@ -52,6 +52,9 @@ services:
       SGC_CATALOG_URL: ${SGC_CATALOG_URL:-https://apicatalogador.sgc.gov.co/api/events/search/}
       # CHG-223: el catalogador tarda 5–12 s por página.
       SGC_TIMEOUT_SECONDS: ${SGC_TIMEOUT_SECONDS:-30}
+      # CHG-231: minutos antes del checkpoint que se releen cada ciclo
+      # para captar las correcciones del SGC.
+      SGC_REVISION_LOOKBACK_MINUTES: ${SGC_REVISION_LOOKBACK_MINUTES:-180}
     volumes:
       - ./services/disaster-service/app:/app/app:ro
       - report-uploads:/data/uploads

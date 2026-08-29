@@ -1590,6 +1590,8 @@ class SeismicEventView(ApiModel):
     zones: list[SeismicZoneView] = Field(default_factory=list)
     # CHG-218: zonas retiradas por edad; los triángulos siguen.
     zones_expired: bool = False
+    # CHG-231: última corrección del SGC (nulo si nunca fue revisado).
+    revised_at: datetime | None = None
 
 
 class SeismicEventsResponse(ApiModel):
@@ -1616,6 +1618,8 @@ class SeismicHistoryItem(ApiModel):
     municipality_code: str | None = None
     department_code: str | None = None
     last_updated_at: datetime
+    # CHG-231: última corrección del SGC (nulo si nunca fue revisado).
+    revised_at: datetime | None = None
 
 
 class SeismicHistoryResponse(ApiModel):

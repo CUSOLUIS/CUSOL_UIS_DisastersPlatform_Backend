@@ -41,6 +41,11 @@ class Settings:
     # CHG-223: el catalogador tarda 5–12 s por página de 100 sismos;
     # con 10 s el poller vencía en ~1 de cada 7 ciclos.
     sgc_timeout_seconds: float = 30.0
+    # CHG-231: el SGC corrige un sismo minutos u horas después sin
+    # cambiar su fecha de origen; con un checkpoint puro esas
+    # correcciones nunca se vuelven a descargar. Cada ciclo relee desde
+    # `checkpoint − ventana` para captarlas como revisión (spec §8-10).
+    sgc_revision_lookback_minutes: int = 180
     # Ventana de visibilidad de un evento en el mapa público.
     seismic_visibility_hours: int = 24
 
@@ -91,6 +96,9 @@ class Settings:
             ).rstrip("/"),
             sgc_timeout_seconds=float(
                 os.getenv("SGC_TIMEOUT_SECONDS", "30")
+            ),
+            sgc_revision_lookback_minutes=max(
+                0, int(os.getenv("SGC_REVISION_LOOKBACK_MINUTES", "180"))
             ),
             seismic_visibility_hours=int(
                 os.getenv("SEISMIC_EVENT_VISIBILITY_HOURS", "24")

@@ -155,6 +155,21 @@ def requires_confirmation(magnitude: float) -> bool:
     return magnitude >= 4.5
 
 
+# CHG-231 — Un sismo «corregido» es el que el SGC revisó después de la
+# primera detección (spec §8-10): `last_updated_at` avanza con cada
+# revisión y `first_detected_at` no. Se tolera un segundo de holgura
+# porque en el INSERT ambos se fijan con NOW() en la misma transacción.
+_REVISION_TOLERANCE = timedelta(seconds=1)
+
+
+def revised_at(event: dict) -> datetime | None:
+    first = event.get("first_detected_at")
+    last = event.get("last_updated_at")
+    if first is None or last is None:
+        return None
+    return last if last - first > _REVISION_TOLERANCE else None
+
+
 # CHG-225 — Los círculos del mapa viven lo mismo que la alerta del
 # triángulo: M < 3.0 → 3 min; 3.0 ≤ M < 4.5 → 10 min; M ≥ 4.5 → no
 # caducan por sí solos y solo los retira el tope general de visibilidad

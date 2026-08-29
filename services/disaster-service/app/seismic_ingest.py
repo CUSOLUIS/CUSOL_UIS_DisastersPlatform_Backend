@@ -276,9 +276,16 @@ async def run_sgc_poll_cycle(
     notifier: ReportNotifier | None,
     *,
     source: str = "SGC",
+    revision_lookback_minutes: int = 0,
 ) -> dict:
     """Un ciclo completo (spec §7). Devuelve un resumen contable para
-    pruebas y logs; captura todo fallo y lo cuenta en el checkpoint."""
+    pruebas y logs; captura todo fallo y lo cuenta en el checkpoint.
+
+    CHG-231: `revision_lookback_minutes` hace que cada ciclo relea los
+    sismos de esa ventana ANTES del checkpoint. El SGC corrige magnitud,
+    profundidad o epicentro minutos u horas después sin mover la fecha
+    de origen; sin la ventana, esas correcciones quedaban por debajo del
+    checkpoint y jamás llegaban a `is_revision`."""
     summary = {"created": 0, "revised": 0, "unchanged": 0, "failed": False}
     try:
         checkpoint = await repository.get_seismic_checkpoint(source)
@@ -289,6 +296,8 @@ async def run_sgc_poll_cycle(
             since = datetime.now(UTC) - timedelta(
                 hours=_BOOTSTRAP_WINDOW_HOURS
             )
+        elif revision_lookback_minutes > 0:
+            since = since - timedelta(minutes=revision_lookback_minutes)
         raw_rows = await provider.fetch_recent(since)
         newest_time: datetime | None = None
         for attributes in raw_rows:
@@ -395,11 +404,17 @@ async def supervised_poll_loop(
     notifier: ReportNotifier | None,
     interval_seconds: int,
     stop_event: asyncio.Event,
+    revision_lookback_minutes: int = 0,
 ) -> None:
     """Bucle de fondo supervisado: corre hasta que el servicio pare.
     Cada ciclo está aislado; el intervalo es configurable (spec §6)."""
     while not stop_event.is_set():
-        await run_sgc_poll_cycle(repository, provider, notifier)
+        await run_sgc_poll_cycle(
+            repository,
+            provider,
+            notifier,
+            revision_lookback_minutes=revision_lookback_minutes,
+        )
         try:
             await asyncio.wait_for(
                 stop_event.wait(), timeout=interval_seconds
