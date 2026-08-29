@@ -155,6 +155,30 @@ def requires_confirmation(magnitude: float) -> bool:
     return magnitude >= 4.5
 
 
+# CHG-225 — Los círculos del mapa viven lo mismo que la alerta del
+# triángulo: M < 3.0 → 3 min; 3.0 ≤ M < 4.5 → 10 min; M ≥ 4.5 → no
+# caducan por sí solos y solo los retira el tope general de visibilidad
+# del evento (CHG-218, 24 h por defecto). Antes TODOS duraban 24 h.
+def zones_expiry(
+    magnitude: float, origin_time: datetime, visibility_hours: int
+) -> datetime:
+    """Instante a partir del cual el evento viaja sin zonas."""
+    ceiling = origin_time + timedelta(hours=visibility_hours)
+    by_intensity = alert_expiry(magnitude, origin_time)
+    if by_intensity is None:
+        return ceiling
+    return min(by_intensity, ceiling)
+
+
+def zones_expired(
+    magnitude: float,
+    origin_time: datetime,
+    visibility_hours: int,
+    now: datetime,
+) -> bool:
+    return now >= zones_expiry(magnitude, origin_time, visibility_hours)
+
+
 # ---------------------------------------------------------------------------
 # Clasificación de severidad (spec §16-19): las tres capas se derivan
 # de INTENSIDAD (cómo se sintió en cada lugar), nunca solo de la

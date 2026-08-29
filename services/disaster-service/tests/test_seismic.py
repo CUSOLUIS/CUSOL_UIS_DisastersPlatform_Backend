@@ -1759,6 +1759,59 @@ async def test_las_zonas_se_retiran_a_las_24_horas_pero_el_evento_sigue():
     assert len(afectados.json()["markers"]) == 1
 
 
+# CHG-225 — Los círculos duran lo mismo que la alerta del triángulo.
+
+
+def test_las_zonas_caducan_con_la_metrica_de_la_alerta():
+    origen = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+    assert seismic.zones_expiry(2.9, origen, 24) == origen + timedelta(minutes=3)
+    assert seismic.zones_expiry(3.0, origen, 24) == origen + timedelta(minutes=10)
+    assert seismic.zones_expiry(4.4, origen, 24) == origen + timedelta(minutes=10)
+    # M ≥ 4.5: solo el tope general de visibilidad las retira.
+    assert seismic.zones_expiry(4.5, origen, 24) == origen + timedelta(hours=24)
+    assert seismic.zones_expiry(6.8, origen, 24) == origen + timedelta(hours=24)
+    assert seismic.zones_expired(2.9, origen, 24, origen + timedelta(minutes=2)) is False
+    assert seismic.zones_expired(2.9, origen, 24, origen + timedelta(minutes=3)) is True
+    assert seismic.zones_expired(3.5, origen, 24, origen + timedelta(minutes=9)) is False
+    assert seismic.zones_expired(3.5, origen, 24, origen + timedelta(minutes=10)) is True
+    assert seismic.zones_expired(5.0, origen, 24, origen + timedelta(hours=23)) is False
+
+
+@pytest.mark.anyio
+async def test_un_sismo_leve_pierde_los_circulos_a_los_minutos_pero_el_fuerte_no():
+    repo = FakeSeismicRepository()
+    leve, _ = seed_event(repo, magnitude=2.8)
+    repo.events[leve]["origin_time_utc"] = datetime.now(UTC) - timedelta(
+        minutes=4
+    )
+    moderado, _ = seed_event(repo, magnitude=3.6)
+    repo.events[moderado]["origin_time_utc"] = datetime.now(UTC) - timedelta(
+        minutes=11
+    )
+    moderado_fresco, _ = seed_event(repo, magnitude=3.6)
+    repo.events[moderado_fresco]["origin_time_utc"] = datetime.now(
+        UTC
+    ) - timedelta(minutes=5)
+    fuerte, _ = seed_event(repo, magnitude=5.2)
+    repo.events[fuerte]["origin_time_utc"] = datetime.now(UTC) - timedelta(
+        hours=5
+    )
+    app = seismic_app(repo)
+
+    response = await request_app(app, "GET", "/internal/v1/seismic/events")
+    assert response.status_code == 200
+    por_id = {e["id"]: e for e in response.json()["events"]}
+
+    assert por_id[str(leve)]["zonesExpired"] is True
+    assert por_id[str(leve)]["zones"] == []
+    assert por_id[str(moderado)]["zonesExpired"] is True
+    assert por_id[str(moderado)]["zones"] == []
+    assert por_id[str(moderado_fresco)]["zonesExpired"] is False
+    assert len(por_id[str(moderado_fresco)]["zones"]) >= 1
+    assert por_id[str(fuerte)]["zonesExpired"] is False
+    assert len(por_id[str(fuerte)]["zones"]) >= 1
+
+
 # CHG-220 — La altitud viaja de la presencia a la instantánea y al panel.
 
 

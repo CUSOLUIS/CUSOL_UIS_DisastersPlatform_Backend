@@ -7305,11 +7305,15 @@ def create_app(
         preliminary = (
             event["processing_status"] == "SEISMIC_DATA_PRELIMINARY"
         )
-        # CHG-218: los círculos se retiran a las N horas del origen; el
-        # evento puede seguir vivo (alertas activas) sin ellos.
-        zones_expired = event["origin_time_utc"] <= datetime.now(
-            UTC
-        ) - timedelta(hours=resolved_settings.seismic_visibility_hours)
+        # CHG-218/CHG-225: los círculos se retiran con la misma métrica
+        # que la alerta del triángulo (3 min / 10 min / hasta el tope de
+        # N horas para M ≥ 4.5); el evento puede seguir vivo sin ellos.
+        zones_expired = seismic_rules.zones_expired(
+            event["magnitude"],
+            event["origin_time_utc"],
+            resolved_settings.seismic_visibility_hours,
+            datetime.now(UTC),
+        )
         return SeismicEventView(
             id=event["id"],
             source=event["source"],
